@@ -56,6 +56,29 @@ class TestDetectToolFailureTerminal:
         assert is_failure is True
         assert suffix == " [exit 1]"
 
+    def test_nonzero_exit_with_output_is_not_failure(self):
+        # grep/diff/test/pipefail can return non-zero with valid output.
+        # This should NOT be classified as a failure.
+        result = json.dumps({"output": "matched line\n", "exit_code": 1})
+        assert _detect_tool_failure("terminal", result) == (False, "")
+
+    def test_nonzero_exit_with_whitespace_only_output_is_failure(self):
+        result = json.dumps({"output": "   \n  ", "exit_code": 1})
+        is_failure, suffix = _detect_tool_failure("terminal", result)
+        assert is_failure is True
+        assert suffix == " [exit 1]"
+
+    def test_nonzero_exit_with_error_field_takes_precedence_over_output(self):
+        # If there's an explicit error field, it's a failure regardless of output.
+        result = json.dumps({
+            "output": "some output\n",
+            "exit_code": 2,
+            "error": "command not found: foo",
+        })
+        is_failure, suffix = _detect_tool_failure("terminal", result)
+        assert is_failure is True
+        assert "command not found" in suffix
+
     def test_nonzero_exit_with_error_shows_message(self):
         result = json.dumps({
             "output": "",

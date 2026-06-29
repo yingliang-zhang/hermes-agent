@@ -205,6 +205,14 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
         if isinstance(data, dict):
             exit_code = data.get("exit_code")
             if exit_code is not None and exit_code != 0:
+                err_msg = data.get("error")
+                output = data.get("output", "")
+                if err_msg:
+                    return True, f" [error]"
+                if output and str(output).strip():
+                    # Non-zero exit but meaningful output — likely a benign
+                    # non-zero code (grep no-match, pipefail + head, etc.).
+                    return False, ""
                 return True, f" [exit {exit_code}]"
         return False, ""
 

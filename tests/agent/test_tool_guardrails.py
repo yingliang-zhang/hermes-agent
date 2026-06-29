@@ -147,6 +147,35 @@ def test_file_mutation_lint_error_result_is_not_a_tool_failure():
     assert classify_tool_failure("patch", patch_result) == (False, "")
 
 
+def test_classify_terminal_nonzero_exit_with_output_is_not_failure():
+    # grep/diff/test/pipefail can return non-zero with valid output.
+    result = json.dumps({"output": "matched line\n", "exit_code": 1})
+    assert classify_tool_failure("terminal", result) == (False, "")
+
+
+def test_classify_terminal_nonzero_exit_with_empty_output_is_failure():
+    result = json.dumps({"output": "", "exit_code": 1})
+    is_failure, suffix = classify_tool_failure("terminal", result)
+    assert is_failure is True
+    assert "exit 1" in suffix
+
+
+def test_classify_terminal_nonzero_exit_with_error_field_is_failure():
+    result = json.dumps({
+        "output": "partial output\n",
+        "exit_code": 2,
+        "error": "command not found: foo",
+    })
+    is_failure, _ = classify_tool_failure("terminal", result)
+    assert is_failure is True
+
+
+def test_classify_terminal_nonzero_exit_with_whitespace_output_is_failure():
+    result = json.dumps({"output": "  \n ", "exit_code": 1})
+    is_failure, _ = classify_tool_failure("terminal", result)
+    assert is_failure is True
+
+
 def test_same_tool_varying_args_warns_by_default_without_halting():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(same_tool_failure_warn_after=2, same_tool_failure_halt_after=3)

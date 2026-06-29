@@ -1099,13 +1099,26 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
     data = safe_json_loads(result)
 
     # Terminal: non-zero exit code is the canonical failure signal.
+    # But some commands (grep, diff, test, pipe pipelines under pipefail)
+    # return non-zero exit codes by design even when they produce valid
+    # output.  If there is no explicit ``error`` field AND the output is
+    # non-empty, treat the call as successful — the command did its job,
+    # the non-zero code is structural (e.g. grep found no match, head
+    # closed the pipe early).  Only flag as failure when there is an
+    # explicit error message OR the output is empty (which usually
+    # indicates a real crash like command-not-found).
     if tool_name == "terminal":
         if isinstance(data, dict):
             exit_code = data.get("exit_code")
             if exit_code is not None and exit_code != 0:
                 err_msg = data.get("error")
+                output = data.get("output", "")
                 if err_msg:
                     return True, f" [{_trim_error(str(err_msg))}]"
+                if output and str(output).strip():
+                    # Non-zero exit but meaningful output — likely a benign
+                    # non-zero code (grep no-match, pipefail + head, etc.).
+                    return False, ""
                 return True, f" [exit {exit_code}]"
         return False, ""
 
