@@ -130,3 +130,74 @@ class TestPlatformForwardedAtBoundary:
         kwargs = calls[-1].kwargs
         assert kwargs.get("platform") == "telegram"
         assert kwargs.get("boundary_reason") == "compression"
+
+
+class TestTodoSnapshotMergedNotDuplicated:
+    """When the compressed transcript already ends with a user message, the
+    todo snapshot must be folded into it rather than appended as a second
+    standalone user message (which would create consecutive user/user turns)."""
+
+    def test_snapshot_merges_into_trailing_user(self, tmp_path: Path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_TODO_MERGE"
+        db.create_session(parent, source="cli")
+        agent = _build_agent_with_db(db, parent, platform="cli")
+
+        # Compressor returns a transcript ending with a user message — the
+        # exact case where appending a todo snapshot would create user/user.
+        agent.context_compressor.compress.return_value = [
+            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+            {"role": "assistant", "content": "acknowledged"},
+            {"role": "user", "content": "tail"},
+        ]
+
+        # Seed a non-empty todo store
+        agent._todo_store._todos = [{"id": "t1", "content": "task A", "status": "pending"}]
+        agent._todo_store.format_for_injection = lambda: "## Current Tasks\n- [ ] task A"
+
+        result = agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+        compressed = result[0] if isinstance(result, tuple) else result
+
+        # The snapshot must be merged, not appended — so the transcript length
+        # should be unchanged (3 messages, not 4).
+        assert len(compressed) == 3
+
+        # The trailing user message must carry both the original text and snapshot
+        tail = compressed[-1]
+        assert tail["role"] == "user"
+        assert "tail" in tail["content"]
+        assert "task A" in tail["content"]
+
+        # No consecutive user/user pair
+        for i in range(1, len(compressed)):
+            assert not (compressed[i]["role"] == "user" and compressed[i - 1]["role"] == "user"), \
+                f"Consecutive user/user at index {i}"
+
+    def test_snapshot_merge_is_persisted_in_place(self, tmp_path: Path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_TODO_INPLACE"
+        db.create_session(parent, source="cli")
+        agent = _build_agent_with_db(db, parent, platform="cli")
+        agent.compression_in_place = True  # in-place mode
+
+        agent.context_compressor.compress.return_value = [
+            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "last user msg"},
+        ]
+
+        agent._todo_store._todos = [{"id": "t1", "content": "do thing", "status": "in_progress"}]
+        agent._todo_store.format_for_injection = lambda: "## Current Tasks\n- [ ] do thing"
+
+        agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+
+        # Verify the live DB transcript has the merged tail, no user/user
+        db_msgs = db.get_messages(agent.session_id)
+        for i in range(1, len(db_msgs)):
+            assert not (db_msgs[i]["role"] == "user" and db_msgs[i - 1]["role"] == "user"), \
+                f"Consecutive user/user persisted at index {i}"
+
+        # The last user message must contain both the original text and snapshot
+        last_user = [m for m in db_msgs if m["role"] == "user"][-1]
+        assert "last user msg" in last_user["content"]
+        assert "do thing" in last_user["content"]

@@ -646,7 +646,18 @@ def compress_context(
 
         todo_snapshot = agent._todo_store.format_for_injection()
         if todo_snapshot:
-            compressed.append({"role": "user", "content": todo_snapshot})
+            # Fold the snapshot into the trailing user message when one exists
+            # with plain-string content, instead of appending a standalone user
+            # message that would create consecutive user/user turns — a
+            # role-alternation violation some providers reject outright.
+            _merged_into_tail = False
+            if compressed:
+                _tail = compressed[-1]
+                if _tail.get("role") == "user" and isinstance(_tail.get("content"), str):
+                    _tail["content"] = f"{_tail['content']}\n\n{todo_snapshot}"
+                    _merged_into_tail = True
+            if not _merged_into_tail:
+                compressed.append({"role": "user", "content": todo_snapshot})
 
         agent._invalidate_system_prompt()
         new_system_prompt = agent._build_system_prompt(system_message)
