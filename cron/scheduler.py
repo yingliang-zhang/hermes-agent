@@ -297,6 +297,11 @@ _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
 
+# One-shot startup session cleanup: close cron sessions left open by a
+# previous process lifecycle where the finally block in run_job() could
+# not execute (SIGTERM / SIGKILL / crash).
+_startup_session_cleanup_done = False
+
 # Sequential (env-mutating) cron jobs — workdir jobs that touch
 # process-global runtime state — must run one at a time, but must NOT block the
 # ticker thread.  A persistent single-thread executor preserves ordering across
@@ -2901,6 +2906,37 @@ def _notify_provider_jobs_changed() -> None:
         logger.debug("on_jobs_changed notify failed: %s", e)
 
 
+def _cleanup_stale_cron_sessions() -> int:
+    """Close cron sessions left open from a previous process lifecycle.
+
+    When the scheduler/gateway process is killed (SIGTERM/SIGKILL/crash)
+    before ``run_job()``'s finally block executes, cron session rows stay
+    with ``ended_at IS NULL`` forever — there is no startup cleanup nor
+    orphan reaper for pure cron sessions.  This makes Run History
+    unreliable (sessions appear stuck) and inflates the "open sessions"
+    count.
+
+    Called once per process lifetime at the first ``tick()`` invocation.
+    Returns the number of sessions closed.
+    """
+    try:
+        from hermes_state import SessionDB
+        db = SessionDB()
+        count = db.close_stale_sessions(
+            end_reason="process_restart", source="cron"
+        )
+        if count:
+            logger.info(
+                "Closed %d stale cron session(s) from a previous process",
+                count,
+            )
+        db.close()
+        return count
+    except Exception as exc:
+        logger.debug("Failed to clean up stale cron sessions: %s", exc)
+        return 0
+
+
 def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> int:
     """
     Check and run all due jobs.
@@ -2932,6 +2968,14 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         if lock_fd is not None:
             lock_fd.close()
         return 0
+
+    # ── Startup session cleanup (runs once per process lifetime) ──────
+    # Close cron sessions left open by a previous process lifecycle
+    # (SIGTERM/SIGKILL/crash before run_job() finally could execute).
+    global _startup_session_cleanup_done
+    if not _startup_session_cleanup_done:
+        _startup_session_cleanup_done = True
+        _cleanup_stale_cron_sessions()
 
     try:
         due_jobs = get_due_jobs()
