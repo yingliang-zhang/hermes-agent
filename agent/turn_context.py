@@ -411,18 +411,23 @@ def build_turn_context(
     # Gate the (expensive) full token estimate behind a cheap pre-check.
     # See ``_should_run_preflight_estimate`` for the OR semantics that fix
     # issue #27405 (a few very large messages slipping past the count gate).
-    if agent.compression_enabled and _should_run_preflight_estimate(
-        messages,
-        agent.context_compressor.protect_first_n,
-        agent.context_compressor.protect_last_n,
-        agent.context_compressor.threshold_tokens,
+    _compressor = agent.context_compressor
+    _hard_limit = getattr(_compressor, "hygiene_hard_message_limit", 0)
+    _hard_limit_breached = _hard_limit > 0 and len(messages) >= _hard_limit
+    if agent.compression_enabled and (
+        _hard_limit_breached
+        or _should_run_preflight_estimate(
+            messages,
+            _compressor.protect_first_n,
+            _compressor.protect_last_n,
+            _compressor.threshold_tokens,
+        )
     ):
         _preflight_tokens = estimate_request_tokens_rough(
             messages,
             system_prompt=active_system_prompt or "",
             tools=agent.tools or None,
         )
-        _compressor = agent.context_compressor
         _defer_preflight = getattr(
             _compressor,
             "should_defer_preflight_to_real_usage",
@@ -444,7 +449,12 @@ def build_turn_context(
             in {"native", "off"}
         )
 
-        if not _preflight_deferred:
+        # A count breach overrides noisy real-usage deferral and the token
+        # threshold, while normal cooldown and anti-thrashing protections stay
+        # in force. This mirrors gateway hygiene (#2153/#4750) without making
+        # automatic compression equivalent to the user's forced /compress.
+
+        if not _preflight_deferred or _hard_limit_breached:
             _last = _compressor.last_prompt_tokens
             # Do NOT overwrite the -1 sentinel (#36718).
             if _last >= 0 and _preflight_tokens > _last:
@@ -456,7 +466,13 @@ def build_turn_context(
             lambda: None,
         )()
 
-        if _preflight_deferred:
+        _compression_check_tokens = (
+            max(_preflight_tokens, _compressor.threshold_tokens)
+            if _hard_limit_breached
+            else _preflight_tokens
+        )
+
+        if _preflight_deferred and not _hard_limit_breached:
             logger.info(
                 "Skipping preflight compression: rough estimate ~%s >= %s, "
                 "but last real provider prompt was %s after compression",
@@ -477,19 +493,33 @@ def build_turn_context(
                 "(mode=%s); Hermes will not start thread compaction here.",
                 getattr(agent, "codex_app_server_auto_compaction", "native"),
             )
-        elif _compressor.should_compress(_preflight_tokens):
-            logger.info(
-                "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
-                f"{_preflight_tokens:,}",
-                f"{_compressor.threshold_tokens:,}",
-                agent.model,
-                f"{_compressor.context_length:,}",
-            )
-            agent._emit_status(
-                f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
-                f">= {_compressor.threshold_tokens:,} threshold. "
-                "This may take a moment."
-            )
+        elif _compressor.should_compress(_compression_check_tokens):
+            if _hard_limit_breached:
+                logger.info(
+                    "Preflight compression: hard message limit %d reached "
+                    "(%d messages, ~%s tokens, model %s, ctx %s)",
+                    _hard_limit, len(messages),
+                    f"{_preflight_tokens:,}", agent.model,
+                    f"{_compressor.context_length:,}",
+                )
+                agent._emit_status(
+                    f"📦 Preflight compression: {len(messages)} messages "
+                    f">= hard limit {_hard_limit}. "
+                    "This may take a moment."
+                )
+            else:
+                logger.info(
+                    "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
+                    f"{_preflight_tokens:,}",
+                    f"{_compressor.threshold_tokens:,}",
+                    agent.model,
+                    f"{_compressor.context_length:,}",
+                )
+                agent._emit_status(
+                    f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
+                    f">= {_compressor.threshold_tokens:,} threshold. "
+                    "This may take a moment."
+                )
             for _pass in range(3):
                 _orig_len = len(messages)
                 _orig_tokens = _preflight_tokens

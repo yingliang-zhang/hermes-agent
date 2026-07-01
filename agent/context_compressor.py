@@ -1279,6 +1279,7 @@ class ContextCompressor(ContextEngine):
         api_mode: str = "",
         abort_on_summary_failure: bool = False,
         max_tokens: int | None = None,
+        hygiene_hard_message_limit: int = 0,
     ):
         self.model = model
         self.base_url = base_url
@@ -1302,6 +1303,11 @@ class ContextCompressor(ContextEngine):
         # When False (default = historical behavior), insert a
         # deterministic "summary unavailable" handoff and drop the middle window.
         self.abort_on_summary_failure = abort_on_summary_failure
+        # Hard message-count safety valve: trigger automatic compression at
+        # this count regardless of token estimates. Normal automatic cooldown
+        # and anti-thrashing protections still apply. Mirrors gateway hygiene
+        # (gateway/run.py, #2153/#4750). 0 = disabled.
+        self.hygiene_hard_message_limit = max(0, int(hygiene_hard_message_limit or 0))
 
         self.context_length = get_model_context_length(
             model, base_url=base_url, api_key=api_key,
