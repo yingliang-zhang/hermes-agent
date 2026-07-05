@@ -1,6 +1,6 @@
 import { atom } from 'nanostores'
 
-import type { CronJob } from '@/types/hermes'
+import type { CronJob, SessionInfo } from '@/types/hermes'
 
 // Cron *jobs* (not run sessions) power the sidebar "Cron jobs" section. Listing
 // the job — schedule, state, live next-run countdown — makes the job the
@@ -92,3 +92,18 @@ export const setCronFocusJobId = (id: null | string) => $cronFocusJobId.set(id)
 // focus id here: the cron overlay's first fetch may not have loaded that row.
 export const $cronReviewRequest = atom(0)
 export const requestCronReview = () => $cronReviewRequest.set($cronReviewRequest.get() + 1)
+
+// Stale-while-revalidate cache for cron run sessions. Unlike $cronJobs (a
+// reactive atom shared by sidebar + overlay), runs are per-job and read-only —
+// no cross-component sync needed. The cache just prevents a remount spinner
+// when the panel is closed and reopened: the component renders stale data
+// instantly, then the background poll silently replaces it with fresh results.
+const cronRunsCache = new Map<string, SessionInfo[]>()
+
+export function getCachedCronRuns(jobId: string): SessionInfo[] | null {
+  return cronRunsCache.get(jobId) ?? null
+}
+
+export function setCachedCronRuns(jobId: string, runs: SessionInfo[]): void {
+  cronRunsCache.set(jobId, runs)
+}
