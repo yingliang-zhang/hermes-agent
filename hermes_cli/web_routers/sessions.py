@@ -632,6 +632,13 @@ async def get_session_messages(
                 limit=_limit,
                 offset=offset,
                 latest=latest_page,
+                # Include compression-ancestor messages so the REST transcript
+                # matches the gateway's session.resume (which uses
+                # include_ancestors=True). Without this, the desktop's REST
+                # prefetch only shows the child continuation's messages after a
+                # compression rotation, hiding the pre-compaction transcript
+                # (#51058).
+                include_ancestors=True,
             )
         finally:
             db.close()
