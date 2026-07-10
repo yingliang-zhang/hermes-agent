@@ -2158,6 +2158,11 @@ def init_agent(
             _compression_cfg.get("micro_compact_defrag_threshold_tokens", 2000),
             2000,
         ),
+    # Configurable cap for the tail message floor (see
+    # _find_tail_cut_by_tokens in context_compressor.py).  0 = use the
+    # module-level default (8), preserving backward compatibility.
+    compression_max_tail_message_floor = int(
+        _compression_cfg.get("max_tail_message_floor", 0) or 0
     )
     codex_app_server_auto_compaction = str(
         _compression_cfg.get("codex_app_server_auto", "native") or "native"
@@ -2644,6 +2649,7 @@ def init_agent(
             min_tail_user_messages=compression_min_tail_users,
             tail_mode=compression_tail_mode,
             hygiene_hard_message_limit=compression_hard_msg_limit,
+            max_tail_message_floor=compression_max_tail_message_floor,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
