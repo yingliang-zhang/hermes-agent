@@ -2942,6 +2942,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                             agent.model,
                             agent.provider,
                             api_mode=agent.api_mode,
+
                         )
                         or _is_codex_spark(agent.model, agent.provider)
                     ),
