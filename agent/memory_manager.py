@@ -352,14 +352,16 @@ def build_memory_context_block(raw_context: str) -> str:
 
 
 class MemoryManager:
-    """Orchestrates the built-in provider plus at most one external provider.
+    """Orchestrates memory providers and read-only recall context sources.
 
     The builtin provider is always first. Only one non-builtin (external)
-    provider is allowed.  Failures in one provider never block the other.
+    provider is allowed. Read-only context sources occupy no provider slot.
+    Failures in one source never block the others.
     """
 
     def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
         self._providers: List[MemoryProvider] = []
+        self._context_sources: List[Any] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
         self._external_prefetch_timeout = (
@@ -459,10 +461,19 @@ class MemoryManager:
             len(provider.get_tool_schemas()),
         )
 
+    def add_context_source(self, source: Any) -> None:
+        """Register a read-only recall source outside provider lifecycle."""
+        self._context_sources.append(source)
+
     @property
     def providers(self) -> List[MemoryProvider]:
         """All registered providers in order."""
         return list(self._providers)
+
+    @property
+    def context_sources(self) -> List[Any]:
+        """All registered read-only recall context sources in order."""
+        return list(self._context_sources)
 
     def get_provider(self, name: str) -> Optional[MemoryProvider]:
         """Get a provider by name, or None if not registered."""
@@ -531,6 +542,16 @@ class MemoryManager:
                 logger.debug(
                     "Memory provider '%s' prefetch failed (non-fatal): %s",
                     provider.name, e,
+                )
+        for source in self._context_sources:
+            try:
+                result = source.prefetch(clean_query, session_id=session_id)
+                if result and result.strip():
+                    parts.append(result)
+            except Exception as e:
+                logger.debug(
+                    "Memory context source '%s' prefetch failed (non-fatal): %s",
+                    getattr(source, "name", "unknown"), e,
                 )
         return "\n\n".join(parts)
 
@@ -1141,6 +1162,14 @@ class MemoryManager:
         the interpreter rather than blocking exit.
         """
         self._drain_sync_executor()
+        for source in reversed(self._context_sources):
+            try:
+                source.shutdown()
+            except Exception as e:
+                logger.warning(
+                    "Memory context source '%s' shutdown failed: %s",
+                    getattr(source, "name", "unknown"), e,
+                )
         for provider in reversed(self._providers):
             try:
                 provider.shutdown()

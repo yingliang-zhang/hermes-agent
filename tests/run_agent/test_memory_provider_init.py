@@ -1,7 +1,7 @@
 """Regression tests for memory provider selection during AIAgent init."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 class RecordingMemoryProvider:
@@ -59,6 +59,130 @@ def test_blank_memory_provider_does_not_auto_enable_honcho():
     save_config.assert_not_called()
 
 
+def test_basic_memory_auto_recall_creates_read_only_context_source_without_provider():
+    source = SimpleNamespace(name="basic_memory", shutdown=lambda: None)
+    basic_cfg = {
+        "auto_recall": True,
+        "project": "agent-memory",
+        "max_results": 3,
+        "max_chars": 4000,
+    }
+    cfg = {
+        "memory": {"provider": "", "basic_memory": basic_cfg},
+        "agent": {},
+    }
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch(
+            "agent.basic_memory_recall.BasicMemoryRecallSource.from_config",
+            return_value=source,
+        ) as from_config,
+        patch("plugins.memory.load_memory_provider") as load_memory_provider,
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+        )
+
+    assert agent._memory_manager is not None
+    assert agent._memory_manager.providers == []
+    assert agent._memory_manager.context_sources == [source]
+    from_config.assert_called_once_with(basic_cfg)
+    load_memory_provider.assert_not_called()
+
+
+def test_basic_memory_auto_recall_survives_external_provider_load_failure():
+    source = SimpleNamespace(name="basic_memory", shutdown=MagicMock())
+    basic_cfg = {"auto_recall": True}
+    cfg = {
+        "memory": {"provider": "broken", "basic_memory": basic_cfg},
+        "agent": {},
+    }
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch(
+            "agent.basic_memory_recall.BasicMemoryRecallSource.from_config",
+            return_value=source,
+        ),
+        patch(
+            "plugins.memory.load_memory_provider",
+            side_effect=RuntimeError("provider import failed"),
+        ),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+        )
+
+    assert agent._memory_manager is not None
+    assert agent._memory_manager.providers == []
+    assert agent._memory_manager.context_sources == [source]
+    source.shutdown.assert_not_called()
+
+
+def test_basic_memory_construction_failure_does_not_block_external_provider(caplog):
+    provider = RecordingMemoryProvider()
+    cfg = {
+        "memory": {
+            "provider": "recording",
+            "basic_memory": {
+                "auto_recall": True,
+                "search_all_projects": True,
+            },
+        },
+        "agent": {},
+    }
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch(
+            "agent.basic_memory_recall.BasicMemoryRecallSource.from_config",
+            side_effect=RuntimeError("basic construction failed"),
+        ),
+        patch("plugins.memory.load_memory_provider", return_value=provider) as load_provider,
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+            session_id="sess-isolation",
+        )
+
+    load_provider.assert_called_once_with("recording")
+    assert agent._memory_manager is not None
+    assert agent._memory_manager.providers == [provider]
+    assert provider.init_session_id == "sess-isolation"
+    assert "Basic Memory context source init failed: basic construction failed" in caplog.text
+
+
 def test_aiagent_forwards_user_id_alt_to_memory_provider():
     provider = RecordingMemoryProvider()
     cfg = {"memory": {"provider": "recording"}, "agent": {}}
@@ -93,6 +217,44 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
     assert "warning_callback" not in provider.init_kwargs
     assert "status_callback" not in provider.init_kwargs
 
+
+
+def test_aiagent_preserves_legacy_workspace_and_forwards_resolved_scope_workspace(
+    tmp_path, monkeypatch
+):
+    provider = RecordingMemoryProvider()
+    cfg = {"memory": {"provider": "recording"}, "agent": {}}
+    workspace = tmp_path / "actual-workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(
+        "agent.runtime_cwd.resolve_agent_cwd",
+        lambda: workspace,
+    )
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=provider),
+        patch("hermes_cli.profiles.get_active_profile_name", return_value="default"),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+            session_id="sess-workspace",
+            platform="cli",
+        )
+
+    assert agent._memory_manager is not None
+    assert provider.init_kwargs["agent_workspace"] == "hermes"
+    assert provider.init_kwargs["scope_workspace"] == str(workspace)
 
 class CoreShadowProvider:
     """Provider that tries to register tools shadowing built-in core tools."""

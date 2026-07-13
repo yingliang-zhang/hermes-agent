@@ -215,6 +215,13 @@ def _make_hindsight_provider():
     provider._session_turns = ["turn-1", "turn-2"]
     provider._turn_counter = 2
     provider._turn_index = 2
+    provider._committed_turn_count = 0
+    provider._retain_state = hindsight_mod._RetainSessionState(
+        session_id=provider._session_id,
+        parent_session_id=provider._parent_session_id,
+        document_id=provider._document_id,
+        turns=provider._session_turns,
+    )
     # Attrs read by _build_metadata / _build_retain_kwargs when the
     # buffer-flush path on session switch fires. Empty strings keep the
     # metadata minimal but well-formed.
@@ -228,6 +235,8 @@ def _make_hindsight_provider():
     provider._thread_id = ""
     provider._agent_identity = ""
     provider._agent_workspace = ""
+    provider._scope_workspace = ""
+    provider._scope_dimensions = []
     provider._retain_tags = []
     provider._retain_context = "test-context"
     provider._retain_async = False
@@ -236,6 +245,24 @@ def _make_hindsight_provider():
     provider._prefetch_thread = None
     provider._prefetch_lock = threading.Lock()
     provider._prefetch_result = ""
+    provider._prefetch_generation = 0
+    provider._prefetch_requested_query = ""
+    provider._prefetch_requested_generation = 0
+    provider._prefetch_requested_session_id = ""
+    provider._prefetch_result_session_id = ""
+    provider._prefetch_completed_session_id = ""
+    provider._prefetch_inflight_session_id = ""
+    provider._prefetch_post_turn_skip_session_id = ""
+    provider._prefetch_inflight_query = ""
+    provider._prefetch_inflight_generation = 0
+    provider._prefetch_result_query = ""
+    provider._prefetch_result_generation = 0
+    provider._prefetch_completed_query = ""
+    provider._prefetch_completed_generation = 0
+    provider._prefetch_post_turn_skip_query = ""
+    provider._prefetch_condition = threading.Condition(provider._prefetch_lock)
+    provider._prefetch_threads = set()
+    provider._prefetch_inflight = {}
     # Sync thread tracking (legacy alias at the writer).
     provider._sync_thread = None
     # Writer queue infra the flush-on-switch path enqueues onto. We stub
@@ -246,17 +273,10 @@ def _make_hindsight_provider():
     import queue as _queue
     provider._retain_queue = _queue.Queue()
     provider._shutting_down = threading.Event()
+    provider._retain_lifecycle_lock = threading.RLock()
     provider._atexit_registered = True
     provider._ensure_writer = lambda: None
     provider._register_atexit = lambda: None
-    # Mode + API state used by _resolve_retain_target; stub the resolver
-    # so tests don't actually probe the API. Real probe behavior is
-    # exercised by tests in tests/plugins/memory/test_hindsight_provider.py.
-    provider._mode = "cloud"
-    provider._api_url = ""
-    provider._api_key = ""
-    provider._client = None
-    provider._resolve_retain_target = lambda fb: (fb, None)
     # Stub the network-touching helper so any enqueued flush closure is
     # a no-op if ever drained in a unit test.
     provider._run_hindsight_operation = lambda _op: None

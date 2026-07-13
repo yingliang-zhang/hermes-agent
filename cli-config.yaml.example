@@ -663,6 +663,21 @@ memory:
   # For exit/reset, only fires if the session had at least this many user turns.
   flush_min_turns: 6        # Min user turns to trigger flush on exit/reset (0 = disabled)
 
+  # Optional read-only automatic recall from the Basic Memory MCP server.
+  # Uses only fixed mcp__basic_memory__search_notes and injects matched chunks,
+  # never full note content. This commented block remains disabled by default.
+  # basic_memory:
+  #   auto_recall: true
+  #   project: "agent-memory"       # Project name; use one scope option.
+  #   project_id: ""                # Stable project ID alternative.
+  #   search_all_projects: false    # Set true to search every project instead.
+  #   search_type: hybrid          # text/title/permalink/vector/semantic/hybrid.
+  #   max_results: 5               # Integer from 1 through 20.
+  #   max_chars: 6000              # Integer from 1 through 20000.
+  #   max_query_chars: 1000        # Integer from 1 through 4000.
+  #   min_similarity: 0.55         # Optional number from 0 through 1.
+  #   timeout_seconds: 2.0         # Greater than 0, at most 10 seconds.
+
 # =============================================================================
 # Session Reset Policy (Messaging Platforms)
 # =============================================================================

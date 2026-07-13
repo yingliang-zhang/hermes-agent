@@ -5,29 +5,126 @@ prefetch (auto_recall, preamble, query truncation), sync_turn (auto_retain,
 turn counting, tags), and schema completeness.
 """
 
+import hashlib
 import json
 import os
+from pathlib import Path
 import re
 import stat
 import sys
+import tomllib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+from packaging.version import Version
 import pytest
-
+import yaml
+import plugins.memory.hindsight as hindsight_plugin
 from hermes_cli.memory_setup import _CANCELLED
 from plugins.memory.hindsight import (
     HindsightMemoryProvider,
     RECALL_SCHEMA,
     REFLECT_SCHEMA,
     RETAIN_SCHEMA,
-    _load_config,
+    _MIN_CLIENT_VERSION,
+    _MIN_SCORES_CLIENT_VERSION,
     _build_embedded_profile_env,
+    _load_config,
     _normalize_observation_scopes,
     _normalize_retain_tags,
     _resolve_bank_id_template,
     _sanitize_bank_segment,
 )
+
+
+def _expected_scope_tag(dimension: str, value: str) -> str:
+    canonical = str(value)
+    if dimension == "workspace":
+        canonical = os.path.realpath(os.path.abspath(os.path.expanduser(canonical)))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    return f"scope:{dimension}:{digest}"
+
+
+def test_hindsight_client_declarations_share_supported_interval():
+    """Every install path must preserve current compatible Hindsight clients."""
+    repo_root = Path(__file__).resolve().parents[3]
+    package_name = canonicalize_name("hindsight-client")
+
+    project = tomllib.loads(
+        (repo_root / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    manifest = yaml.safe_load(
+        (repo_root / "plugins/memory/hindsight/plugin.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    provider_requirement = getattr(
+        hindsight_plugin,
+        "_CLIENT_REQUIREMENT",
+        f"hindsight-client>={_MIN_CLIENT_VERSION}",
+    )
+    declaration_groups = {
+        "pyproject hindsight extra": project["project"]["optional-dependencies"][
+            "hindsight"
+        ],
+        "lazy dependency": __import__(
+            "tools.lazy_deps", fromlist=["LAZY_DEPS"]
+        ).LAZY_DEPS["memory.hindsight"],
+        "plugin manifest": manifest["pip_dependencies"],
+        "provider setup and auto-upgrade": [provider_requirement],
+    }
+
+    minimum = Version(_MIN_SCORES_CLIENT_VERSION)
+    future_compatible = Version(
+        f"{minimum.release[0]}.{minimum.release[1] + 1}.0"
+    )
+    obsolete = Version("0.6.1")
+    upper_boundary = Version(
+        f"{minimum.release[0]}.{minimum.release[1] + 2}.0"
+    )
+    expected_compatibility = {
+        minimum: True,
+        future_compatible: True,
+        obsolete: False,
+        upper_boundary: False,
+    }
+
+    for source, specs in declaration_groups.items():
+        requirements = [
+            requirement
+            for spec in specs
+            if canonicalize_name((requirement := Requirement(spec)).name)
+            == package_name
+        ]
+        assert len(requirements) == 1, (
+            f"{source} must declare hindsight-client exactly once, got {specs!r}"
+        )
+        specifier = requirements[0].specifier
+        for version, should_accept in expected_compatibility.items():
+            assert (version in specifier) is should_accept, (
+                f"{source} has incompatible interval {specifier}: expected "
+                f"version {version} acceptance to be {should_accept}"
+            )
+
+    assert _MIN_CLIENT_VERSION == _MIN_SCORES_CLIENT_VERSION, (
+        "provider compatibility and min_scores floors must share one source of truth"
+    )
+
+
+def _seed_prefetch_result(
+    provider, query: str, text: str, *, session_id: str | None = None
+) -> None:
+    effective_session_id = session_id or provider._session_id
+    provider._prefetch_generation = 1
+    provider._prefetch_result = text
+    provider._prefetch_result_query = query
+    provider._prefetch_result_generation = 1
+    provider._prefetch_result_session_id = effective_session_id
+    provider._prefetch_completed_query = query
+    provider._prefetch_completed_generation = 1
+    provider._prefetch_completed_session_id = effective_session_id
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +277,9 @@ def provider(tmp_path, monkeypatch):
 def provider_with_config(tmp_path, monkeypatch):
     """Create a provider factory that accepts custom config overrides."""
     def _make(**overrides):
+        init_kwargs = dict(overrides.pop("_init_kwargs", {}))
+        session_id = init_kwargs.pop("session_id", "test-session")
+        platform = init_kwargs.pop("platform", "cli")
         config = {
             "mode": "cloud",
             "apiKey": "test-key",
@@ -198,7 +298,12 @@ def provider_with_config(tmp_path, monkeypatch):
         )
 
         p = HindsightMemoryProvider()
-        p.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+        p.initialize(
+            session_id=session_id,
+            hermes_home=str(tmp_path),
+            platform=platform,
+            **init_kwargs,
+        )
         p._client = _make_mock_client()
         return p
     return _make
@@ -800,18 +905,20 @@ class TestToolHandlers:
 
 
 class TestPrefetch:
-    def test_prefetch_returns_empty_when_no_result(self, provider):
-        assert provider.prefetch("test") == ""
+    def test_prefetch_runs_current_query_when_no_result_is_cached(self, provider):
+        result = provider.prefetch("test")
+        assert "Memory 1" in result
+        assert provider._client.arecall.call_args.kwargs["query"] == "test"
 
     def test_prefetch_default_preamble(self, provider):
-        provider._prefetch_result = "- some memory"
+        _seed_prefetch_result(provider, "test", "- some memory")
         result = provider.prefetch("test")
         assert "Hindsight Memory" in result
         assert "- some memory" in result
 
     def test_prefetch_custom_preamble(self, provider_with_config):
         p = provider_with_config(recall_prompt_preamble="Custom header:")
-        p._prefetch_result = "- memory line"
+        _seed_prefetch_result(p, "test", "- memory line")
         result = p.prefetch("test")
         assert result.startswith("Custom header:")
         assert "- memory line" in result
@@ -980,13 +1087,27 @@ class TestSyncTurn:
         assert item["metadata"]["turn_index"] == "3"
         assert item["metadata"]["message_count"] == "6"
 
-    def test_sync_turn_accumulates_full_session_without_append_support(self, provider_with_config):
-        """Legacy/overwrite APIs (no update_mode=append) resend the ENTIRE session each retain."""
+    def test_sync_turn_ships_only_uncommitted_delta_each_batch(self, provider_with_config):
+        """Every retained batch sends only the delta not already committed.
+
+        Re-retaining committed turns is what made the old 'resend the whole
+        session on overwrite' path unsafe: combined with a stable
+        document_id it either overwrote or (under update_mode='append')
+        deleted prior memory_units (vectorize-io/hindsight#2664). Each
+        batch must ship strictly the turns after the committed watermark.
+        """
         p = provider_with_config(retain_every_n_turns=2)
 
         p.sync_turn("turn1-user", "turn1-asst")
         p.sync_turn("turn2-user", "turn2-asst")
         p._retain_queue.join()
+
+        first = p._client.aretain_batch.call_args.kwargs
+        first_item = first["items"][0]
+        assert "turn1-user" in first_item["content"]
+        assert "turn2-user" in first_item["content"]
+        # No update_mode is ever sent on automatic retains.
+        assert "update_mode" not in first_item
 
         p._client.aretain_batch.reset_mock()
 
@@ -994,68 +1115,31 @@ class TestSyncTurn:
         p.sync_turn("turn4-user", "turn4-asst")
         p._retain_queue.join()
 
-        content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
-        # Without append support the document is overwritten, so it must
-        # contain ALL turns from the session.
-        assert "turn1-user" in content
-        assert "turn2-user" in content
-        assert "turn3-user" in content
-        assert "turn4-user" in content
-
-    def test_sync_turn_appends_only_delta_when_append_supported(self, provider_with_config, monkeypatch):
-        """On append-capable APIs each retain ships only the new turns, not the whole session."""
-        monkeypatch.setattr(
-            "plugins.memory.hindsight._fetch_hindsight_api_version",
-            lambda *a, **kw: "0.5.6",
-        )
-        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
-        # Clear before AND after: the capability cache is module-global and keyed
-        # per api_url, so a stale entry would leak into other tests.
-        with _append_capability_lock:
-            _append_capability_cache.clear()
-        try:
-            p = provider_with_config(retain_every_n_turns=2)
-
-            p.sync_turn("turn1-user", "turn1-asst")
-            p.sync_turn("turn2-user", "turn2-asst")
-            p._retain_queue.join()
-
-            first = p._client.aretain_batch.call_args.kwargs
-            first_item = first["items"][0]
-            assert first["document_id"] == "test-session"
-            assert first_item["update_mode"] == "append"
-            assert "turn1-user" in first_item["content"]
-            assert "turn2-user" in first_item["content"]
-
-            p._client.aretain_batch.reset_mock()
-
-            p.sync_turn("turn3-user", "turn3-asst")
-            p.sync_turn("turn4-user", "turn4-asst")
-            p._retain_queue.join()
-
-            second = p._client.aretain_batch.call_args.kwargs
-            second_item = second["items"][0]
-            assert second["document_id"] == "test-session"
-            assert second_item["update_mode"] == "append"
-            # Only the delta — the already-retained turns must NOT be resent.
-            assert "turn1-user" not in second_item["content"]
-            assert "turn2-user" not in second_item["content"]
-            assert "turn3-user" in second_item["content"]
-            assert "turn4-user" in second_item["content"]
-            # message_count reflects only the delta (2 turns -> 4 messages).
-            assert second_item["metadata"]["message_count"] == "4"
-        finally:
-            with _append_capability_lock:
-                _append_capability_cache.clear()
+        second = p._client.aretain_batch.call_args.kwargs
+        second_item = second["items"][0]
+        # Only the delta — the already-committed turns must NOT be resent.
+        assert "turn1-user" not in second_item["content"]
+        assert "turn2-user" not in second_item["content"]
+        assert "turn3-user" in second_item["content"]
+        assert "turn4-user" in second_item["content"]
+        assert "update_mode" not in second_item
+        # message_count reflects only the delta (2 turns -> 4 messages).
+        assert second_item["metadata"]["message_count"] == "4"
 
     def test_sync_turn_passes_document_id(self, provider):
-        """sync_turn should pass document_id (session_id + per-startup ts)."""
+        """sync_turn passes an immutable per-batch document_id rooted in the
+        session (session_id + provider nonce + turn-range), never the bare
+        per-process session id and never update_mode='append'."""
         provider.sync_turn("hello", "hi")
         provider._retain_queue.join()
         call_kwargs = provider._client.aretain_batch.call_args.kwargs
-        # Format: {session_id}-{YYYYMMDD_HHMMSS_microseconds}
-        assert call_kwargs["document_id"].startswith("test-session-")
-        assert call_kwargs["document_id"] == provider._document_id
+        doc = call_kwargs["document_id"]
+        # Rooted in the session and unique per batch (nonce + turn-range).
+        assert doc.startswith("test-session-")
+        # Must NOT be the bare session id (that was the unsafe stable-doc
+        # assumption that issue #2664 makes a deletion hazard).
+        assert doc != "test-session"
+        assert "update_mode" not in call_kwargs["items"][0]
 
     def test_resume_creates_new_document(self, tmp_path, monkeypatch):
         """Resuming a session (re-initializing) gets a new document_id
@@ -1069,14 +1153,14 @@ class TestSyncTurn:
         p1 = HindsightMemoryProvider()
         p1.initialize(session_id="resumed-session", hermes_home=str(tmp_path), platform="cli")
 
-        # Sleep just enough that the microsecond timestamp differs
+        # Preserve the legacy timestamp-based _document_id compatibility.
         import time
         time.sleep(0.001)
 
         p2 = HindsightMemoryProvider()
         p2.initialize(session_id="resumed-session", hermes_home=str(tmp_path), platform="cli")
 
-        # Same session, but each process gets its own document_id
+        # Same session, but each provider instance gets its own document_id.
         assert p1._document_id != p2._document_id
         assert p1._document_id.startswith("resumed-session-")
         assert p2._document_id.startswith("resumed-session-")
@@ -1197,6 +1281,66 @@ class TestShutdownRace:
         provider.shutdown()
         assert provider._shutting_down.is_set()
 
+    def test_shutdown_flushes_uncommitted_tail_once_without_existing_writer(
+        self, provider_with_config
+    ):
+        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+        client = p._client
+
+        p.sync_turn("tail-user-1", "tail-assistant-1")
+        p.sync_turn("tail-user-2", "tail-assistant-2")
+        assert p._writer_thread is None
+        client.aretain_batch.assert_not_called()
+
+        p.shutdown()
+
+        client.aretain_batch.assert_called_once()
+        item = client.aretain_batch.call_args.kwargs["items"][0]
+        content = item["content"]
+        assert "tail-user-1" in content
+        assert "tail-user-2" in content
+
+        p.shutdown()
+        client.aretain_batch.assert_called_once()
+
+    def test_shutdown_queues_tail_fifo_behind_pending_retain(
+        self, provider_with_config
+    ):
+        import threading
+
+        p = provider_with_config(retain_every_n_turns=2, retain_async=False)
+        first_started = threading.Event()
+        release_first = threading.Event()
+        call_contents: list[str] = []
+
+        async def _blocking_retain(**kwargs):
+            content = kwargs["items"][0]["content"]
+            call_contents.append(content)
+            if "boundary-user" in content:
+                first_started.set()
+                release_first.wait(timeout=5.0)
+
+        p._client.aretain_batch = AsyncMock(side_effect=_blocking_retain)
+        p.sync_turn("boundary-user", "boundary-assistant")
+        p.sync_turn("boundary-user-2", "boundary-assistant-2")
+        assert first_started.wait(timeout=2.0)
+        p.sync_turn("tail-user", "tail-assistant")
+
+        shutdown_thread = threading.Thread(target=p.shutdown)
+        shutdown_thread.start()
+        assert p._shutting_down.wait(timeout=2.0)
+        release_first.set()
+        shutdown_thread.join(timeout=5.0)
+
+        assert not shutdown_thread.is_alive()
+        assert len(call_contents) == 2
+        assert "boundary-user" in call_contents[0]
+        assert "tail-user" not in call_contents[0]
+        assert "tail-user" in call_contents[1]
+
+        p.shutdown()
+        assert len(call_contents) == 2
+
 
 # ---------------------------------------------------------------------------
 # on_session_switch — flush + prefetch reset behavior
@@ -1206,8 +1350,9 @@ class TestShutdownRace:
 class TestSessionSwitchBufferFlush:
     def test_buffered_turns_flushed_before_clear(self, provider_with_config):
         """retain_every_n_turns > 1 must not silently drop partial buffers
-        on session switch. Whatever's in _session_turns at switch time
-        should land in the OLD document under the OLD session id."""
+        on session switch. Whatever's UNCOMMITTED in _session_turns at
+        switch time should land in a NEW immutable batch id rooted in the
+        OLD session id, via the writer queue (FIFO)."""
         p = provider_with_config(retain_every_n_turns=3, retain_async=False)
         old_doc = p._document_id
 
@@ -1219,13 +1364,18 @@ class TestSessionSwitchBufferFlush:
         assert p._sync_thread is None
         p._client.aretain_batch.assert_not_called()
 
-        # Switch — flush should fire under OLD document_id via the writer queue.
+        # Switch — flush should fire under a NEW immutable batch id rooted
+        # in the OLD session, via the writer queue.
         p.on_session_switch("new-sid", parent_session_id="test-session", reset=True)
         p._retain_queue.join()
 
         p._client.aretain_batch.assert_called_once()
         kw = p._client.aretain_batch.call_args.kwargs
-        assert kw["document_id"] == old_doc
+        flush_id = kw["document_id"]
+        # Rooted in the OLD session, a fresh immutable batch id (not the
+        # bare per-session doc, which is the unsafe stable-doc assumption).
+        assert flush_id.startswith("test-session-")
+        assert flush_id != old_doc
         item = kw["items"][0]
         # Both buffered turns must be present in the flushed payload.
         content = json.loads(item["content"])
@@ -1254,11 +1404,15 @@ class TestSessionSwitchBufferFlush:
     def test_prefetch_result_cleared_on_switch(self, provider):
         """Stale recall text from the old session must not leak into the
         next session's first prefetch read."""
-        provider._prefetch_result = "old-session recall: User likes Rust"
+        _seed_prefetch_result(
+            provider,
+            "old query",
+            "old-session recall: User likes Rust",
+        )
         provider.on_session_switch("new-sid")
         assert provider._prefetch_result == ""
-        # And subsequent prefetch() should now report empty, not the leftover.
-        assert provider.prefetch("anything") == ""
+        result = provider.prefetch("anything")
+        assert "old-session recall" not in result
 
     def test_in_flight_prefetch_thread_drained_on_switch(self, provider, monkeypatch):
         """on_session_switch must wait for an in-flight prefetch from the
@@ -1343,107 +1497,270 @@ class TestSessionSwitchBufferFlush:
 
 
 # ---------------------------------------------------------------------------
-# update_mode='append' capability probe + retain dispatch
+# Immutable per-batch document_id, delta-only retains, failed-batch retry.
+#
+# Replaces the old update_mode='append' capability-probe suite. Hindsight
+# issue #2664 proves that a stable document_id + update_mode='append' DELETES
+# existing memory_units on re-retain, and PR #2666 (oversized append) is still
+# open with CHANGES_REQUESTED. So Hermes must NEVER send update_mode='append'
+# on automatic sync_turn / session-switch flush. Instead every logical batch
+# gets an immutable unique document_id (provider nonce + stable turn-range),
+# ships only the uncommitted delta, and a failed batch is retried with the
+# same id/content before any later batch — without advancing the watermark.
 # ---------------------------------------------------------------------------
 
 
-class TestUpdateModeAppendCapability:
-    def _clear_capability_cache(self):
-        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
-        with _append_capability_lock:
-            _append_capability_cache.clear()
+class TestImmutableBatchRetain:
+    def test_automatic_retain_never_sends_append_or_stable_session_doc(self, provider):
+        """Automatic retains never use append or a bare session document.
 
-    def test_legacy_api_falls_back_to_per_process_doc_id(self, provider, monkeypatch):
-        """API returns no /version (or pre-0.5.0) — sync_turn must use the
-        per-process unique doc_id and NOT pass update_mode."""
-        self._clear_capability_cache()
-        monkeypatch.setattr(
-            "plugins.memory.hindsight._fetch_hindsight_api_version",
-            lambda *a, **kw: None,
-        )
-        old_doc = provider._document_id
+        The obsolete append capability-probe helpers must remain removed.
+        """
+        assert not hasattr(hindsight_mod(), "_check_api_supports_update_mode_append")
+        assert not hasattr(hindsight_mod(), "_fetch_hindsight_api_version")
+        assert not hasattr(HindsightMemoryProvider, "_resolve_retain_target")
+
         provider.sync_turn("hello", "hi")
         provider._retain_queue.join()
 
         kw = provider._client.aretain_batch.call_args.kwargs
-        assert kw["document_id"] == old_doc
+        assert kw["document_id"] != "test-session"
         assert kw["document_id"].startswith("test-session-")
         item = kw["items"][0]
         assert "update_mode" not in item
 
-    def test_modern_api_uses_stable_doc_id_with_append(self, provider, monkeypatch):
-        """API on >=0.5.0 — retain uses stable session_id and sets update_mode='append'."""
-        self._clear_capability_cache()
-        monkeypatch.setattr(
-            "plugins.memory.hindsight._fetch_hindsight_api_version",
-            lambda *a, **kw: "0.5.6",
-        )
-        provider.sync_turn("hello", "hi")
-        provider._retain_queue.join()
-
-        kw = provider._client.aretain_batch.call_args.kwargs
-        # Stable: just the session id, no per-process timestamp suffix.
-        assert kw["document_id"] == "test-session"
-        item = kw["items"][0]
-        assert item["update_mode"] == "append"
-
-    def test_capability_cached_per_url(self, provider, monkeypatch):
-        """The /version probe must run at most once per (process, api_url)."""
-        self._clear_capability_cache()
-        calls = {"n": 0}
-
-        def _spy(*a, **kw):
-            calls["n"] += 1
-            return "0.5.6"
-
-        monkeypatch.setattr(
-            "plugins.memory.hindsight._fetch_hindsight_api_version", _spy
-        )
-        provider.sync_turn("a", "b")
-        provider._retain_queue.join()
-        provider.sync_turn("c", "d")
-        provider._retain_queue.join()
-        assert calls["n"] == 1
-
-    def test_legacy_warning_emitted_once(self, provider, monkeypatch, caplog):
-        """One-time WARN nudges users to upgrade Hindsight."""
-        import logging
-        self._clear_capability_cache()
-        monkeypatch.setattr(
-            "plugins.memory.hindsight._fetch_hindsight_api_version",
-            lambda *a, **kw: "0.4.22",
-        )
-        with caplog.at_level(logging.WARNING, logger="plugins.memory.hindsight"):
-            provider.sync_turn("a", "b")
-            provider._retain_queue.join()
-            provider.sync_turn("c", "d")
-            provider._retain_queue.join()
-        warns = [r for r in caplog.records
-                 if r.levelno == logging.WARNING
-                 and "older than 0.5.0" in r.getMessage()]
-        # Cache hit on the second call → no second warn.
-        assert len(warns) == 1
-
-    def test_session_switch_flush_picks_capability_against_old_session(
-        self, provider_with_config, monkeypatch
+    def test_two_successful_batches_have_distinct_immutable_ids_and_delta_payload(
+        self, provider_with_config
     ):
-        """When the API supports append, the flush on /reset must land
-        in the OLD session's stable document, not a per-process id."""
-        self._clear_capability_cache()
-        monkeypatch.setattr(
-            "plugins.memory.hindsight._fetch_hindsight_api_version",
-            lambda *a, **kw: "0.5.6",
-        )
-        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+        """Two consecutive successful batches get different immutable
+        document_ids, and the second batch's payload excludes the
+        first batch's turns (delta-only)."""
+        p = provider_with_config(retain_every_n_turns=2)
+
         p.sync_turn("turn1-user", "turn1-asst")
         p.sync_turn("turn2-user", "turn2-asst")
+        p._retain_queue.join()
+        first = p._client.aretain_batch.call_args.kwargs
+        first_id = first["document_id"]
+
+        p._client.aretain_batch.reset_mock()
+
+        p.sync_turn("turn3-user", "turn3-asst")
+        p.sync_turn("turn4-user", "turn4-asst")
+        p._retain_queue.join()
+        second = p._client.aretain_batch.call_args.kwargs
+        second_id = second["document_id"]
+
+        # Different immutable IDs per logical batch.
+        assert first_id != second_id
+        # Both rooted in the session + a provider nonce + a turn-range.
+        for doc in (first_id, second_id):
+            assert doc.startswith("test-session-")
+        # The turn-range identity must differ between batches.
+        range_first = first_id.rsplit("-t", 1)[-1] if "-t" in first_id else ""
+        range_second = second_id.rsplit("-t", 1)[-1] if "-t" in second_id else ""
+        assert range_first != range_second
+        # Delta-only: second payload excludes first-batch turns.
+        assert "turn1-user" not in second["items"][0]["content"]
+        assert "turn2-user" not in second["items"][0]["content"]
+        assert "turn3-user" in second["items"][0]["content"]
+        assert "turn4-user" in second["items"][0]["content"]
+
+    def test_failed_first_batch_retried_with_same_id_before_later_batch(
+        self, provider_with_config
+    ):
+        """A failed first batch must NOT advance the committed watermark.
+        On the next eligible sync, the failed batch is retried FIRST with
+        identical content and identical document_id, then later turns are
+        retained as a separate batch — no watermark loss, no gap."""
+        p = provider_with_config(retain_every_n_turns=2, retain_async=False)
+
+        # Batch 1 (turns 1-2) FAILS.
+        p._client.aretain_batch.side_effect = RuntimeError("network down")
+        p.sync_turn("turn1-user", "turn1-asst")
+        p.sync_turn("turn2-user", "turn2-asst")
+        p._retain_queue.join()
+        # Watermark must NOT have advanced despite the enqueue.
+        assert p._committed_turn_count == 0
+        first_call = p._client.aretain_batch.call_args.kwargs
+        failed_id = first_call["document_id"]
+        failed_content = first_call["items"][0]["content"]
+
+        # Recover the network. More turns accumulate; next boundary triggers
+        # a retain that must retry the failed batch FIRST.
+        p._client.aretain_batch.side_effect = None
+        p._client.aretain_batch.reset_mock()
+        p.sync_turn("turn3-user", "turn3-asst")
+        p.sync_turn("turn4-user", "turn4-asst")
+        p._retain_queue.join()
+
+        calls = p._client.aretain_batch.call_args_list
+        assert len(calls) >= 2
+        retry = calls[0].kwargs
+        later = calls[1].kwargs
+        # Retry is the failed batch: same id, same content.
+        assert retry["document_id"] == failed_id
+        assert retry["items"][0]["content"] == failed_content
+        # The later batch is a DIFFERENT immutable id and carries the new turns.
+        assert later["document_id"] != failed_id
+        assert "turn1-user" not in later["items"][0]["content"]
+        assert "turn2-user" not in later["items"][0]["content"]
+        assert "turn3-user" in later["items"][0]["content"]
+        assert "turn4-user" in later["items"][0]["content"]
+        # After both succeed, the watermark advanced past everything.
+        assert p._committed_turn_count == 4
+
+    def test_failed_batch_retried_again_stays_same_id_and_no_loop(
+        self, provider_with_config
+    ):
+        """If the retry also fails, the batch keeps its id/content and the
+        watermark still does not advance. No infinite automatic retry loop:
+        retries are driven only by the next real sync, never a background spin."""
+        p = provider_with_config(retain_every_n_turns=2, retain_async=False)
+        p._client.aretain_batch.side_effect = RuntimeError("still down")
+        p.sync_turn("turn1-user", "turn1-asst")
+        p.sync_turn("turn2-user", "turn2-asst")
+        p._retain_queue.join()
+        failed_id = p._client.aretain_batch.call_args.kwargs["document_id"]
+        failed_content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+        assert p._committed_turn_count == 0
+
+        # Another boundary; retry fails again.
+        p.sync_turn("turn3-user", "turn3-asst")
+        p.sync_turn("turn4-user", "turn4-asst")
+        p._retain_queue.join()
+        retry = p._client.aretain_batch.call_args.kwargs
+        assert retry["document_id"] == failed_id
+        assert retry["items"][0]["content"] == failed_content
+        # Watermark unchanged; no later batch was sent (gap-free).
+        assert p._committed_turn_count == 0
+        assert p._client.aretain_batch.call_count == 2
+
+    def test_session_switch_flush_only_uncommitted_tail_with_new_batch_id(
+        self, provider_with_config
+    ):
+        """on_session_switch flushes ONLY the uncommitted tail turns (not
+        already-committed ones), preserving old session id/tags/FIFO, then
+        rotates to a fresh nonce + cleared watermark. The flush uses a NEW
+        immutable batch id."""
+        p = provider_with_config(retain_every_n_turns=2, retain_async=False)
+
+        # Commit the first batch (turns 1-2).
+        p.sync_turn("turn1-user", "turn1-asst")
+        p.sync_turn("turn2-user", "turn2-asst")
+        p._retain_queue.join()
+        assert p._committed_turn_count == 2
+        committed_id = p._client.aretain_batch.call_args.kwargs["document_id"]
+
+        # Buffer one uncommitted tail turn (no boundary retained yet).
+        p._client.aretain_batch.reset_mock()
+        p.sync_turn("turn3-user", "turn3-asst")
+
+        old_doc = p._document_id
         p.on_session_switch("new-sid", parent_session_id="test-session", reset=True)
         p._retain_queue.join()
 
+        p._client.aretain_batch.assert_called_once()
         kw = p._client.aretain_batch.call_args.kwargs
-        # Flush goes to the OLD session's stable doc, not new-sid's.
-        assert kw["document_id"] == "test-session"
-        assert kw["items"][0]["update_mode"] == "append"
+        flush_id = kw["document_id"]
+        # Flush id is a NEW immutable batch id: rooted in the OLD session,
+        # distinct from both the committed batch id and the bare old doc.
+        assert flush_id.startswith("test-session-")
+        assert flush_id != committed_id
+        assert flush_id != old_doc
+        # ONLY the uncommitted tail (turn 3); the committed turns 1-2
+        # must NOT be re-retained.
+        content = kw["items"][0]["content"]
+        assert "turn1-user" not in content
+        assert "turn2-user" not in content
+        assert "turn3-user" in content
+        # Old session id preserved in lineage tags + metadata.
+        assert "session:test-session" in kw["items"][0]["tags"]
+        assert kw["items"][0]["metadata"]["session_id"] == "test-session"
+        assert "update_mode" not in kw["items"][0]
+
+        # Rotated to fresh state.
+        assert p._session_id == "new-sid"
+        assert p._session_turns == []
+        assert p._turn_counter == 0
+        assert p._committed_turn_count == 0
+        assert p._document_id != old_doc
+        assert p._document_id.startswith("new-sid-")
+
+    def test_session_switch_retries_failed_batch_before_uncommitted_tail(
+        self, provider_with_config
+    ):
+        """A forced switch retries a failed batch before its later tail."""
+        p = provider_with_config(retain_every_n_turns=2, retain_async=False)
+        p._client.aretain_batch.side_effect = RuntimeError("network down")
+        p.sync_turn("turn1-user", "turn1-asst")
+        p.sync_turn("turn2-user", "turn2-asst")
+        p._retain_queue.join()
+        failed = p._client.aretain_batch.call_args.kwargs
+        failed_id = failed["document_id"]
+        failed_content = failed["items"][0]["content"]
+
+        p._client.aretain_batch.side_effect = None
+        p._client.aretain_batch.reset_mock()
+        p.sync_turn("turn3-user", "turn3-asst")
+        p.on_session_switch(
+            "new-sid", parent_session_id="test-session", reset=True
+        )
+        p._retain_queue.join()
+
+        calls = p._client.aretain_batch.call_args_list
+        assert len(calls) == 2
+        retry = calls[0].kwargs
+        tail = calls[1].kwargs
+        assert retry["document_id"] == failed_id
+        assert retry["items"][0]["content"] == failed_content
+        assert tail["document_id"] != failed_id
+        assert "turn1-user" not in tail["items"][0]["content"]
+        assert "turn2-user" not in tail["items"][0]["content"]
+        assert "turn3-user" in tail["items"][0]["content"]
+        assert "session:test-session" in tail["items"][0]["tags"]
+        assert tail["items"][0]["metadata"]["session_id"] == "test-session"
+        assert p._session_id == "new-sid"
+        assert p._committed_turn_count == 0
+
+    def test_two_resumed_provider_instances_cannot_share_batch_document_id(
+        self, tmp_path, monkeypatch
+    ):
+        """Two provider instances for the SAME session (e.g. a /resume in a
+        second process) must not be able to target the same batch document
+        id. Each mints its own per-process nonce, so even an identical
+        turn-range yields a different immutable id."""
+        config = {"mode": "cloud", "apiKey": "k", "api_url": "http://x", "bank_id": "b"}
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+
+        p1 = HindsightMemoryProvider()
+        p1.initialize(session_id="resumed-session", hermes_home=str(tmp_path), platform="cli")
+        p1._client = _make_mock_client()
+        p1.sync_turn("a-user", "a-asst")
+        p1._retain_queue.join()
+        id1 = p1._client.aretain_batch.call_args.kwargs["document_id"]
+
+        p2 = HindsightMemoryProvider()
+        p2.initialize(session_id="resumed-session", hermes_home=str(tmp_path), platform="cli")
+        p2._client = _make_mock_client()
+        p2.sync_turn("a-user", "a-asst")
+        p2._retain_queue.join()
+        id2 = p2._client.aretain_batch.call_args.kwargs["document_id"]
+
+        # Same session, same turn-range, but different provider nonce →
+        # different immutable batch ids. No cross-process document collision.
+        assert id1 != id2
+        assert id1.startswith("resumed-session-")
+        assert id2.startswith("resumed-session-")
+        assert p1._retain_state.nonce != p2._retain_state.nonce
+
+
+def hindsight_mod():
+    import importlib
+    return importlib.import_module("plugins.memory.hindsight")
 
 
 # ---------------------------------------------------------------------------
@@ -1471,6 +1788,596 @@ class TestSystemPrompt:
         assert "hindsight_recall" in block
 
 
+
+# ---------------------------------------------------------------------------
+# Dynamic scope tags, score floors, and query-correct prefetch (m3)
+# ---------------------------------------------------------------------------
+
+
+class TestDynamicScopeTags:
+    def test_scope_config_accepts_csv_dedupes_and_warns_invalid(
+        self, provider_with_config, caplog
+    ):
+        caplog.set_level("WARNING", logger="plugins.memory.hindsight")
+        p = provider_with_config(
+            scope_tags="workspace, profile, workspace, bogus, session"
+        )
+
+        assert p._scope_dimensions == ["workspace", "profile", "session"]
+        assert "Ignoring invalid Hindsight scope_tags value 'bogus'" in caplog.text
+
+    def test_scope_hashes_canonical_values_without_logging_raw_workspace(
+        self, provider_with_config, tmp_path, caplog
+    ):
+        workspace = tmp_path / "private" / "customer-workspace"
+        workspace.mkdir(parents=True)
+        caplog.set_level("DEBUG", logger="plugins.memory.hindsight")
+
+        p = provider_with_config(
+            scope_tags=["profile", "workspace", "session"],
+            bank_id_template="bank-{workspace}",
+            _init_kwargs={
+                "agent_identity": "profile-a",
+                "agent_workspace": "hermes",
+                "scope_workspace": str(workspace),
+                "session_id": "session-a",
+            },
+        )
+
+        assert p._scope_tags_for_session("session-a") == [
+            _expected_scope_tag("profile", "profile-a"),
+            _expected_scope_tag("workspace", str(workspace)),
+            _expected_scope_tag("session", "session-a"),
+        ]
+        assert p._bank_id == "bank-hermes"
+        assert str(workspace) not in caplog.text
+        assert str(workspace) not in repr(p._scope_tags_for_session("session-a"))
+
+    def test_workspace_scope_hash_separates_resolved_paths_without_changing_bank(
+        self, provider_with_config, tmp_path
+    ):
+        workspace_a = tmp_path / "workspace-a"
+        workspace_b = tmp_path / "workspace-b"
+        workspace_a.mkdir()
+        workspace_b.mkdir()
+
+        providers = [
+            provider_with_config(
+                scope_tags=["workspace"],
+                bank_id_template="bank-{workspace}",
+                _init_kwargs={
+                    "agent_workspace": "hermes",
+                    "scope_workspace": str(workspace),
+                },
+            )
+            for workspace in (workspace_a, workspace_b)
+        ]
+
+        assert [provider._bank_id for provider in providers] == [
+            "bank-hermes",
+            "bank-hermes",
+        ]
+        assert providers[0]._scope_tags_for_session("test-session") != (
+            providers[1]._scope_tags_for_session("test-session")
+        )
+
+    @pytest.mark.parametrize("dimension", ["profile", "workspace", "session"])
+    def test_each_configured_scope_dimension_requires_context(
+        self, provider_with_config, dimension
+    ):
+        init_kwargs = {"session_id": ""} if dimension == "session" else {}
+        p = provider_with_config(
+            scope_tags=[dimension],
+            _init_kwargs=init_kwargs,
+        )
+
+        with pytest.raises(ValueError, match=dimension):
+            p._scope_tags_for_session(p._session_id)
+
+    def test_automatic_prefetch_fails_closed_when_scope_context_is_missing(
+        self, provider_with_config, caplog
+    ):
+        sensitive_profile = "private-profile-value"
+        sensitive_session = "private-session-value"
+        p = provider_with_config(
+            scope_tags=["profile", "workspace", "session"],
+            _init_kwargs={
+                "agent_identity": sensitive_profile,
+                "session_id": sensitive_session,
+            },
+        )
+        caplog.set_level("DEBUG", logger="plugins.memory.hindsight")
+
+        assert p.prefetch("scoped automatic query") == ""
+        p._client.arecall.assert_not_called()
+        assert sensitive_profile not in caplog.text
+        assert sensitive_session not in caplog.text
+
+    def test_explicit_tools_fail_closed_when_scope_context_is_missing(
+        self, provider_with_config
+    ):
+        sensitive_profile = "private-profile-value"
+        sensitive_session = "private-session-value"
+        p = provider_with_config(
+            scope_tags=["profile", "workspace", "session"],
+            _init_kwargs={
+                "agent_identity": sensitive_profile,
+                "session_id": sensitive_session,
+            },
+        )
+
+        calls = [
+            ("hindsight_recall", {"query": "find it"}),
+            ("hindsight_reflect", {"query": "synthesize it"}),
+            ("hindsight_retain", {"content": "remember it"}),
+        ]
+        for tool_name, args in calls:
+            result = json.loads(p.handle_tool_call(tool_name, args))
+            assert "error" in result
+            assert "workspace" in result["error"]
+            assert sensitive_profile not in result["error"]
+            assert sensitive_session not in result["error"]
+
+        p._client.arecall.assert_not_called()
+        p._client.areflect.assert_not_called()
+        p._client.aretain_batch.assert_not_called()
+
+    def test_automatic_retain_fails_closed_when_scope_context_is_missing(
+        self, provider_with_config, caplog
+    ):
+        sensitive_profile = "private-profile-value"
+        sensitive_session = "private-session-value"
+        p = provider_with_config(
+            scope_tags=["profile", "workspace", "session"],
+            _init_kwargs={
+                "agent_identity": sensitive_profile,
+                "session_id": sensitive_session,
+            },
+        )
+        caplog.set_level("DEBUG", logger="plugins.memory.hindsight")
+
+        p.sync_turn("secret user turn", "secret assistant turn")
+        p._retain_queue.join()
+
+        p._client.aretain_batch.assert_not_called()
+        assert sensitive_profile not in caplog.text
+        assert sensitive_session not in caplog.text
+
+    def test_automatic_retain_includes_all_current_scope_tags(
+        self, provider_with_config, tmp_path
+    ):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        p = provider_with_config(
+            retain_tags=["configured"],
+            scope_tags=["profile", "workspace", "session"],
+            _init_kwargs={
+                "agent_identity": "profile-a",
+                "agent_workspace": "hermes",
+                "scope_workspace": str(workspace),
+            },
+        )
+
+        p.sync_turn("hello", "hi")
+        p._retain_queue.join()
+
+        tags = p._client.aretain_batch.call_args.kwargs["items"][0]["tags"]
+        assert "configured" in tags
+        assert "session:test-session" in tags
+        assert _expected_scope_tag("profile", "profile-a") in tags
+        assert _expected_scope_tag("workspace", str(workspace)) in tags
+        assert _expected_scope_tag("session", "test-session") in tags
+
+    def test_manual_retain_uses_current_scope_tags(
+        self, provider_with_config, tmp_path
+    ):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        p = provider_with_config(
+            scope_tags=["profile", "workspace", "session"],
+            _init_kwargs={
+                "agent_identity": "profile-a",
+                "agent_workspace": "hermes",
+                "scope_workspace": str(workspace),
+            },
+        )
+
+        p.handle_tool_call("hindsight_retain", {"content": "remember this"})
+
+        tags = p._client.aretain_batch.call_args.kwargs["items"][0]["tags"]
+        assert tags == [
+            _expected_scope_tag("profile", "profile-a"),
+            _expected_scope_tag("workspace", str(workspace)),
+            _expected_scope_tag("session", "test-session"),
+        ]
+
+    def test_explicit_recall_and_reflect_require_all_scopes(
+        self, provider_with_config, tmp_path
+    ):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        p = provider_with_config(
+            recall_tags=["shared", "shared"],
+            recall_tags_match="any_strict",
+            scope_tags=["profile", "workspace", "session"],
+            _init_kwargs={
+                "agent_identity": "profile-a",
+                "agent_workspace": "hermes",
+                "scope_workspace": str(workspace),
+            },
+        )
+        expected = [
+            "shared",
+            _expected_scope_tag("profile", "profile-a"),
+            _expected_scope_tag("workspace", str(workspace)),
+            _expected_scope_tag("session", "test-session"),
+        ]
+
+        p.handle_tool_call("hindsight_recall", {"query": "find it"})
+        recall_kwargs = p._client.arecall.call_args.kwargs
+        assert recall_kwargs["tags"] == expected
+        assert recall_kwargs["tags_match"] == "all_strict"
+
+        p.handle_tool_call("hindsight_reflect", {"query": "synthesize it"})
+        reflect_kwargs = p._client.areflect.call_args.kwargs
+        assert reflect_kwargs["tags"] == expected
+        assert reflect_kwargs["tags_match"] == "all_strict"
+
+    def test_session_switch_flush_uses_old_session_scope(
+        self, provider_with_config
+    ):
+        p = provider_with_config(
+            scope_tags=["session"],
+            retain_every_n_turns=2,
+            retain_async=False,
+        )
+        p.sync_turn("old user", "old assistant")
+
+        p.on_session_switch(
+            "new-session",
+            parent_session_id="test-session",
+            reset=True,
+        )
+        p._retain_queue.join()
+
+        tags = p._client.aretain_batch.call_args.kwargs["items"][0]["tags"]
+        assert _expected_scope_tag("session", "test-session") in tags
+        assert _expected_scope_tag("session", "new-session") not in tags
+
+    def test_scope_disabled_preserves_legacy_query_tag_behavior(
+        self, provider_with_config
+    ):
+        p = provider_with_config(
+            scope_tags=[],
+            recall_tags=["legacy"],
+            recall_tags_match="any_strict",
+        )
+
+        p.queue_prefetch("automatic query")
+        p._prefetch_thread.join(timeout=5.0)
+        automatic_kwargs = p._client.arecall.call_args.kwargs
+        assert automatic_kwargs["tags"] == ["legacy"]
+        assert automatic_kwargs["tags_match"] == "any_strict"
+
+        p.handle_tool_call("hindsight_recall", {"query": "explicit query"})
+        explicit_kwargs = p._client.arecall.call_args.kwargs
+        assert explicit_kwargs["tags"] == ["legacy"]
+        assert explicit_kwargs["tags_match"] == "any_strict"
+
+        p.handle_tool_call("hindsight_reflect", {"query": "reflect query"})
+        reflect_kwargs = p._client.areflect.call_args.kwargs
+        assert "tags" not in reflect_kwargs
+        assert "tags_match" not in reflect_kwargs
+
+
+class _UnsupportedRecallClient:
+    def __init__(self):
+        self.recall_calls = 0
+
+    async def arecall(
+        self,
+        bank_id,
+        query,
+        budget,
+        max_tokens,
+        types=None,
+        tags=None,
+        tags_match=None,
+    ):
+        self.recall_calls += 1
+        return SimpleNamespace(results=[SimpleNamespace(text="unfiltered")])
+
+
+class TestRecallMinScores:
+    def test_valid_scores_normalize_and_invalid_entries_warn(
+        self, provider_with_config, caplog
+    ):
+        caplog.set_level("WARNING", logger="plugins.memory.hindsight")
+        p = provider_with_config(
+            recall_min_scores={
+                "semantic": 0,
+                "keyword": 1.25,
+                "reranker": float("nan"),
+                "final": -0.1,
+                "unknown": 0.5,
+                "bool-score": True,
+            }
+        )
+
+        assert p._recall_min_scores == {"semantic": 0.0, "keyword": 1.25}
+        assert "Invalid Hindsight recall_min_scores entry 'reranker'" in caplog.text
+        assert "Invalid Hindsight recall_min_scores entry 'final'" in caplog.text
+        assert "Ignoring unknown Hindsight recall_min_scores key 'unknown'" in caplog.text
+        assert "Ignoring unknown Hindsight recall_min_scores key 'bool-score'" in caplog.text
+
+    def test_non_mapping_scores_disable_filter_with_warning(
+        self, provider_with_config, caplog
+    ):
+        caplog.set_level("WARNING", logger="plugins.memory.hindsight")
+        p = provider_with_config(recall_min_scores=["semantic", 0.5])
+
+        assert p._recall_min_scores == {}
+        assert "Hindsight recall_min_scores must be an object" in caplog.text
+
+    def test_supported_auto_and_explicit_recall_receive_score_floors(
+        self, provider_with_config
+    ):
+        p = provider_with_config(
+            recall_min_scores={"semantic": 0.2, "final": 0.7}
+        )
+
+        auto_context = p.prefetch("automatic query")
+        assert "Memory 1" in auto_context
+        assert p._client.arecall.call_args.kwargs["min_scores"] == {
+            "semantic": 0.2,
+            "final": 0.7,
+        }
+
+        p._client.arecall.reset_mock()
+        p.handle_tool_call("hindsight_recall", {"query": "explicit query"})
+        assert p._client.arecall.call_args.kwargs["min_scores"] == {
+            "semantic": 0.2,
+            "final": 0.7,
+        }
+
+    def test_unsupported_auto_recall_fails_closed_and_warns_once(
+        self, provider_with_config, caplog
+    ):
+        p = provider_with_config(recall_min_scores={"final": 0.8})
+        client = _UnsupportedRecallClient()
+        p._client = client
+        caplog.set_level("WARNING", logger="plugins.memory.hindsight")
+
+        assert p.prefetch("first query") == ""
+        assert p.prefetch("second query") == ""
+
+        assert client.recall_calls == 0
+        warnings = [
+            record.message
+            for record in caplog.records
+            if "hindsight-client>=0.8.4" in record.message
+        ]
+        assert len(warnings) == 1
+
+    def test_unsupported_explicit_recall_errors_without_calling_client(
+        self, provider_with_config
+    ):
+        p = provider_with_config(recall_min_scores={"final": 0.8})
+        client = _UnsupportedRecallClient()
+        p._client = client
+
+        result = json.loads(
+            p.handle_tool_call("hindsight_recall", {"query": "explicit query"})
+        )
+
+        assert client.recall_calls == 0
+        assert "error" in result
+        assert "hindsight-client>=0.8.4" in result["error"]
+
+    def test_filtered_auto_reflect_fails_closed_but_explicit_reflect_works(
+        self, provider_with_config, caplog
+    ):
+        p = provider_with_config(
+            recall_min_scores={"final": 0.8},
+            recall_prefetch_method="reflect",
+            scope_tags=["session"],
+        )
+        caplog.set_level("WARNING", logger="plugins.memory.hindsight")
+
+        assert p.prefetch("automatic reflection") == ""
+        p._client.areflect.assert_not_called()
+        assert "recall_prefetch_method=reflect cannot apply recall_min_scores" in caplog.text
+
+        result = json.loads(
+            p.handle_tool_call("hindsight_reflect", {"query": "explicit reflection"})
+        )
+        assert result["result"] == "Synthesized answer"
+        reflect_kwargs = p._client.areflect.call_args.kwargs
+        assert reflect_kwargs["tags"] == [
+            _expected_scope_tag("session", "test-session")
+        ]
+        assert reflect_kwargs["tags_match"] == "all_strict"
+
+
+class TestCurrentQueryPrefetch:
+    def test_prefetch_never_returns_previous_query_result(self, provider):
+        async def _query_result(**kwargs):
+            return SimpleNamespace(
+                results=[SimpleNamespace(text=f"memory for {kwargs['query']}")]
+            )
+
+        provider._client.arecall = AsyncMock(side_effect=_query_result)
+        provider.queue_prefetch("previous query")
+        provider._prefetch_thread.join(timeout=5.0)
+
+        result = provider.prefetch(" current query ")
+
+        assert "memory for current query" in result
+        assert "memory for previous query" not in result
+        assert [
+            call.kwargs["query"] for call in provider._client.arecall.call_args_list
+        ] == ["previous query", "current query"]
+
+    def test_new_generation_blocks_older_worker_publish(self, provider):
+        import threading
+
+        old_started = threading.Event()
+        release_old = threading.Event()
+
+        def _recall(**kwargs):
+            if kwargs["query"] == "old query":
+                old_started.set()
+                release_old.wait(timeout=5.0)
+            return SimpleNamespace(
+                results=[SimpleNamespace(text=f"memory for {kwargs['query']}")]
+            )
+
+        client = SimpleNamespace(arecall=_recall)
+        provider._run_hindsight_operation = lambda operation: operation(client)
+
+        provider.queue_prefetch("old query")
+        old_thread = provider._prefetch_thread
+        assert old_started.wait(timeout=2.0)
+
+        provider.queue_prefetch("new query")
+        newer_thread = provider._prefetch_thread
+        release_old.set()
+        old_thread.join(timeout=5.0)
+        if newer_thread is not old_thread:
+            newer_thread.join(timeout=5.0)
+
+        result = provider.prefetch("new query")
+        assert "memory for new query" in result
+        assert "memory for old query" not in result
+
+    def test_same_query_inflight_is_deduplicated(self, provider):
+        import threading
+
+        started = threading.Event()
+        release = threading.Event()
+        calls = 0
+
+        def _recall(**kwargs):
+            nonlocal calls
+            calls += 1
+            started.set()
+            release.wait(timeout=5.0)
+            return SimpleNamespace(results=[])
+
+        client = SimpleNamespace(arecall=_recall)
+        provider._run_hindsight_operation = lambda operation: operation(client)
+
+        provider.queue_prefetch("same query")
+        first_thread = provider._prefetch_thread
+        assert started.wait(timeout=2.0)
+        provider.queue_prefetch("same query")
+        second_thread = provider._prefetch_thread
+        release.set()
+        first_thread.join(timeout=5.0)
+        if second_thread is not first_thread:
+            second_thread.join(timeout=5.0)
+
+        assert second_thread is first_thread
+        assert calls == 1
+
+    def test_post_turn_queue_is_noop_after_current_query_recall(self, provider):
+        context = provider.prefetch("current query")
+        assert "Memory 1" in context
+        assert provider._client.arecall.call_count == 1
+
+        worker = provider._prefetch_thread
+        provider.queue_prefetch("current query")
+        if provider._prefetch_thread is not worker:
+            provider._prefetch_thread.join(timeout=5.0)
+
+        assert provider._client.arecall.call_count == 1
+
+    def test_completed_prefetch_result_is_scoped_by_session(
+        self, provider_with_config
+    ):
+        p = provider_with_config(scope_tags=["session"])
+        calls: list[list[str]] = []
+
+        async def _scoped_recall(**kwargs):
+            calls.append(kwargs["tags"])
+            return SimpleNamespace(
+                results=[SimpleNamespace(text=f"memory from call {len(calls)}")]
+            )
+
+        p._client.arecall = AsyncMock(side_effect=_scoped_recall)
+        p.queue_prefetch("same query", session_id="session-a")
+        p._join_prefetch_workers(timeout=5.0)
+
+        result = p.prefetch("same query", session_id="session-b")
+
+        assert "memory from call 2" in result
+        assert calls == [
+            [_expected_scope_tag("session", "session-a")],
+            [_expected_scope_tag("session", "session-b")],
+        ]
+
+    def test_same_query_different_session_is_not_inflight_deduplicated(
+        self, provider_with_config
+    ):
+        import threading
+
+        p = provider_with_config(scope_tags=["session"])
+        calls: list[list[str]] = []
+        first_started = threading.Event()
+        both_started = threading.Event()
+        release = threading.Event()
+
+        def _recall(**kwargs):
+            calls.append(kwargs["tags"])
+            first_started.set()
+            if len(calls) == 2:
+                both_started.set()
+            release.wait(timeout=5.0)
+            session = "a" if kwargs["tags"] == [
+                _expected_scope_tag("session", "session-a")
+            ] else "b"
+            return SimpleNamespace(
+                results=[SimpleNamespace(text=f"memory for session {session}")]
+            )
+
+        client = SimpleNamespace(arecall=_recall)
+        p._run_hindsight_operation = lambda operation: operation(client)
+
+        p.queue_prefetch("same query", session_id="session-a")
+        assert first_started.wait(timeout=2.0)
+        p.queue_prefetch("same query", session_id="session-b")
+        observed_both = both_started.wait(timeout=2.0)
+        worker_count = len(p._prefetch_threads)
+        release.set()
+        p._join_prefetch_workers(timeout=5.0)
+
+        assert observed_both
+        assert worker_count <= 2
+        assert calls == [
+            [_expected_scope_tag("session", "session-a")],
+            [_expected_scope_tag("session", "session-b")],
+        ]
+        assert "memory for session b" in p.prefetch(
+            "same query", session_id="session-b"
+        )
+
+    def test_post_turn_duplicate_suppression_is_scoped_by_session(
+        self, provider_with_config
+    ):
+        p = provider_with_config(scope_tags=["session"])
+
+        assert p.prefetch("same query", session_id="session-a")
+        p.queue_prefetch("same query", session_id="session-b")
+        p._join_prefetch_workers(timeout=5.0)
+
+        assert p._client.arecall.call_count == 2
+        assert p._client.arecall.call_args_list[0].kwargs["tags"] == [
+            _expected_scope_tag("session", "session-a")
+        ]
+        assert p._client.arecall.call_args_list[1].kwargs["tags"] == [
+            _expected_scope_tag("session", "session-b")
+        ]
+
 # ---------------------------------------------------------------------------
 # Config schema tests
 # ---------------------------------------------------------------------------
@@ -1487,6 +2394,7 @@ class TestConfigSchema:
             "retain_tags", "retain_source",
             "retain_user_prefix", "retain_assistant_prefix",
             "recall_tags", "recall_tags_match",
+            "scope_tags", "recall_min_scores",
             "auto_recall", "auto_retain",
             "retain_every_n_turns", "retain_async", "retain_context",
             "recall_max_tokens", "recall_max_input_chars",

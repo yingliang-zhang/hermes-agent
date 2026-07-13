@@ -77,6 +77,8 @@ class MemoryProvider(ABC):
           - agent_identity (str): Profile name (e.g. "coder"). Use for
             per-profile provider identity scoping.
           - agent_workspace (str): Shared workspace name (e.g. "hermes").
+          - scope_workspace (str): Resolved working-directory path used only
+            for providers' dynamic workspace isolation.
           - parent_session_id (str): For subagents, the parent's session_id.
           - user_id (str): Platform user identifier (gateway sessions).
           - user_id_alt (str): Optional alternate stable platform user identifier.

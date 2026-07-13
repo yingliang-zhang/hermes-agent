@@ -1673,20 +1673,55 @@ def init_agent(
     
 
 
-    # Memory provider plugin (external — one at a time, alongside built-in)
-    # Reads memory.provider from config to select which plugin to activate.
+    # Memory providers and read-only recall context sources.
+    # Only one external provider is allowed; context sources occupy no provider
+    # slot.
     agent._memory_manager = None
+    _basic_source = None
     if not skip_memory:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
+            _basic_cfg = mem_config.get("basic_memory", {}) if mem_config else {}
+            try:
+                from agent.basic_memory_recall import (
+                    BasicMemoryRecallSource as _BasicMemoryRecallSource,
+                )
 
-            if _mem_provider_name and _mem_provider_name.strip():
+                _basic_source = _BasicMemoryRecallSource.from_config(_basic_cfg)
+            except Exception as _basic_error:
+                _ra().logger.warning(
+                    "Basic Memory context source init failed: %s", _basic_error
+                )
+                if _basic_source is not None:
+                    try:
+                        _basic_source.shutdown()
+                    except Exception as _shutdown_error:
+                        _ra().logger.warning(
+                            "Basic Memory partial source cleanup failed: %s",
+                            _shutdown_error,
+                        )
+                _basic_source = None
+            _has_external_provider = (
+                isinstance(_mem_provider_name, str) and bool(_mem_provider_name.strip())
+            )
+            _provider_load_failed = False
+
+            if _has_external_provider or _basic_source is not None:
                 from agent.memory_manager import MemoryManager as _MemoryManager
-                from plugins.memory import load_memory_provider as _load_mem
                 agent._memory_manager = _MemoryManager()
-                _mp = _load_mem(_mem_provider_name)
-                if _mp and _mp.is_available():
-                    agent._memory_manager.add_provider(_mp)
+                if _basic_source is not None:
+                    agent._memory_manager.add_context_source(_basic_source)
+                if _has_external_provider:
+                    try:
+                        from plugins.memory import load_memory_provider as _load_mem
+                        _mp = _load_mem(_mem_provider_name)
+                        if _mp and _mp.is_available():
+                            agent._memory_manager.add_provider(_mp)
+                    except Exception as _provider_error:
+                        _provider_load_failed = True
+                        _ra().logger.warning(
+                            "Memory provider plugin init failed: %s", _provider_error
+                        )
                 if agent._memory_manager.providers:
                     _init_kwargs = {
                         "session_id": agent.session_id,
@@ -1729,16 +1764,49 @@ def init_agent(
                         from hermes_cli.profiles import get_active_profile_name
                         _profile = get_active_profile_name()
                         _init_kwargs["agent_identity"] = _profile
-                        _init_kwargs["agent_workspace"] = "hermes"
+                    except Exception:
+                        pass
+                    _init_kwargs["agent_workspace"] = "hermes"
+                    try:
+                        from agent.runtime_cwd import resolve_agent_cwd
+                        _init_kwargs["scope_workspace"] = str(resolve_agent_cwd())
                     except Exception:
                         pass
                     agent._memory_manager.initialize_all(**_init_kwargs)
                     _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
                 else:
-                    _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
-                    agent._memory_manager = None
+                    if _has_external_provider and not _provider_load_failed:
+                        _ra().logger.debug(
+                            "Memory provider '%s' not found or not available",
+                            _mem_provider_name,
+                        )
+                    if not agent._memory_manager.context_sources:
+                        agent._memory_manager = None
         except Exception as _mpe:
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
+            _manager = agent._memory_manager
+            _source_managed = False
+            if _manager is not None and _basic_source is not None:
+                try:
+                    _source_managed = _basic_source in _manager.context_sources
+                except Exception:
+                    pass
+            if _manager is not None:
+                try:
+                    _manager.shutdown_all()
+                except Exception as _shutdown_error:
+                    _ra().logger.warning(
+                        "Memory manager cleanup after init failure failed: %s",
+                        _shutdown_error,
+                    )
+            if _basic_source is not None and not _source_managed:
+                try:
+                    _basic_source.shutdown()
+                except Exception as _shutdown_error:
+                    _ra().logger.warning(
+                        "Memory context source cleanup after init failure failed: %s",
+                        _shutdown_error,
+                    )
             agent._memory_manager = None
 
     from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
