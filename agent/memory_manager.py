@@ -367,6 +367,20 @@ class MemoryManager:
         # _submit_background() and the sync_all/queue_prefetch_all rationale.
         self._sync_executor: Optional[ThreadPoolExecutor] = None
         self._sync_executor_lock = threading.Lock()
+        # Slow provider calls share one lock across synchronous reads and the
+        # accepted-work worker. Boundary reservation never takes this lock.
+        self._provider_call_lock = threading.RLock()
+        # A reserved session-boundary generation closes synchronous memory
+        # reads before the caller publishes a new session id. The single
+        # provider worker later commits the newest generation.
+        self._session_boundary_lock = threading.RLock()
+        self._session_boundary_condition = threading.Condition(
+            self._session_boundary_lock
+        )
+        self._session_boundary_generation = 0
+        self._session_boundary_completed = 0
+        self._session_switch_failed = False
+        self._bound_session_id = ""
         # Shutdown linearizes with submission under _sync_executor_lock. Once
         # closed, the manager never creates a replacement worker.
         self._background_closed = False
@@ -460,23 +474,35 @@ class MemoryManager:
     # -- System prompt -------------------------------------------------------
 
     def build_system_prompt(self) -> str:
-        """Collect system prompt blocks from all providers.
+        """Collect a generation-stable system-prompt block from providers.
 
-        Returns combined text, or empty string if no providers contribute.
-        Each non-empty block is labeled with the provider name.
+        The first prompt after a session transition waits for that transition's
+        accepted job to finish. A failed rebind completes the wait but leaves
+        memory disabled, yielding one stable memory-free prompt.
         """
-        blocks = []
-        for provider in self._providers:
-            try:
-                block = provider.system_prompt_block()
-                if block and block.strip():
-                    blocks.append(block)
-            except Exception as e:
-                logger.warning(
-                    "Memory provider '%s' system_prompt_block() failed: %s",
-                    provider.name, e,
-                )
-        return "\n\n".join(blocks)
+        while True:
+            generation = self._wait_for_readable_generation()
+            if generation is None:
+                return ""
+            with self._provider_call_lock:
+                with self._session_boundary_lock:
+                    if not self._memory_enabled_for_generation_locked(generation):
+                        continue
+                blocks = []
+                for provider in self._providers:
+                    try:
+                        block = provider.system_prompt_block()
+                        if block and block.strip():
+                            blocks.append(block)
+                    except Exception as e:
+                        logger.warning(
+                            "Memory provider '%s' system_prompt_block() failed: %s",
+                            provider.name, e,
+                        )
+                result = "\n\n".join(blocks)
+                with self._session_boundary_lock:
+                    if self._memory_enabled_for_generation_locked(generation):
+                        return result
 
     # -- Prefetch / recall ---------------------------------------------------
 
@@ -499,26 +525,34 @@ class MemoryManager:
         return extract_user_instruction_from_skill_message(text)
 
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
-        """Collect prefetch context from all providers.
-
-        Returns merged context text labeled by provider. Empty providers
-        are skipped. Failures in one provider don't block others.
-        """
+        """Collect generation-stable prefetch context from all providers."""
+        generation = self._capture_readable_generation()
+        if generation is None:
+            logger.debug("Memory prefetch skipped during session boundary")
+            return ""
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
             return ""
-        parts = []
-        for provider in self._providers:
-            try:
-                result = provider.prefetch(clean_query, session_id=session_id)
-                if result and result.strip():
-                    parts.append(result)
-            except Exception as e:
-                logger.debug(
-                    "Memory provider '%s' prefetch failed (non-fatal): %s",
-                    provider.name, e,
-                )
-        return "\n\n".join(parts)
+        with self._provider_call_lock:
+            with self._session_boundary_lock:
+                if not self._memory_enabled_for_generation_locked(generation):
+                    return ""
+            parts = []
+            for provider in self._providers:
+                try:
+                    result = provider.prefetch(clean_query, session_id=session_id)
+                    if result and result.strip():
+                        parts.append(result)
+                except Exception as e:
+                    logger.debug(
+                        "Memory provider '%s' prefetch failed (non-fatal): %s",
+                        provider.name, e,
+                    )
+            result = "\n\n".join(parts)
+            with self._session_boundary_lock:
+                if self._memory_enabled_for_generation_locked(generation):
+                    return result
+        return ""
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn.
@@ -545,7 +579,7 @@ class MemoryManager:
                         provider.name, e,
                     )
 
-        self._submit_background(_run)
+        self._submit_provider_work(_run, operation="queued prefetch")
 
     # -- Sync ----------------------------------------------------------------
 
@@ -617,9 +651,60 @@ class MemoryManager:
                         provider.name, e,
                     )
 
-        self._submit_background(_run)
+        self._submit_provider_work(_run, operation="turn sync")
 
     # -- Background dispatch -------------------------------------------------
+
+    def _submit_provider_work(self, fn, *, operation: str) -> bool:
+        """Queue provider work behind the boundary generation that accepted it.
+
+        Stable work stays FIFO ahead of a later boundary. Work accepted while
+        a boundary is pending runs only after that same generation rebinds
+        successfully; supersession or failure drops it closed.
+        """
+        with self._session_boundary_lock:
+            generation = self._session_boundary_generation
+            accepted_while_pending = (
+                self._session_boundary_completed < generation
+                or self._session_switch_failed
+            )
+
+            def _guarded() -> None:
+                with self._session_boundary_lock:
+                    current_generation = self._session_boundary_generation
+                    if accepted_while_pending:
+                        allowed = (
+                            current_generation == generation
+                            and self._session_boundary_completed >= generation
+                            and not self._session_switch_failed
+                        )
+                    else:
+                        allowed = not (
+                            current_generation == generation
+                            and (
+                                self._session_boundary_completed < generation
+                                or self._session_switch_failed
+                            )
+                        )
+                    if not allowed:
+                        logger.debug(
+                            "Skipping memory %s: boundary generation %d is not usable "
+                            "(current=%d completed=%d failed=%s)",
+                            operation,
+                            generation,
+                            current_generation,
+                            self._session_boundary_completed,
+                            self._session_switch_failed,
+                        )
+                        return
+                with self._provider_call_lock:
+                    fn()
+
+            accepted = self._submit_background(_guarded)
+
+        if not accepted:
+            logger.warning("Dropping memory %s: background worker unavailable", operation)
+        return accepted
 
     def _submit_background(self, fn) -> bool:
         """Submit ``fn`` atomically with respect to manager shutdown.
@@ -750,41 +835,54 @@ class MemoryManager:
     def handle_tool_call(
         self, tool_name: str, args: Dict[str, Any], **kwargs
     ) -> str:
-        """Route a tool call to the correct provider.
-
-        Returns JSON string result. Raises ValueError if no provider
-        handles the tool.
-        """
+        """Route a generation-stable tool call to its provider."""
+        generation = self._capture_readable_generation()
+        if generation is None:
+            return tool_error(
+                "Memory session transition is still finalizing; "
+                "retry after the boundary completes"
+            )
         provider = self._tool_to_provider.get(tool_name)
         if provider is None:
             return tool_error(f"No memory provider handles tool '{tool_name}'")
-        try:
-            return provider.handle_tool_call(tool_name, args, **kwargs)
-        except Exception as e:
-            logger.error(
-                "Memory provider '%s' handle_tool_call(%s) failed: %s",
-                provider.name, tool_name, e,
-            )
-            return tool_error(f"Memory tool '{tool_name}' failed: {e}")
+        with self._provider_call_lock:
+            with self._session_boundary_lock:
+                if not self._memory_enabled_for_generation_locked(generation):
+                    return tool_error(
+                        "Memory session transition is still finalizing; "
+                        "retry after the boundary completes"
+                    )
+            try:
+                result = provider.handle_tool_call(tool_name, args, **kwargs)
+            except Exception as e:
+                logger.error(
+                    "Memory provider '%s' handle_tool_call(%s) failed: %s",
+                    provider.name, tool_name, e,
+                )
+                return tool_error(f"Memory tool '{tool_name}' failed: {e}")
+            with self._session_boundary_lock:
+                if self._memory_enabled_for_generation_locked(generation):
+                    return result
+        return tool_error(
+            "Memory session transition changed while the tool was running; retry"
+        )
 
     # -- Lifecycle hooks -----------------------------------------------------
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-        """Notify all providers of a new turn.
+        """Notify all providers of a new turn without overlapping other hooks."""
+        with self._provider_call_lock:
+            for provider in self._providers:
+                try:
+                    provider.on_turn_start(turn_number, message, **kwargs)
+                except Exception as e:
+                    logger.debug(
+                        "Memory provider '%s' on_turn_start failed: %s",
+                        provider.name, e,
+                    )
 
-        kwargs may include: remaining_tokens, model, platform, tool_count.
-        """
-        for provider in self._providers:
-            try:
-                provider.on_turn_start(turn_number, message, **kwargs)
-            except Exception as e:
-                logger.debug(
-                    "Memory provider '%s' on_turn_start failed: %s",
-                    provider.name, e,
-                )
-
-    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        """Notify all providers of session end."""
+    def _notify_session_end_locked(self, messages: List[Dict[str, Any]]) -> None:
+        """Invoke session-end hooks while the provider-call lock is held."""
         for provider in self._providers:
             try:
                 provider.on_session_end(messages)
@@ -795,6 +893,67 @@ class MemoryManager:
                     exc_info=True,
                 )
 
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        """Notify all providers of session end without hook overlap."""
+        with self._provider_call_lock:
+            self._notify_session_end_locked(messages)
+
+    def _memory_enabled_for_generation_locked(self, generation: int) -> bool:
+        return (
+            generation == self._session_boundary_generation
+            and self._session_boundary_completed >= generation
+            and not self._session_switch_failed
+        )
+
+    def _capture_readable_generation(self) -> Optional[int]:
+        with self._session_boundary_lock:
+            generation = self._session_boundary_generation
+            if not self._memory_enabled_for_generation_locked(generation):
+                return None
+            return generation
+
+    def _wait_for_readable_generation(self) -> Optional[int]:
+        with self._session_boundary_condition:
+            while (
+                self._session_boundary_completed
+                < self._session_boundary_generation
+            ):
+                self._session_boundary_condition.wait()
+            generation = self._session_boundary_generation
+            if not self._memory_enabled_for_generation_locked(generation):
+                return None
+            return generation
+
+    @property
+    def session_boundary_pending(self) -> bool:
+        """Whether the current generation's accepted job is unfinished."""
+        with self._session_boundary_lock:
+            return (
+                self._session_boundary_completed < self._session_boundary_generation
+            )
+
+    @property
+    def memory_enabled(self) -> bool:
+        """Whether provider reads are safe for the current generation."""
+        with self._session_boundary_lock:
+            return self._memory_enabled_for_generation_locked(
+                self._session_boundary_generation
+            )
+
+    def reserve_session_boundary(self) -> int:
+        """Publish a generation without waiting for slow provider work."""
+        with self._session_boundary_condition:
+            self._session_boundary_generation += 1
+            self._session_boundary_condition.notify_all()
+            return self._session_boundary_generation
+
+    def _complete_session_boundary(self, generation: int) -> None:
+        with self._session_boundary_condition:
+            self._session_boundary_completed = max(
+                self._session_boundary_completed, generation
+            )
+            self._session_boundary_condition.notify_all()
+
     def commit_session_boundary_async(
         self,
         messages: List[Dict[str, Any]],
@@ -802,47 +961,128 @@ class MemoryManager:
         new_session_id: str,
         parent_session_id: str = "",
         reason: str = "new_session",
+        on_switched: Optional[Callable[[], None]] = None,
+        generation: Optional[int] = None,
     ) -> None:
-        """Queue old-session extraction + provider rebinding as ONE serialized task.
-
-        Session rotation (/new) must deliver ``on_session_end`` (end-of-session
-        extraction — an LLM-bound call that can take seconds) strictly BEFORE
-        ``on_session_switch`` (which rebinds provider-internal ``_session_id`` /
-        turn buffers to the new session). Running extraction inline blocked the
-        /new command for the whole LLM round-trip (#16454); running it on an
-        ad-hoc thread raced the inline switch — providers key off internal
-        state, so a late ``on_session_end`` ran against post-switch bindings
-        (transcript misattributed to the new session id, double-ingest of the
-        old turn buffer, new-session buffers cleared).
-
-        Submitting BOTH hooks as one task on the manager's single background
-        worker gives both properties at a single chokepoint: the caller returns
-        immediately, and the worker's FIFO order serializes end→switch against
-        every other provider write (per-turn ``sync_all``, prefetches), which
-        already share the same worker. If the executor is unavailable, the
-        boundary task is rejected with a warning rather than running provider
-        code inline outside lifecycle tracking.
-        """
-        if not self._providers:
+        """Queue old extraction and rebind as one generation-aware job."""
+        if not self._providers or not new_session_id:
             return
         snapshot = list(messages or [])
+        if generation is None:
+            generation = self.reserve_session_boundary()
 
         def _run() -> None:
-            try:
-                self.on_session_end(snapshot)
-            except Exception as e:  # pragma: no cover - on_session_end guards per-provider
-                logger.warning("Session-boundary extraction failed: %s", e)
-            try:
-                self.on_session_switch(
+            switched = False
+            with self._provider_call_lock:
+                with self._session_boundary_lock:
+                    if generation != self._session_boundary_generation:
+                        self._complete_session_boundary(generation)
+                        logger.debug(
+                            "Skipping superseded memory boundary %d before extraction",
+                            generation,
+                        )
+                        return
+                    bound_session_id = self._bound_session_id
+
+                extraction_allowed = not (
+                    snapshot
+                    and parent_session_id
+                    and bound_session_id
+                    and bound_session_id != parent_session_id
+                )
+                if snapshot and not extraction_allowed:
+                    logger.warning(
+                        "Skipping memory extraction for unbound parent session %s "
+                        "(provider is bound to %s)",
+                        parent_session_id,
+                        bound_session_id,
+                    )
+                elif snapshot:
+                    self._notify_session_end_locked(snapshot)
+
+                with self._session_boundary_lock:
+                    if generation != self._session_boundary_generation:
+                        self._complete_session_boundary(generation)
+                        logger.debug(
+                            "Skipping superseded memory boundary %d provider switch",
+                            generation,
+                        )
+                        return
+
+                switched = self._switch_providers_on_worker(
                     new_session_id,
                     parent_session_id=parent_session_id,
                     reset=True,
                     reason=reason,
                 )
-            except Exception as e:  # pragma: no cover - on_session_switch guards per-provider
-                logger.warning("Session-boundary switch failed: %s", e)
 
-        self._submit_background(_run)
+            with self._session_boundary_lock:
+                if generation != self._session_boundary_generation:
+                    self._complete_session_boundary(generation)
+                    return
+                if switched and on_switched is not None:
+                    try:
+                        on_switched()
+                    except Exception as e:
+                        switched = False
+                        logger.warning(
+                            "Session-boundary completion callback failed; "
+                            "memory remains disabled: %s",
+                            e,
+                        )
+                self._session_switch_failed = not switched
+                if not switched:
+                    logger.warning(
+                        "Memory session boundary %d rebind failed; "
+                        "memory remains disabled",
+                        generation,
+                    )
+                self._complete_session_boundary(generation)
+
+        if not self._submit_background(_run):
+            with self._session_boundary_lock:
+                if generation == self._session_boundary_generation:
+                    self._session_switch_failed = True
+                self._complete_session_boundary(generation)
+            logger.warning(
+                "Memory session boundary %d could not be queued; "
+                "memory remains disabled",
+                generation,
+            )
+
+    def _switch_providers_on_worker(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs,
+    ) -> bool:
+        """Rebind providers without reserving or submitting another job."""
+        if rewound:
+            kwargs["rewound"] = True
+        switched = True
+        with self._provider_call_lock:
+            for provider in self._providers:
+                try:
+                    provider.on_session_switch(
+                        new_session_id,
+                        parent_session_id=parent_session_id,
+                        reset=reset,
+                        **kwargs,
+                    )
+                except Exception as e:
+                    switched = False
+                    logger.debug(
+                        "Memory provider '%s' on_session_switch failed: %s",
+                        provider.name,
+                        e,
+                    )
+        if switched:
+            with self._session_boundary_lock:
+                self._bound_session_id = new_session_id
+        return switched
 
     def on_session_switch(
         self,
@@ -852,63 +1092,66 @@ class MemoryManager:
         reset: bool = False,
         rewound: bool = False,
         **kwargs,
-    ) -> None:
-        """Notify all providers that the agent's session_id has rotated.
+    ) -> bool:
+        """Synchronously commit a generation-aware provider transition.
 
-        Fires on ``/resume``, ``/branch``, ``/reset``, ``/new``, and
-        context compression — any path that reassigns
-        ``AIAgent.session_id`` without tearing the provider down.
-
-        Providers keep running; they only need to refresh cached
-        per-session state so subsequent writes land in the correct
-        session's record. See ``MemoryProvider.on_session_switch`` for
-        the full contract.
-
-        ``rewound=True`` signals that session_id is unchanged but the
-        transcript was truncated; providers caching per-turn document
-        state should invalidate.
+        Resume, branch, compression, and rewind callers supersede any pending
+        boundary immediately, then wait only for their accepted worker job.
         """
         if not new_session_id:
-            return
-        # Only forward ``rewound`` when it's actually set. Passing it
-        # unconditionally would inject ``rewound=False`` into every
-        # provider's **kwargs for the common /resume, /branch, /new, and
-        # compression paths, polluting providers that capture extra kwargs
-        # (and breaking exact-dict assertions). The /undo path sets
-        # rewound=True explicitly; everyone else stays clean.
-        if rewound:
-            kwargs["rewound"] = True
-        for provider in self._providers:
+            return False
+        if not self._providers:
+            return True
+        generation = self.reserve_session_boundary()
+        completed = threading.Event()
+        outcome = {"switched": False}
+
+        def _run() -> None:
             try:
-                provider.on_session_switch(
+                with self._session_boundary_lock:
+                    if generation != self._session_boundary_generation:
+                        self._complete_session_boundary(generation)
+                        return
+                switched = self._switch_providers_on_worker(
                     new_session_id,
                     parent_session_id=parent_session_id,
                     reset=reset,
+                    rewound=rewound,
                     **kwargs,
                 )
-            except Exception as e:
-                logger.debug(
-                    "Memory provider '%s' on_session_switch failed: %s",
-                    provider.name, e,
-                )
+                with self._session_boundary_lock:
+                    if generation != self._session_boundary_generation:
+                        self._complete_session_boundary(generation)
+                        return
+                    self._session_switch_failed = not switched
+                    self._complete_session_boundary(generation)
+                    outcome["switched"] = switched
+            finally:
+                completed.set()
+
+        if not self._submit_background(_run):
+            with self._session_boundary_lock:
+                if generation == self._session_boundary_generation:
+                    self._session_switch_failed = True
+                self._complete_session_boundary(generation)
+            return False
+        completed.wait()
+        return outcome["switched"]
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
-        """Notify all providers before context compression.
-
-        Returns combined text from providers to include in the compression
-        summary prompt. Empty string if no provider contributes.
-        """
+        """Notify providers before compression without overlapping hooks."""
         parts = []
-        for provider in self._providers:
-            try:
-                result = provider.on_pre_compress(messages)
-                if result and result.strip():
-                    parts.append(result)
-            except Exception as e:
-                logger.debug(
-                    "Memory provider '%s' on_pre_compress failed: %s",
-                    provider.name, e,
-                )
+        with self._provider_call_lock:
+            for provider in self._providers:
+                try:
+                    result = provider.on_pre_compress(messages)
+                    if result and result.strip():
+                        parts.append(result)
+                except Exception as e:
+                    logger.debug(
+                        "Memory provider '%s' on_pre_compress failed: %s",
+                        provider.name, e,
+                    )
         return "\n\n".join(parts)
 
     @staticmethod
@@ -944,28 +1187,28 @@ class MemoryManager:
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Notify external providers when the built-in memory tool writes.
-
-        Skips the builtin provider itself (it's the source of the write).
-        """
-        for provider in self._providers:
-            if provider.name == "builtin":
-                continue
-            try:
-                metadata_mode = self._provider_memory_write_metadata_mode(provider)
-                if metadata_mode == "keyword":
-                    provider.on_memory_write(
-                        action, target, content, metadata=dict(metadata or {})
+        """Notify external providers without overlapping other hooks."""
+        with self._provider_call_lock:
+            for provider in self._providers:
+                if provider.name == "builtin":
+                    continue
+                try:
+                    metadata_mode = self._provider_memory_write_metadata_mode(provider)
+                    if metadata_mode == "keyword":
+                        provider.on_memory_write(
+                            action, target, content, metadata=dict(metadata or {})
+                        )
+                    elif metadata_mode == "positional":
+                        provider.on_memory_write(
+                            action, target, content, dict(metadata or {})
+                        )
+                    else:
+                        provider.on_memory_write(action, target, content)
+                except Exception as e:
+                    logger.debug(
+                        "Memory provider '%s' on_memory_write failed: %s",
+                        provider.name, e,
                     )
-                elif metadata_mode == "positional":
-                    provider.on_memory_write(action, target, content, dict(metadata or {}))
-                else:
-                    provider.on_memory_write(action, target, content)
-            except Exception as e:
-                logger.debug(
-                    "Memory provider '%s' on_memory_write failed: %s",
-                    provider.name, e,
-                )
 
     # Actions the bridge mirrors to external providers. The built-in memory
     # tool can also return non-mutating shapes (errors, staged-for-approval
@@ -1048,19 +1291,26 @@ class MemoryManager:
             except Exception as e:
                 logger.debug("notify_memory_tool_write failed for op %s: %s", action, e)
 
-    def on_delegation(self, task: str, result: str, *,
-                      child_session_id: str = "", **kwargs) -> None:
-        """Notify all providers that a subagent completed."""
-        for provider in self._providers:
-            try:
-                provider.on_delegation(
-                    task, result, child_session_id=child_session_id, **kwargs
-                )
-            except Exception as e:
-                logger.debug(
-                    "Memory provider '%s' on_delegation failed: %s",
-                    provider.name, e,
-                )
+    def on_delegation(
+        self,
+        task: str,
+        result: str,
+        *,
+        child_session_id: str = "",
+        **kwargs,
+    ) -> None:
+        """Notify providers of delegation without overlapping other hooks."""
+        with self._provider_call_lock:
+            for provider in self._providers:
+                try:
+                    provider.on_delegation(
+                        task, result, child_session_id=child_session_id, **kwargs
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "Memory provider '%s' on_delegation failed: %s",
+                        provider.name, e,
+                    )
 
     def shutdown_all(self) -> None:
         """Bounded, idempotent shutdown without closing providers under work.
@@ -1095,15 +1345,16 @@ class MemoryManager:
             finalizer.join(timeout=_SYNC_DRAIN_TIMEOUT_S)
 
     def _shutdown_providers(self) -> None:
-        """Close providers once, in reverse registration order."""
-        for provider in reversed(self._providers):
-            try:
-                provider.shutdown()
-            except Exception as e:
-                logger.warning(
-                    "Memory provider '%s' shutdown failed: %s",
-                    provider.name, e,
-                )
+        """Close providers once, after every other provider call drains."""
+        with self._provider_call_lock:
+            for provider in reversed(self._providers):
+                try:
+                    provider.shutdown()
+                except Exception as e:
+                    logger.warning(
+                        "Memory provider '%s' shutdown failed: %s",
+                        provider.name, e,
+                    )
 
     def _drain_sync_executor(self) -> Optional[ThreadPoolExecutor]:
         """Detach the worker and stop submissions without cancelling its queue."""
@@ -1136,20 +1387,22 @@ class MemoryManager:
         return True
 
     def initialize_all(self, session_id: str, **kwargs) -> None:
-        """Initialize all providers.
-
-        Automatically injects ``hermes_home`` into *kwargs* so that every
-        provider can resolve profile-scoped storage paths without importing
-        ``get_hermes_home()`` themselves.
-        """
+        """Initialize providers and record the successfully bound session."""
         if "hermes_home" not in kwargs:
             from hermes_constants import get_hermes_home
             kwargs["hermes_home"] = str(get_hermes_home())
-        for provider in self._providers:
-            try:
-                provider.initialize(session_id=session_id, **kwargs)
-            except Exception as e:
-                logger.warning(
-                    "Memory provider '%s' initialize failed: %s",
-                    provider.name, e,
-                )
+        initialized = True
+        with self._provider_call_lock:
+            for provider in self._providers:
+                try:
+                    provider.initialize(session_id=session_id, **kwargs)
+                except Exception as e:
+                    initialized = False
+                    logger.warning(
+                        "Memory provider '%s' initialize failed: %s",
+                        provider.name,
+                        e,
+                    )
+        if initialized and session_id:
+            with self._session_boundary_lock:
+                self._bound_session_id = session_id

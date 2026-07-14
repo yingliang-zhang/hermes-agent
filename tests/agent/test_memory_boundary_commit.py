@@ -7,10 +7,13 @@ the manager's single serialized background worker.
 """
 
 from __future__ import annotations
+import json
 
 import threading
 import time
 from typing import Any, Dict, List
+
+import pytest
 
 from agent.memory_manager import MemoryManager
 from agent.memory_provider import MemoryProvider
@@ -115,6 +118,481 @@ def test_boundary_commit_switch_still_fires_when_end_raises():
     assert mm.flush_pending(timeout=5)
 
     assert ("switch", "new-sid", True) in provider.calls
+
+
+def test_boundary_commit_switch_failure_keeps_memory_fail_closed():
+    """A failed provider rebind must not expose old-session state."""
+
+    class _ExplodingSwitchProvider(_RecordingProvider):
+        def on_session_switch(self, new_session_id: str, **kwargs) -> None:
+            del new_session_id, kwargs
+            raise RuntimeError("provider rebind blew up")
+
+        def prefetch(self, query: str, *, session_id: str = "") -> str:
+            del query, session_id
+            return "old-session memory"
+
+    provider = _ExplodingSwitchProvider()
+    mm = _make_manager(provider)
+
+    mm.commit_session_boundary_async(
+        [{"role": "user", "content": "old"}], new_session_id="new-sid"
+    )
+    assert mm.flush_pending(timeout=5)
+
+    assert not mm.session_boundary_pending
+    assert not mm.memory_enabled
+    assert mm.prefetch_all("new-session query", session_id="new-sid") == ""
+
+
+def test_boundary_switch_succeeds_only_when_every_provider_rebinds():
+    class _ExplodingSwitchProvider(_RecordingProvider):
+        def on_session_switch(self, new_session_id: str, **kwargs) -> None:
+            del new_session_id, kwargs
+            raise RuntimeError("provider rebind blew up")
+
+    good = _RecordingProvider()
+    broken = _ExplodingSwitchProvider()
+    mm = MemoryManager()
+    mm._providers.extend([good, broken])
+    mm._bound_session_id = "old-sid"
+
+    assert mm.on_session_switch("new-sid") is False
+    assert mm._bound_session_id == "old-sid"
+    assert not mm.session_boundary_pending
+    assert not mm.memory_enabled
+    assert good.calls == [("switch", "new-sid", False)]
+
+
+def test_boundary_superseded_before_start_skips_extraction_and_switch():
+    """A queued stale boundary must do no provider work once superseded."""
+    provider = _RecordingProvider()
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+
+    def blocking_sync(*_args, **_kwargs):
+        worker_started.set()
+        release_worker.wait(timeout=5)
+
+    provider.sync_turn = blocking_sync  # type: ignore[method-assign]
+    mm = _make_manager(provider)
+    mm.sync_all("block worker", "reply", session_id="A")
+    assert worker_started.wait(timeout=1)
+
+    mm.commit_session_boundary_async(
+        [{"role": "user", "content": "A history"}],
+        new_session_id="B",
+        parent_session_id="A",
+    )
+    mm.commit_session_boundary_async(
+        [],
+        new_session_id="C",
+        parent_session_id="B",
+    )
+    release_worker.set()
+
+    assert mm.flush_pending(timeout=2)
+    assert provider.calls == [("switch", "C", True)]
+
+
+def test_running_extraction_finishes_but_stale_switch_and_callback_are_skipped():
+    """A newer boundary supersedes only the stale extraction's commit phase."""
+    extraction_started = threading.Event()
+    release_extraction = threading.Event()
+    callbacks = []
+
+    class _BlockingEndProvider(_RecordingProvider):
+        def on_session_end(self, messages):  # type: ignore[override]
+            extraction_started.set()
+            release_extraction.wait(timeout=5)
+            self.calls.append(("end", list(messages)))
+
+    provider = _BlockingEndProvider()
+    mm = _make_manager(provider)
+    mm.commit_session_boundary_async(
+        [{"role": "user", "content": "A history"}],
+        new_session_id="B",
+        parent_session_id="A",
+        on_switched=lambda: callbacks.append("B"),
+    )
+    assert extraction_started.wait(timeout=1)
+
+    mm.commit_session_boundary_async(
+        [],
+        new_session_id="C",
+        parent_session_id="B",
+        on_switched=lambda: callbacks.append("C"),
+    )
+    release_extraction.set()
+
+    assert mm.flush_pending(timeout=2)
+    assert provider.calls == [
+        ("end", [{"role": "user", "content": "A history"}]),
+        ("switch", "C", True),
+    ]
+    assert callbacks == ["C"]
+
+
+def test_intermediate_snapshot_is_skipped_when_parent_was_never_bound():
+    """B history must not be extracted through a provider still bound to A."""
+    first_extraction_started = threading.Event()
+    release_first_extraction = threading.Event()
+
+    class _BoundProvider(_RecordingProvider):
+        def __init__(self):
+            super().__init__()
+            self.session_id = "A"
+
+        def on_session_end(self, messages):  # type: ignore[override]
+            self.calls.append(("end", self.session_id, list(messages)))
+            if messages[0]["content"] == "A history":
+                first_extraction_started.set()
+                release_first_extraction.wait(timeout=5)
+
+        def on_session_switch(self, new_session_id, **kwargs):  # type: ignore[override]
+            self.session_id = new_session_id
+            self.calls.append(("switch", new_session_id, kwargs.get("reset")))
+
+    provider = _BoundProvider()
+    mm = _make_manager(provider)
+    mm._bound_session_id = "A"
+    mm.commit_session_boundary_async(
+        [{"role": "user", "content": "A history"}],
+        new_session_id="B",
+        parent_session_id="A",
+    )
+    assert first_extraction_started.wait(timeout=1)
+
+    mm.commit_session_boundary_async(
+        [{"role": "user", "content": "B history"}],
+        new_session_id="C",
+        parent_session_id="B",
+    )
+    release_first_extraction.set()
+
+    assert mm.flush_pending(timeout=2)
+    assert provider.calls == [
+        ("end", "A", [{"role": "user", "content": "A history"}]),
+        ("switch", "C", True),
+    ]
+    assert provider.session_id == "C"
+
+
+def test_boundary_callback_runs_before_memory_gate_opens():
+    """Prompt invalidation must complete before new-session recall is enabled."""
+    provider = _RecordingProvider()
+    mm = _make_manager(provider)
+    callback_observations = []
+
+    mm.commit_session_boundary_async(
+        [],
+        new_session_id="B",
+        parent_session_id="A",
+        on_switched=lambda: callback_observations.append(mm.session_boundary_pending),
+    )
+
+    assert mm.flush_pending(timeout=2)
+    assert callback_observations == [True]
+    assert not mm.session_boundary_pending
+
+
+def test_boundary_callback_failure_keeps_gate_closed_and_skips_queued_sync():
+    provider = _RecordingProvider()
+    mm = _make_manager(provider)
+
+    def fail_callback() -> None:
+        raise RuntimeError("prompt invalidation failed")
+
+    mm.commit_session_boundary_async(
+        [],
+        new_session_id="B",
+        parent_session_id="A",
+        on_switched=fail_callback,
+    )
+    mm.sync_all("new turn", "reply", session_id="B")
+
+    assert mm.flush_pending(timeout=2)
+    assert not mm.session_boundary_pending
+    assert not mm.memory_enabled
+    assert provider.calls == [("switch", "B", True)]
+
+
+def test_rejected_boundary_keeps_gate_closed_and_logs(caplog):
+    class _RejectingExecutor:
+        def submit(self, _fn):
+            raise RuntimeError("executor rejected task")
+
+    provider = _RecordingProvider()
+    mm = _make_manager(provider)
+    mm._sync_executor = _RejectingExecutor()  # type: ignore[assignment]
+
+    with caplog.at_level("WARNING"):
+        mm.commit_session_boundary_async([], new_session_id="B")
+
+    assert not mm.session_boundary_pending
+    assert not mm.memory_enabled
+    assert "could not be queued; memory remains disabled" in caplog.text
+
+
+class _OverlappingTransitionProvider(_RecordingProvider):
+    def __init__(self):
+        super().__init__()
+        self.session_id = "A"
+        self.extraction_started = threading.Event()
+        self.release_extraction = threading.Event()
+        self.overlap = False
+        self._active_hooks = 0
+        self._active_lock = threading.Lock()
+
+    def _enter_hook(self) -> None:
+        with self._active_lock:
+            self.overlap = self.overlap or self._active_hooks > 0
+            self._active_hooks += 1
+
+    def _leave_hook(self) -> None:
+        with self._active_lock:
+            self._active_hooks -= 1
+
+    def on_session_end(self, messages):  # type: ignore[override]
+        self._enter_hook()
+        try:
+            self.extraction_started.set()
+            self.release_extraction.wait(timeout=5)
+            self.calls.append(("end", list(messages)))
+        finally:
+            self._leave_hook()
+
+    def on_session_switch(self, new_session_id, **kwargs):  # type: ignore[override]
+        self._enter_hook()
+        try:
+            self.session_id = new_session_id
+            self.calls.append(
+                (
+                    "switch",
+                    new_session_id,
+                    kwargs.get("reason"),
+                    kwargs.get("rewound", False),
+                )
+            )
+        finally:
+            self._leave_hook()
+
+
+def _assert_pending_new_superseded_by_direct_transition(
+    *, target: str, transition_kwargs: Dict[str, Any]
+) -> None:
+    provider = _OverlappingTransitionProvider()
+    mm = _make_manager(provider)
+    mm._bound_session_id = "A"
+    stale_callbacks = []
+
+    mm.commit_session_boundary_async(
+        [{"role": "user", "content": "A history"}],
+        new_session_id="B",
+        parent_session_id="A",
+        on_switched=lambda: stale_callbacks.append("B"),
+    )
+    assert provider.extraction_started.wait(timeout=1)
+
+    transition_reserved = threading.Event()
+    original_reserve = mm.reserve_session_boundary
+
+    def observed_reserve() -> int:
+        generation = original_reserve()
+        transition_reserved.set()
+        return generation
+
+    mm.reserve_session_boundary = observed_reserve  # type: ignore[method-assign]
+    results = []
+    transition = threading.Thread(
+        target=lambda: results.append(mm.on_session_switch(target, **transition_kwargs))
+    )
+    transition.start()
+    reserved_before_release = transition_reserved.wait(timeout=1)
+    waited_for_extraction = transition.is_alive()
+
+    provider.release_extraction.set()
+    transition.join(timeout=2)
+
+    assert reserved_before_release
+    assert waited_for_extraction
+
+    assert not transition.is_alive()
+    assert results == [True]
+    assert mm.flush_pending(timeout=2)
+    assert provider.session_id == target
+    assert provider.calls == [
+        ("end", [{"role": "user", "content": "A history"}]),
+        (
+            "switch",
+            target,
+            transition_kwargs.get("reason"),
+            transition_kwargs.get("rewound", False),
+        ),
+    ]
+    assert stale_callbacks == []
+    assert not provider.overlap
+
+
+@pytest.mark.parametrize("reason", ["resume", "branch"])
+def test_pending_new_is_superseded_by_resume_or_branch(reason):
+    _assert_pending_new_superseded_by_direct_transition(
+        target=f"latest-{reason}", transition_kwargs={"reason": reason}
+    )
+
+
+@pytest.mark.parametrize(
+    ("target", "transition_kwargs"),
+    [
+        ("compressed", {"reason": "compression"}),
+        ("A", {"rewound": True}),
+    ],
+)
+def test_pending_new_is_superseded_by_compression_or_rewind(
+    target, transition_kwargs
+):
+    _assert_pending_new_superseded_by_direct_transition(
+        target=target, transition_kwargs=transition_kwargs
+    )
+
+
+class _BarrierReadProvider(_RecordingProvider):
+    def __init__(self, operation: str):
+        super().__init__()
+        self.operation = operation
+        self.session_id = "A"
+        self.read_started = threading.Event()
+        self.release_read = threading.Event()
+        self.switch_started = threading.Event()
+        self.overlap = False
+        self._active_hooks = 0
+        self._active_lock = threading.Lock()
+        self._blocked_once = False
+
+    def get_tool_schemas(self):
+        return [
+            {"name": "barrier_recall", "description": "Recall", "parameters": {}}
+        ]
+
+    def _enter_hook(self) -> None:
+        with self._active_lock:
+            self.overlap = self.overlap or self._active_hooks > 0
+            self._active_hooks += 1
+
+    def _leave_hook(self) -> None:
+        with self._active_lock:
+            self._active_hooks -= 1
+
+    def _read(self, operation: str) -> str:
+        self._enter_hook()
+        try:
+            session_id = self.session_id
+            if operation == self.operation and not self._blocked_once:
+                self._blocked_once = True
+                self.read_started.set()
+                self.release_read.wait(timeout=5)
+            self.calls.append(("read", operation, session_id))
+            if operation == "tool":
+                return json.dumps({"bank": session_id})
+            return f"bank:{session_id}"
+        finally:
+            self._leave_hook()
+
+    def system_prompt_block(self):
+        return self._read("prompt")
+
+    def prefetch(self, query, *, session_id=""):
+        del query, session_id
+        return self._read("prefetch")
+
+    def handle_tool_call(self, tool_name, args, **kwargs):
+        del tool_name, args, kwargs
+        return self._read("tool")
+
+    def on_session_switch(self, new_session_id, **kwargs):  # type: ignore[override]
+        del kwargs
+        self._enter_hook()
+        try:
+            self.switch_started.set()
+            self.session_id = new_session_id
+            self.calls.append(("switch", new_session_id))
+        finally:
+            self._leave_hook()
+
+
+@pytest.mark.parametrize("operation", ["prompt", "prefetch", "tool"])
+def test_synchronous_read_discards_stale_generation_without_hook_overlap(operation):
+    provider = _BarrierReadProvider(operation)
+    mm = _make_manager(provider)
+    mm._bound_session_id = "A"
+    mm._tool_to_provider["barrier_recall"] = provider
+    results = []
+
+    if operation == "prompt":
+        invoke = mm.build_system_prompt
+    elif operation == "prefetch":
+        invoke = lambda: mm.prefetch_all("query", session_id="A")
+    else:
+        invoke = lambda: mm.handle_tool_call("barrier_recall", {}, session_id="A")
+
+    reader = threading.Thread(target=lambda: results.append(invoke()))
+    reader.start()
+    assert provider.read_started.wait(timeout=1)
+
+    mm.commit_session_boundary_async(
+        [], new_session_id="B", parent_session_id="A"
+    )
+    switch_overlapped_read = provider.switch_started.wait(timeout=0.05)
+    provider.release_read.set()
+
+    reader.join(timeout=2)
+    assert not reader.is_alive()
+    assert mm.flush_pending(timeout=2)
+    assert provider.session_id == "B"
+    assert not provider.overlap
+    assert not switch_overlapped_read
+    if operation == "prompt":
+        assert results == ["bank:B"]
+    elif operation == "prefetch":
+        assert results == [""]
+    else:
+        assert "error" in json.loads(results[0])
+
+
+def test_failed_rebind_completes_prompt_wait_but_keeps_memory_disabled():
+    switch_started = threading.Event()
+    release_switch = threading.Event()
+
+    class _BlockingFailedSwitchProvider(_RecordingProvider):
+        def on_session_switch(self, new_session_id, **kwargs):  # type: ignore[override]
+            del new_session_id, kwargs
+            switch_started.set()
+            release_switch.wait(timeout=5)
+            raise RuntimeError("rebind failed")
+
+        def system_prompt_block(self):
+            return "old memory"
+
+    mm = _make_manager(_BlockingFailedSwitchProvider())
+    mm.commit_session_boundary_async([], new_session_id="B", parent_session_id="A")
+    assert switch_started.wait(timeout=1)
+    results = []
+    prompt_builder = threading.Thread(
+        target=lambda: results.append(mm.build_system_prompt())
+    )
+    prompt_builder.start()
+    prompt_builder.join(timeout=0.05)
+    waited_for_switch = prompt_builder.is_alive()
+
+    release_switch.set()
+    prompt_builder.join(timeout=2)
+
+    assert waited_for_switch
+
+    assert not prompt_builder.is_alive()
+    assert results == [""]
+    assert not mm.session_boundary_pending
+    assert not mm.memory_enabled
 
 
 def test_boundary_commit_noop_without_providers():
