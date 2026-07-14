@@ -398,36 +398,12 @@ def test_busy_interrupt_mode_ignores_completed_background_delegation(monkeypatch
 
 
 
-def test_busy_steer_mode_injects_when_accepted_without_enqueueing(monkeypatch):
+def test_busy_steer_mode_queues_canonical_turn_without_live_injection(monkeypatch):
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
-    calls = {"interrupt": 0, "steer": []}
+    calls = {"interrupt": 0, "steer": 0}
     agent = types.SimpleNamespace(
         interrupt=lambda: calls.__setitem__("interrupt", calls["interrupt"] + 1),
-        steer=lambda text: (calls["steer"].append(text), True)[1],
-    )
-    session = _session(agent=agent, running=True)
-
-    resp = server._handle_busy_submit(
-        "r1",
-        "sid",
-        session,
-        "nudge",
-        "ws-1",
-        submitted_at=101.25,
-        message_id="desktop-steer-1",
-    )
-
-    assert resp["result"]["status"] == "steered"
-    assert calls == {"interrupt": 0, "steer": ["nudge"]}
-    assert session.get("queued_prompt") is None
-
-
-def test_busy_steer_mode_rejection_queues_with_source_identity(monkeypatch):
-    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
-    calls = {"interrupt": 0, "steer": []}
-    agent = types.SimpleNamespace(
-        interrupt=lambda: calls.__setitem__("interrupt", calls["interrupt"] + 1),
-        steer=lambda text: (calls["steer"].append(text), False)[1],
+        steer=lambda _text: calls.__setitem__("steer", calls["steer"] + 1),
     )
     session = _session(agent=agent, running=True)
 
@@ -442,35 +418,7 @@ def test_busy_steer_mode_rejection_queues_with_source_identity(monkeypatch):
     )
 
     assert resp["result"]["status"] == "queued"
-    assert calls == {"interrupt": 1, "steer": ["nudge"]}
-    assert session["queued_prompt"] == {
-        "text": "nudge",
-        "transport": "ws-1",
-        "submitted_at": 101.25,
-        "message_id": "desktop-steer-1",
-    }
-
-
-def test_busy_steer_mode_unavailable_queues_with_source_identity(monkeypatch):
-    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
-    calls = {"interrupt": 0}
-    agent = types.SimpleNamespace(
-        interrupt=lambda: calls.__setitem__("interrupt", calls["interrupt"] + 1)
-    )
-    session = _session(agent=agent, running=True)
-
-    resp = server._handle_busy_submit(
-        "r1",
-        "sid",
-        session,
-        "nudge",
-        "ws-1",
-        submitted_at=101.25,
-        message_id="desktop-steer-1",
-    )
-
-    assert resp["result"]["status"] == "queued"
-    assert calls["interrupt"] == 1
+    assert calls == {"interrupt": 0, "steer": 0}
     assert session["queued_prompt"] == {
         "text": "nudge",
         "transport": "ws-1",
@@ -656,46 +604,6 @@ def test_prompt_submit_dedupes_explicit_id_already_inflight(monkeypatch):
     assert response["result"]["status"] == "duplicate"
     assert session.get("queued_prompt") is None
     assert calls["interrupt"] == 0
-
-
-
-def test_prompt_submit_duplicate_rehomes_only_matching_queued_source(monkeypatch):
-    session = _session(
-        running=True,
-        transport="ws-current",
-        queued_prompt={
-            "text": "first",
-            "transport": "ws-old",
-            "message_id": "desktop-1",
-        },
-        queued_prompts=[
-            {
-                "text": "second",
-                "transport": "ws-still-live",
-                "message_id": "desktop-2",
-            }
-        ],
-    )
-    monkeypatch.setattr(server, "_sess_nowait", lambda *_a, **_k: (session, None))
-    monkeypatch.setattr(server, "current_transport", lambda: "ws-retry")
-
-    response = server.handle_request(
-        {
-            "id": "rpc-retry",
-            "method": "prompt.submit",
-            "params": {
-                "message_id": "desktop-1",
-                "session_id": "sid",
-                "text": "first",
-            },
-        }
-    )
-
-    assert response is not None
-    assert response["result"]["status"] == "duplicate"
-    assert session["transport"] == "ws-retry"
-    assert session["queued_prompt"]["transport"] == "ws-retry"
-    assert session["queued_prompts"][0]["transport"] == "ws-still-live"
 
 
 def test_prompt_submit_does_not_dedupe_reused_rpc_id_without_explicit_id(
@@ -1126,141 +1034,6 @@ def test_repeated_arrivals_drain_once_in_order_to_their_own_transports(monkeypat
     assert session.get("queued_prompts", []) == []
 
 
-class _RecordingTransport:
-    def __init__(self, completed: threading.Event | None = None):
-        self._closed = False
-        self.completed = completed
-        self.frames = []
-
-    def write(self, obj):
-        self.frames.append(obj)
-        event_type = ((obj.get("params") or {}).get("type"))
-        if event_type == "message.complete" and self.completed is not None:
-            self.completed.set()
-        return not self._closed
-
-    def close(self):
-        self._closed = True
-
-
-def test_session_activate_rehomes_dead_queue_item_and_preserves_live_tail(
-    monkeypatch,
-):
-    dead_head_transport = _RecordingTransport()
-    dead_head_transport.close()
-    current_live_transport = _RecordingTransport()
-    live_tail_transport = _RecordingTransport()
-    activated_transport = _RecordingTransport()
-    session = _session(
-        transport=current_live_transport,
-        queued_prompt={
-            "text": "dead head",
-            "transport": dead_head_transport,
-            "message_id": "desktop-dead",
-        },
-        queued_prompts=[
-            {
-                "text": "live tail",
-                "transport": live_tail_transport,
-                "message_id": "desktop-live",
-            }
-        ],
-    )
-    monkeypatch.setattr(server, "_sess_nowait", lambda *_a, **_k: (session, None))
-    monkeypatch.setattr(server, "_session_info", lambda *_a, **_k: {})
-    monkeypatch.setattr(server, "current_transport", lambda: activated_transport)
-
-    response = server.handle_request(
-        {
-            "id": "rpc-activate",
-            "method": "session.activate",
-            "params": {"session_id": "sid"},
-        }
-    )
-
-    assert response["result"]["session_id"] == "sid"
-    assert session["transport"] is activated_transport
-    assert session["queued_prompt"]["transport"] is activated_transport
-    assert session["queued_prompts"][0]["transport"] is live_tail_transport
-
-
-def test_disconnect_snapshot_cannot_overwrite_inflight_duplicate_retry(
-    monkeypatch,
-):
-    snapshot_taken = threading.Event()
-    finish_snapshot = threading.Event()
-    old_transport = _RecordingTransport()
-    new_transport = _RecordingTransport()
-    old_transport.close()
-    sid = "race-ui"
-    session = _session(
-        running=True,
-        transport=old_transport,
-        inflight_turn={
-            "message_id": "desktop-race-1",
-            "user": "survive disconnect race",
-        },
-    )
-
-    class _SnapshotBarrierSessions(dict):
-        def items(self):
-            snapshot = list(super().items())
-            snapshot_taken.set()
-            finish_snapshot.wait(10)
-            return snapshot
-
-    sessions = _SnapshotBarrierSessions({sid: session})
-    disconnect_result = {}
-    disconnect_errors = []
-
-    def _disconnect():
-        try:
-            disconnect_result["value"] = server._close_sessions_for_transport(
-                old_transport
-            )
-        except BaseException as exc:
-            disconnect_errors.append(exc)
-
-    monkeypatch.setattr(server, "_sessions", sessions)
-    monkeypatch.setattr(server, "_sess_nowait", lambda *_a, **_k: (session, None))
-    monkeypatch.setattr(server, "current_transport", lambda: new_transport)
-    monkeypatch.setattr(server, "_schedule_ws_orphan_reap", lambda *_a, **_k: None)
-    disconnect_thread = threading.Thread(target=_disconnect)
-    disconnect_thread.start()
-
-    try:
-        assert snapshot_taken.wait(10), "disconnect did not snapshot the old owner"
-        duplicate = server.handle_request(
-            {
-                "id": "rpc-retry",
-                "method": "prompt.submit",
-                "params": {
-                    "message_id": "desktop-race-1",
-                    "session_id": sid,
-                    "text": "survive disconnect race",
-                },
-            }
-        )
-        assert duplicate["result"]["status"] == "duplicate"
-        assert session["transport"] is new_transport
-    finally:
-        finish_snapshot.set()
-        disconnect_thread.join(10)
-
-    assert not disconnect_thread.is_alive()
-    assert disconnect_errors == []
-    assert disconnect_result["value"] == (0, 0)
-    assert session["transport"] is new_transport
-
-    server._emit("message.start", sid)
-    server._emit("message.delta", sid, {"text": "delta"})
-    server._emit("message.complete", sid, {"text": "complete"})
-    assert old_transport.frames == []
-    assert [
-        (frame.get("params") or {}).get("type") for frame in new_transport.frames
-    ] == ["message.start", "message.delta", "message.complete"]
-
-
 def _model_response(text):
     message = types.SimpleNamespace(
         content=text,
@@ -1272,7 +1045,7 @@ def _model_response(text):
     return types.SimpleNamespace(choices=[choice], model="test/model", usage=None)
 
 
-def test_busy_steer_rejection_dedupes_and_persists_one_canonical_turn(
+def test_busy_steer_submit_dedupes_and_persists_one_canonical_turn(
     monkeypatch,
     tmp_path,
 ):
@@ -1299,7 +1072,7 @@ def test_busy_steer_rejection_dedupes_and_persists_one_canonical_turn(
     interrupt_calls = []
     wire_requests = []
     completed = threading.Event()
-    monkeypatch.setattr(agent, "steer", lambda text: (steer_calls.append(text), False)[1])
+    monkeypatch.setattr(agent, "steer", lambda text: steer_calls.append(text))
     monkeypatch.setattr(agent, "interrupt", lambda: interrupt_calls.append(True))
     monkeypatch.setattr(
         agent,
@@ -1345,14 +1118,14 @@ def test_busy_steer_rejection_dedupes_and_persists_one_canonical_turn(
 
     assert first["result"]["status"] == "queued"
     assert duplicate["result"]["status"] == "duplicate"
-    assert steer_calls == ["canonical nudge"]
-    assert interrupt_calls == [True]
+    assert steer_calls == []
+    assert interrupt_calls == []
     assert session["queued_prompt"]["message_id"] == "desktop-steer-1"
     assert session.get("queued_prompts", []) == []
 
     session["running"] = False
     assert server._drain_queued_prompt("rpc-steer", "ui-session", session) is True
-    assert completed.wait(10), "steer-fallback queued turn did not complete"
+    assert completed.wait(10), "steer-configured canonical turn did not complete"
 
     canonical_users = [
         message for message in session["history"] if message.get("role") == "user"
@@ -1363,158 +1136,6 @@ def test_busy_steer_rejection_dedupes_and_persists_one_canonical_turn(
         ("canonical nudge", "desktop-steer-1")
     ]
     assert len(wire_requests) == 1
-
-
-def test_reconnect_rehomes_queued_turn_and_routes_all_events_to_live_transport(
-    monkeypatch,
-    tmp_path,
-):
-    db = SessionDB(tmp_path / "reconnect-source.db")
-    session_key = "reconnect-source"
-    sid = "reconnect-ui"
-    db.create_session(session_key, source="desktop", model="test/model")
-    agent = AIAgent(
-        api_key="test-key",
-        base_url="https://example.invalid/v1",
-        provider="custom",
-        model="test/model",
-        api_mode="chat_completions",
-        quiet_mode=True,
-        skip_context_files=True,
-        skip_memory=True,
-        session_db=db,
-        session_id=session_key,
-    )
-    agent._session_db_created = True
-    agent._cached_system_prompt = "You are a test assistant."
-    agent._disable_streaming = True
-
-    wire_requests = []
-    completed = threading.Event()
-    old_transport = _RecordingTransport()
-    new_transport = _RecordingTransport(completed)
-    active_transport = {"value": old_transport}
-    original_run = agent.run_conversation
-
-    def _run_with_delta(user_message, **kwargs):
-        result = original_run(user_message, **kwargs)
-        kwargs["stream_callback"]("ack-delta")
-        return result
-
-    monkeypatch.setattr(agent, "run_conversation", _run_with_delta)
-    monkeypatch.setattr(
-        agent,
-        "_interruptible_api_call",
-        lambda api_kwargs: (
-            wire_requests.append(api_kwargs["messages"]),
-            _model_response("ack"),
-        )[1],
-    )
-    monkeypatch.setattr(agent, "_cleanup_task_resources", lambda *_a, **_k: None)
-    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
-    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_a, **_k: None)
-    monkeypatch.setattr(server, "_wire_callbacks", lambda *_a, **_k: None)
-    monkeypatch.setattr(server, "_register_session_cwd", lambda *_a, **_k: None)
-    monkeypatch.setattr(server, "_session_info", lambda *_a, **_k: {})
-    monkeypatch.setattr(server, "_get_usage", lambda *_a, **_k: {})
-    monkeypatch.setattr(server, "_voice_tts_enabled", lambda: False)
-    monkeypatch.setattr(server, "_get_db", lambda: db)
-    monkeypatch.setattr(server, "current_transport", lambda: active_transport["value"])
-    monkeypatch.setattr(server, "_schedule_ws_orphan_reap", lambda *_a, **_k: None)
-    monkeypatch.setattr("agent.title_generator.maybe_auto_title", lambda *_a, **_k: None)
-
-    session = _session(
-        agent=agent,
-        session_key=session_key,
-        running=True,
-        transport=old_transport,
-    )
-    missing = object()
-    previous_session = server._sessions.get(sid, missing)
-    server._sessions[sid] = session
-    request = {
-        "id": "rpc-original",
-        "method": "prompt.submit",
-        "params": {
-            "message_id": "desktop-reconnect-1",
-            "session_id": sid,
-            "submitted_at": 101.25,
-            "text": "survive reconnect",
-        },
-    }
-
-    try:
-        first = server.handle_request(request)
-        assert first["result"]["status"] == "queued"
-        assert session["queued_prompt"]["transport"] is old_transport
-
-        old_transport.close()
-        server._close_sessions_for_transport(old_transport)
-        assert session["transport"] is server._detached_ws_transport
-
-        active_transport["value"] = new_transport
-        resumed = server.handle_request(
-            {
-                "id": "rpc-resume",
-                "method": "session.resume",
-                "params": {"session_id": session_key},
-            }
-        )
-        assert resumed["result"]["session_id"] == sid
-        assert session["transport"] is new_transport
-        assert session["queued_prompt"]["transport"] is new_transport
-
-        duplicate = server.handle_request({**request, "id": "rpc-retry"})
-        assert duplicate["result"]["status"] == "duplicate"
-        assert session["queued_prompt"]["transport"] is new_transport
-
-        with session["history_lock"]:
-            session["running"] = False
-        assert server._drain_queued_prompt("rpc-drain", sid, session) is True
-        assert completed.wait(10), "reconnected client did not receive completion"
-        run_thread = session.get("_run_thread")
-        assert run_thread is not None
-        run_thread.join(10)
-        assert not run_thread.is_alive()
-
-        old_event_types = [
-            (frame.get("params") or {}).get("type") for frame in old_transport.frames
-        ]
-        new_event_types = [
-            (frame.get("params") or {}).get("type") for frame in new_transport.frames
-        ]
-        assert old_event_types == []
-        assert {
-            "message.start",
-            "message.delta",
-            "message.complete",
-        }.issubset(new_event_types)
-
-        canonical_users = [
-            message for message in session["history"] if message.get("role") == "user"
-        ]
-        assert len(canonical_users) == 1
-        assert canonical_users[0]["content"] == "survive reconnect"
-        assert canonical_users[0]["timestamp"] == 101.25
-        assert canonical_users[0]["_source_message_id"] == "desktop-reconnect-1"
-
-        user_rows = [row for row in db.get_messages(session_key) if row["role"] == "user"]
-        assert [(row["content"], row["platform_message_id"]) for row in user_rows] == [
-            ("survive reconnect", "desktop-reconnect-1")
-        ]
-        assert len(wire_requests) == 1
-        assert session["queued_prompt"] is None
-        assert session.get("queued_prompts", []) == []
-        assert session["inflight_turn"] is None
-    finally:
-        run_thread = session.get("_run_thread")
-        if run_thread is not None:
-            run_thread.join(10)
-        if previous_session is missing:
-            server._sessions.pop(sid, None)
-        else:
-            server._sessions[sid] = previous_session
-        db.close()
 
 
 def test_drain_persists_distinct_users_and_sends_valid_ordered_wire_history(

@@ -4,9 +4,9 @@ import type { MutableRefObject } from 'react'
 import { useEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { getSession } from '@/hermes'
 import type { QueueEditState } from '@/app/chat/composer/composer-utils'
 import { useComposerQueue } from '@/app/chat/composer/hooks/use-composer-queue'
-import { getSession } from '@/hermes'
 import { textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
@@ -18,7 +18,6 @@ import {
   enqueueQueuedPrompt,
   getQueuedPrompts
 } from '@/store/composer-queue'
-import { $notifications, clearNotifications } from '@/store/notifications'
 import {
   $busy,
   $connection,
@@ -276,34 +275,12 @@ function QueueHarness({
     branchCurrentSession: async () => true,
     busyRef: { current: false },
     createBackendSessionForSend: async () => null,
-    getRoutedStoredSessionId: () => selectedStoredSessionIdRef.current,
-    getRuntimeIdForStoredSession: storedSessionId =>
-      storedSessionId === selectedStoredSessionIdRef.current
-        ? activeSessionIdRef.current
-        : null,
-    resumeStoredSession: async storedSessionId => {
-      const routeToken = routeTokenRef.current
-      const selectedStoredSessionId = selectedStoredSessionIdRef.current
-      const resumed = await requestGateway<{ session_id: string }>('session.resume', {
-        session_id: storedSessionId,
-        source: 'desktop'
-      })
-
-      if (
-        routeTokenRef.current !== routeToken ||
-        selectedStoredSessionIdRef.current !== selectedStoredSessionId
-      ) {
-        return
-      }
-
-      selectedStoredSessionIdRef.current = storedSessionId
-      activeSessionIdRef.current = resumed.session_id
-    },
+    getRouteToken: () => routeTokenRef.current,
     handleSkinCommand: () => '',
     openMemoryGraph: () => undefined,
     refreshSessions: async () => undefined,
     requestGateway,
-    getRouteToken: () => routeTokenRef.current,
+    resumeStoredSession: () => undefined,
     selectedStoredSessionIdRef,
     startFreshSessionDraft: () => undefined,
     sttEnabled: false,
