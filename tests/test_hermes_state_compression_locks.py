@@ -48,6 +48,28 @@ def test_acquire_blocks_second_holder(db: SessionDB) -> None:
 
 
 
+def test_completed_rotation_blocks_stale_reacquire_until_reopened(
+    db: SessionDB,
+) -> None:
+    db.create_session("sess1", source="discord")
+    assert db.try_acquire_compression_lock("sess1", "winner") is True
+    db.end_session("sess1", "compression")
+    db.release_compression_lock("sess1", "winner")
+
+    assert db.try_acquire_compression_lock("sess1", "stale-agent") is False
+    assert db.get_compression_lock_holder("sess1") is None
+
+    # Rotation rollback reopens the parent, so a later legitimate attempt can
+    # acquire normally instead of being permanently blocked by the marker.
+    db.reopen_session("sess1")
+    assert db.try_acquire_compression_lock("sess1", "retry") is True
+
+
+def test_release_with_wrong_holder_is_noop(db: SessionDB) -> None:
+    db.try_acquire_compression_lock("sess1", "holder1")
+    # Late-returning compressor must not release a lock it doesn't own
+    db.release_compression_lock("sess1", "holder_other")
+    assert db.get_compression_lock_holder("sess1") == "holder1"
 
 
 
