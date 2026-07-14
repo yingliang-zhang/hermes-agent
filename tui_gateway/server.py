@@ -1117,26 +1117,33 @@ def _close_sessions_for_transport(
             _close_session_by_id(sid, end_reason=end_reason)
             reaped += 1
         else:
-            # Point detached sessions at the drop sentinel (NOT real stdio) so
-            # _ws_session_is_orphaned recognizes them and the grace-reap can
-            # actually fire; a standalone `hermes --tui` keeps real _stdio.
-            session["transport"] = _detached_ws_transport
-            # Close the slash_worker immediately on detach — it's ~13 MB per
-            # process and the Desktop app uses one WS for all sessions, so
-            # switching sessions leaves the old workers alive until the 6 h TTL
-            # reaper or the 20 s orphan reaper fires (which may not fire at all
-            # if the session is flagged running by a background curator review).
-            # The worker is recreated lazily on the next slash command: the
-            # slash.exec handler and _restart_slash_worker both handle
-            # worker=None.
-            worker = session.get("slash_worker")
-            if worker:
-                try:
-                    worker.close()
-                except Exception:
-                    pass
-                session["slash_worker"] = None
-            detached += 1
+            # The owner snapshot can race a resume/retry. Serialize the final
+            # detach with transport rebinding and only replace the transport
+            # this disconnect still owns.
+            with session["history_lock"]:
+                if session.get("transport") is not transport:
+                    continue
+                # Point detached sessions at the drop sentinel (NOT real
+                # stdio) so _ws_session_is_orphaned recognizes them and the
+                # grace-reap can actually fire; a standalone `hermes --tui`
+                # keeps real _stdio.
+                # Close the slash_worker immediately on detach — it's ~13 MB
+                # per process and the Desktop app uses one WS for all
+                # sessions, so switching sessions leaves the old workers alive
+                # until the 6 h TTL reaper or the 20 s orphan reaper fires
+                # (which may not fire at all if the session is flagged running
+                # by a background curator review). The worker is recreated
+                # lazily on the next slash command: the slash.exec handler and
+                # _restart_slash_worker both handle worker=None.
+                worker = session.get("slash_worker")
+                if worker:
+                    try:
+                        worker.close()
+                    except Exception:
+                        pass
+                    session["slash_worker"] = None
+                session["transport"] = _detached_ws_transport
+                detached += 1
             try:
                 _schedule_ws_orphan_reap(sid)
             except Exception:
@@ -7712,13 +7719,10 @@ def _rebind_session_transport(
     """Bind a live client and re-home only queue entries it now owns.
 
     Callers hold ``history_lock``. An explicit source-ID retry transfers that
-    one queued item to the retrying client. Resume/activate instead migrates
-    dead queue transports only when the session itself was detached, preserving
-    still-live per-item FIFO routing for other clients.
+    one queued item to the retrying client. Resume/activate migrates each dead
+    queued transport independently while preserving live per-item FIFO routing.
     """
-    previous_transport = session.get("transport")
     session["transport"] = transport
-    migrate_dead = migrate_dead_queued and _transport_is_dead(previous_transport)
 
     queued_items = [session.get("queued_prompt")]
     pending = session.get("queued_prompts")
@@ -7730,7 +7734,9 @@ def _rebind_session_transport(
         matches_source = (
             message_id is not None and item.get("message_id") == message_id
         )
-        if matches_source or (migrate_dead and _transport_is_dead(item.get("transport"))):
+        if matches_source or (
+            migrate_dead_queued and _transport_is_dead(item.get("transport"))
+        ):
             item["transport"] = transport
 
     # ``inflight_turn`` has no separate transport slot: rebinding the session
