@@ -7620,6 +7620,7 @@ def _start_inflight_turn(
     session: dict,
     text: Any,
     *,
+    submitted_at: float | None = None,
     message_id: str | None = None,
 ) -> None:
     now = time.time()
@@ -7630,6 +7631,8 @@ def _start_inflight_turn(
         "updated_at": now,
         "user": _inflight_text(text),
     }
+    if submitted_at is not None:
+        session["inflight_turn"]["submitted_at"] = submitted_at
     if message_id is not None:
         session["inflight_turn"]["message_id"] = message_id
 
@@ -8120,6 +8123,8 @@ def _handle_busy_submit(
                 return _ok(rid, {"status": "steered"})
         except Exception:
             pass  # fall through to queue
+    # Legacy ``steer`` busy mode queues without interruption — live non-canonical
+    # injection remains available only through the explicit ``session.steer`` API.
     # Text-only corrections redirect the live turn in place when the runtime
     # supports it; media/attachment payloads and older agents fall through to
     # the proven interrupt + queue path below.
@@ -8171,7 +8176,9 @@ def _handle_busy_submit(
     # the pending steer buffer — silently destroying the earlier messages of
     # the burst. Steer-mode fall-throughs keep queue semantics: preserved
     # FIFO in ``queued_prompt``/``queued_prompts`` and drained on turn end.
-    if mode == "interrupt" and not image_paths:
+    # Legacy ``steer`` busy mode also queues without interrupting (legacy
+    # alias for queue semantics).
+    if mode not in ("queue", "steer") and not image_paths:
         _interrupt_busy_session(sid, session, agent)
     return _ok(rid, {"status": "queued"})
 
@@ -8200,6 +8207,12 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         session["running"] = True
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
+        _start_inflight_turn(
+            session,
+            queued["text"],
+            submitted_at=queued.get("submitted_at"),
+            message_id=queued.get("message_id"),
+        )
     run_kwargs = {
         key: queued[key]
         for key in ("submitted_at", "message_id")
@@ -8278,18 +8291,30 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             file=sys.stderr,
         )
         with session["history_lock"]:
-            had_successor = bool(session.get("queued_prompt")) or bool(
-                session.get("queued_prompts")
-            )
-            if not had_successor:
+            # Arrivals that raced the failed attempt sit in the FIFO tail —
+            # restore the exact pre-dispatch order (failed item back at head,
+            # displaced head back ahead of the arrivals) and stop here: the
+            # failed item must not be retried in a tight loop while later
+            # submissions wait behind it.
+            arrivals_raced = bool(session.get("queued_prompts"))
+            displaced_head = session.get("queued_prompt")
+            if arrivals_raced:
+                session.setdefault("queued_prompts", []).insert(0, displaced_head)
+                session["queued_prompt"] = queued
+            elif displaced_head is None:
                 # Nothing behind the failed item — restore it so the user's
                 # message is not silently dropped by the failed dispatch.
                 session["queued_prompt"] = queued
+            _clear_inflight_turn(session)
             session["running"] = False
         dispatch_failed = True
     if dispatch_failed:
         with session["history_lock"]:
-            drain_next = had_successor and not session.get("_turn_cancel_requested")
+            drain_next = (
+                not arrivals_raced
+                and displaced_head is not None
+                and not session.get("_turn_cancel_requested")
+            )
         if drain_next:
             _drain_queued_prompt(rid, sid, session)
     return True
