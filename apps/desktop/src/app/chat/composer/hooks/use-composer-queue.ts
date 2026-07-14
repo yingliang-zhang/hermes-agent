@@ -39,6 +39,8 @@ interface UseComposerQueueArgs {
   queueEditRef: RefObject<QueueEditState | null>
   queueSessionKey: ChatBarProps['queueSessionKey']
   sessionId: string | null | undefined
+  /** Stored session id for the active session — used to stamp queue entries. */
+  storedSessionId: string | null | undefined
 }
 
 /**
@@ -62,7 +64,8 @@ export function useComposerQueue({
   onSubmit,
   queueEditRef,
   queueSessionKey,
-  sessionId
+  sessionId,
+  storedSessionId
 }: UseComposerQueueArgs) {
   const { t } = useI18n()
   const scope = useComposerScope()
@@ -180,7 +183,14 @@ export function useComposerQueue({
       return false
     }
 
-    if (!enqueueQueuedPrompt(activeQueueSessionKey, { text, attachments })) {
+    if (
+      !enqueueQueuedPrompt(activeQueueSessionKey, {
+        text,
+        attachments,
+        sourceRuntimeId: sessionId ?? undefined,
+        sourceStoredId: storedSessionId ?? undefined
+      })
+    ) {
       return false
     }
 
@@ -189,10 +199,13 @@ export function useComposerQueue({
     triggerHaptic('selection')
 
     return true
-  }, [activeQueueSessionKey, attachments, clearDraft, draftRef, scope.attachments])
+  }, [activeQueueSessionKey, attachments, clearDraft, draftRef, scope.attachments, sessionId, storedSessionId])
 
   // All queue drain paths share one lock + send-then-remove sequence.
   // `pickEntry` lets each caller choose head, by-id, or skip-edited.
+  // Each entry carries its source session ids so the drain always targets
+  // the session that owned the entry at enqueue time — never the
+  // currently-active session if the user switched in between (Race 5).
   const runDrain = useCallback(
     async (pickEntry: (entries: QueuedPromptEntry[]) => QueuedPromptEntry | undefined): Promise<boolean> => {
       if (drainingQueueRef.current || !activeQueueSessionKey) {

@@ -556,7 +556,6 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
               if (targetIsCurrentView()) {
                 activeSessionIdRef.current = recoveredId
               }
-
               await withSessionBusyRetry(() =>
                 requestGateway('prompt.submit', submitParams(recoveredId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
               )

@@ -111,7 +111,7 @@ function Harness({
     state: Record<string, unknown>
   ) => void
   onReady: (handle: HarnessHandle) => void
-  onSeedState?: (state: Record<string, unknown>) => void
+  onSeedState?: (state: Record<string, unknown>, sessionId: string, storedSessionId?: string | null) => void
   openMemoryGraph?: () => void
   refreshSessions: () => Promise<void>
   requestGateway: <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
@@ -162,7 +162,7 @@ function Harness({
       // Seed with interrupted:true so we can prove a fresh submit clears it.
       const next = updater(stateRef.current) as unknown as Record<string, unknown>
       stateRef.current = next as never
-      onSeedState?.(next)
+      onSeedState?.(next, sessionId, storedSessionId)
       onUpdateState?.(sessionId, storedSessionId, next)
 
       return next as never

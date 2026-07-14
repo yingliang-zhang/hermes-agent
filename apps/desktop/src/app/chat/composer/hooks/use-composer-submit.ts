@@ -34,6 +34,7 @@ interface UseComposerSubmitArgs {
   queueEdit: QueueEditState | null
   queuedPrompts: QueuedPromptEntry[]
   sessionId: string | null | undefined
+  storedSessionId: string | null | undefined
   setComposerText: (value: string) => void
   stashAt: (scope: string | null, text?: string, attachments?: ComposerAttachment[]) => void
 }
@@ -69,6 +70,7 @@ export function useComposerSubmit({
   queueEdit,
   queuedPrompts,
   sessionId,
+  storedSessionId,
   setComposerText,
   stashAt
 }: UseComposerSubmitArgs) {
@@ -192,12 +194,20 @@ export function useComposerSubmit({
       return
     }
 
+    const sourceQueueSessionKey = activeQueueSessionKey
+    const sourceRuntimeId = sessionId ?? undefined
+    const sourceStoredId = storedSessionId ?? undefined
     triggerHaptic('submit')
     clearDraft()
 
     void Promise.resolve(onSteer(text)).then(accepted => {
-      if (!accepted && activeQueueSessionKey) {
-        enqueueQueuedPrompt(activeQueueSessionKey, { text, attachments: [] })
+      if (!accepted && sourceQueueSessionKey) {
+        enqueueQueuedPrompt(sourceQueueSessionKey, {
+          text,
+          attachments: [],
+          sourceRuntimeId,
+          sourceStoredId
+        })
       }
     })
   }

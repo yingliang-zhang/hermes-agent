@@ -207,7 +207,8 @@ export function ChatBar({
     onSubmit,
     queueEditRef,
     queueSessionKey,
-    sessionId
+    sessionId,
+    storedSessionId: queueSessionKey
   })
 
   const statusStackVisible = queuedPrompts.length > 0 || statusPresent
@@ -268,6 +269,7 @@ export function ChatBar({
     queueEdit,
     queuedPrompts,
     sessionId,
+    storedSessionId: queueSessionKey,
     setComposerText,
     stashAt
   })
