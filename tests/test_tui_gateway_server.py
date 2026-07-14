@@ -17709,7 +17709,11 @@ def test_close_sessions_for_transport_closes_flagged_repoints_rest(monkeypatch):
     transport = object()  # the disconnecting transport
     server._sessions.clear()
     server._sessions["a"] = {"transport": transport, "close_on_disconnect": True}
-    server._sessions["b"] = {"transport": transport, "close_on_disconnect": False}
+    server._sessions["b"] = {
+        "transport": transport,
+        "close_on_disconnect": False,
+        "history_lock": threading.Lock(),
+    }
     try:
         server._close_sessions_for_transport(transport, end_reason="ws_disconnect")
         assert seen == [("a", "ws_disconnect")]  # only the flagged one closed
@@ -17748,7 +17752,13 @@ def test_close_sessions_for_transport_skips_rebound_session(monkeypatch):
             return dict.get(self, key, default)
 
     session = _RebindsOnStomp(
-        {"transport": old_transport, "close_on_disconnect": False}
+        {
+            "transport": old_transport,
+            "close_on_disconnect": False,
+            # Real sessions always carry this; the detach path serializes the
+            # ownership re-check under it (see sibling test above).
+            "history_lock": threading.Lock(),
+        }
     )
     server._sessions.clear()
     server._sessions["rebound"] = session

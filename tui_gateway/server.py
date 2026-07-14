@@ -1392,24 +1392,17 @@ def _close_sessions_for_transport(
             # pop-outs all register as viewers, so on disconnect re-bind the
             # session to the most recent surviving viewer instead of
             # stranding the original window on the sentinel (#83716).
-            viewers = session.get("viewers")
-            if viewers:
-                viewers.pop(transport, None)
-            # Revalidate under the sessions lock before stomping (#77129):
-            # between the owned-sessions snapshot above and this write, a
-            # concurrent session.resume can rebind the session to a NEW live
-            # transport. Stomping it back onto the drop sentinel here would
-            # knock an attached client into detached state and arm an orphan
-            # reap against a session that has a live owner. If the transport
-            # already moved on to a different live transport, this disconnect
-            # has nothing left to tear down — skip the park AND the reap.
-            with _sessions_lock:
-                current = session.get("transport")
-                if (
-                    current is not transport
-                    and current is not None
-                    and not _transport_is_dead(current)
-                ):
+            # Serialize the final detach with transport rebinding — every
+            # rebind (resume, queue-drain, retry) — and the viewers bookkeeping
+            # below (_live_session_payload mutates it under the same lock) —
+            # so the owner snapshot above can't race a rebind between check and
+            # write (#77129): only tear down when this disconnect still owns
+            # the session's current transport.
+            with session["history_lock"]:
+                viewers = session.get("viewers")
+                if viewers:
+                    viewers.pop(transport, None)
+                if session.get("transport") is not transport:
                     continue
                 remaining = [
                     (ts, v)
@@ -8907,13 +8900,10 @@ def _rebind_session_transport(
     """Bind a live client and re-home only queue entries it now owns.
 
     Callers hold ``history_lock``. An explicit source-ID retry transfers that
-    one queued item to the retrying client. Resume/activate instead migrates
-    dead queue transports only when the session itself was detached, preserving
-    still-live per-item FIFO routing for other clients.
+    one queued item to the retrying client. Resume/activate migrates each dead
+    queued transport independently while preserving live per-item FIFO routing.
     """
-    previous_transport = session.get("transport")
     session["transport"] = transport
-    migrate_dead = migrate_dead_queued and _transport_is_dead(previous_transport)
 
     queued_items = [session.get("queued_prompt")]
     pending = session.get("queued_prompts")
@@ -8925,7 +8915,9 @@ def _rebind_session_transport(
         matches_source = (
             message_id is not None and item.get("message_id") == message_id
         )
-        if matches_source or (migrate_dead and _transport_is_dead(item.get("transport"))):
+        if matches_source or (
+            migrate_dead_queued and _transport_is_dead(item.get("transport"))
+        ):
             item["transport"] = transport
 
     # ``inflight_turn`` has no separate transport slot: rebinding the session
