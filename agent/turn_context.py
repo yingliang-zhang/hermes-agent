@@ -527,11 +527,28 @@ def build_turn_context(
             for _pass in range(3):
                 _orig_len = len(messages)
                 _orig_tokens = _preflight_tokens
-                messages, active_system_prompt = agent._compress_context(
-                    messages, system_message, approx_tokens=_preflight_tokens,
-                    task_id=effective_task_id,
-                    force=_hard_limit_breached,
-                )
+                _compress_kwargs = {
+                    "approx_tokens": _preflight_tokens,
+                    "task_id": effective_task_id,
+                }
+                if _hard_limit_breached:
+                    try:
+                        messages, active_system_prompt = agent._compress_context(
+                            messages,
+                            system_message,
+                            force=True,
+                            **_compress_kwargs,
+                        )
+                    except TypeError as exc:
+                        if "unexpected keyword argument 'force'" not in str(exc):
+                            raise
+                        messages, active_system_prompt = agent._compress_context(
+                            messages, system_message, **_compress_kwargs
+                        )
+                else:
+                    messages, active_system_prompt = agent._compress_context(
+                        messages, system_message, **_compress_kwargs
+                    )
                 # Re-estimate now so size-only compression (same row count,
                 # lower token count — e.g. summarising tool outputs) is
                 # recognised as progress instead of being misread as

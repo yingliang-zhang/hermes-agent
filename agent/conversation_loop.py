@@ -1142,13 +1142,28 @@ def run_conversation(
                     f"📦 Pre-API compression: ~{request_pressure_tokens:,} tokens "
                     "near the context/output limit. Compacting before the next model call."
                 )
-            messages, active_system_prompt = agent._compress_context(
-                messages,
-                system_message,
-                approx_tokens=request_pressure_tokens,
-                task_id=effective_task_id,
-                force=_hard_limit_breached,
-            )
+            _compress_kwargs = {
+                "approx_tokens": request_pressure_tokens,
+                "task_id": effective_task_id,
+            }
+            if _hard_limit_breached:
+                try:
+                    messages, active_system_prompt = agent._compress_context(
+                        messages,
+                        system_message,
+                        force=True,
+                        **_compress_kwargs,
+                    )
+                except TypeError as exc:
+                    if "unexpected keyword argument 'force'" not in str(exc):
+                        raise
+                    messages, active_system_prompt = agent._compress_context(
+                        messages, system_message, **_compress_kwargs
+                    )
+            else:
+                messages, active_system_prompt = agent._compress_context(
+                    messages, system_message, **_compress_kwargs
+                )
             # Reset retry/empty-response state so the compacted request
             # gets a fresh chance instead of inheriting stale recovery
             # counters from the pre-compaction history.
