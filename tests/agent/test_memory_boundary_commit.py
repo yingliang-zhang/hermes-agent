@@ -145,6 +145,95 @@ def test_boundary_commit_switch_failure_keeps_memory_fail_closed():
     assert mm.prefetch_all("new-session query", session_id="new-sid") == ""
 
 
+def test_async_unexpected_worker_failure_completes_prompt_wait(
+    monkeypatch, caplog
+):
+    class _PromptProvider(_RecordingProvider):
+        def system_prompt_block(self):
+            return "old memory"
+
+    switch_started = threading.Event()
+    release_switch = threading.Event()
+    mm = _make_manager(_PromptProvider())
+
+    def fail_switch(*_args, **_kwargs):
+        switch_started.set()
+        release_switch.wait(timeout=5)
+        raise RuntimeError("unexpected manager worker failure")
+
+    monkeypatch.setattr(mm, "_switch_providers_on_worker", fail_switch)
+    with caplog.at_level("ERROR"):
+        mm.commit_session_boundary_async([], new_session_id="B")
+        assert switch_started.wait(timeout=1)
+        prompt_results = []
+        prompt_waiter = threading.Thread(
+            target=lambda: prompt_results.append(mm.build_system_prompt())
+        )
+        prompt_waiter.start()
+        prompt_waiter.join(timeout=0.05)
+        waited_for_boundary = prompt_waiter.is_alive()
+
+        release_switch.set()
+        prompt_waiter.join(timeout=2)
+        assert mm.flush_pending(timeout=2)
+
+    assert waited_for_boundary
+    assert not prompt_waiter.is_alive()
+    assert prompt_results == [""]
+    assert mm.build_system_prompt() == ""
+    assert not mm.session_boundary_pending
+    assert not mm.memory_enabled
+    assert "failed unexpectedly; memory remains disabled" in caplog.text
+
+
+def test_sync_unexpected_worker_failure_completes_prompt_wait(
+    monkeypatch, caplog
+):
+    class _PromptProvider(_RecordingProvider):
+        def system_prompt_block(self):
+            return "old memory"
+
+    switch_started = threading.Event()
+    release_switch = threading.Event()
+    mm = _make_manager(_PromptProvider())
+
+    def fail_switch(*_args, **_kwargs):
+        switch_started.set()
+        release_switch.wait(timeout=5)
+        raise RuntimeError("unexpected manager worker failure")
+
+    monkeypatch.setattr(mm, "_switch_providers_on_worker", fail_switch)
+    switch_results = []
+    with caplog.at_level("ERROR"):
+        switcher = threading.Thread(
+            target=lambda: switch_results.append(mm.on_session_switch("B"))
+        )
+        switcher.start()
+        assert switch_started.wait(timeout=1)
+        prompt_results = []
+        prompt_waiter = threading.Thread(
+            target=lambda: prompt_results.append(mm.build_system_prompt())
+        )
+        prompt_waiter.start()
+        prompt_waiter.join(timeout=0.05)
+        waited_for_boundary = prompt_waiter.is_alive()
+
+        release_switch.set()
+        switcher.join(timeout=2)
+        prompt_waiter.join(timeout=2)
+        assert mm.flush_pending(timeout=2)
+
+    assert waited_for_boundary
+    assert not switcher.is_alive()
+    assert not prompt_waiter.is_alive()
+    assert switch_results == [False]
+    assert prompt_results == [""]
+    assert mm.build_system_prompt() == ""
+    assert not mm.session_boundary_pending
+    assert not mm.memory_enabled
+    assert "failed unexpectedly; memory remains disabled" in caplog.text
+
+
 def test_boundary_switch_succeeds_only_when_every_provider_rebinds():
     class _ExplodingSwitchProvider(_RecordingProvider):
         def on_session_switch(self, new_session_id: str, **kwargs) -> None:
@@ -195,11 +284,10 @@ def test_boundary_superseded_before_start_skips_extraction_and_switch():
     assert provider.calls == [("switch", "C", True)]
 
 
-def test_running_extraction_finishes_but_stale_switch_and_callback_are_skipped():
+def test_running_extraction_finishes_but_stale_switch_is_skipped():
     """A newer boundary supersedes only the stale extraction's commit phase."""
     extraction_started = threading.Event()
     release_extraction = threading.Event()
-    callbacks = []
 
     class _BlockingEndProvider(_RecordingProvider):
         def on_session_end(self, messages):  # type: ignore[override]
@@ -213,7 +301,6 @@ def test_running_extraction_finishes_but_stale_switch_and_callback_are_skipped()
         [{"role": "user", "content": "A history"}],
         new_session_id="B",
         parent_session_id="A",
-        on_switched=lambda: callbacks.append("B"),
     )
     assert extraction_started.wait(timeout=1)
 
@@ -221,7 +308,6 @@ def test_running_extraction_finishes_but_stale_switch_and_callback_are_skipped()
         [],
         new_session_id="C",
         parent_session_id="B",
-        on_switched=lambda: callbacks.append("C"),
     )
     release_extraction.set()
 
@@ -230,7 +316,6 @@ def test_running_extraction_finishes_but_stale_switch_and_callback_are_skipped()
         ("end", [{"role": "user", "content": "A history"}]),
         ("switch", "C", True),
     ]
-    assert callbacks == ["C"]
 
 
 def test_intermediate_snapshot_is_skipped_when_parent_was_never_bound():
@@ -278,43 +363,8 @@ def test_intermediate_snapshot_is_skipped_when_parent_was_never_bound():
     assert provider.session_id == "C"
 
 
-def test_boundary_callback_runs_before_memory_gate_opens():
-    """Prompt invalidation must complete before new-session recall is enabled."""
-    provider = _RecordingProvider()
-    mm = _make_manager(provider)
-    callback_observations = []
-
-    mm.commit_session_boundary_async(
-        [],
-        new_session_id="B",
-        parent_session_id="A",
-        on_switched=lambda: callback_observations.append(mm.session_boundary_pending),
-    )
-
-    assert mm.flush_pending(timeout=2)
-    assert callback_observations == [True]
-    assert not mm.session_boundary_pending
 
 
-def test_boundary_callback_failure_keeps_gate_closed_and_skips_queued_sync():
-    provider = _RecordingProvider()
-    mm = _make_manager(provider)
-
-    def fail_callback() -> None:
-        raise RuntimeError("prompt invalidation failed")
-
-    mm.commit_session_boundary_async(
-        [],
-        new_session_id="B",
-        parent_session_id="A",
-        on_switched=fail_callback,
-    )
-    mm.sync_all("new turn", "reply", session_id="B")
-
-    assert mm.flush_pending(timeout=2)
-    assert not mm.session_boundary_pending
-    assert not mm.memory_enabled
-    assert provider.calls == [("switch", "B", True)]
 
 
 def test_rejected_boundary_keeps_gate_closed_and_logs(caplog):
@@ -384,13 +434,11 @@ def _assert_pending_new_superseded_by_direct_transition(
     provider = _OverlappingTransitionProvider()
     mm = _make_manager(provider)
     mm._bound_session_id = "A"
-    stale_callbacks = []
 
     mm.commit_session_boundary_async(
         [{"role": "user", "content": "A history"}],
         new_session_id="B",
         parent_session_id="A",
-        on_switched=lambda: stale_callbacks.append("B"),
     )
     assert provider.extraction_started.wait(timeout=1)
 
@@ -430,7 +478,6 @@ def _assert_pending_new_superseded_by_direct_transition(
             transition_kwargs.get("rewound", False),
         ),
     ]
-    assert stale_callbacks == []
     assert not provider.overlap
 
 

@@ -961,7 +961,6 @@ class MemoryManager:
         new_session_id: str,
         parent_session_id: str = "",
         reason: str = "new_session",
-        on_switched: Optional[Callable[[], None]] = None,
         generation: Optional[int] = None,
     ) -> None:
         """Queue old extraction and rebind as one generation-aware job."""
@@ -972,72 +971,81 @@ class MemoryManager:
             generation = self.reserve_session_boundary()
 
         def _run() -> None:
-            switched = False
-            with self._provider_call_lock:
-                with self._session_boundary_lock:
-                    if generation != self._session_boundary_generation:
-                        self._complete_session_boundary(generation)
-                        logger.debug(
-                            "Skipping superseded memory boundary %d before extraction",
-                            generation,
-                        )
-                        return
-                    bound_session_id = self._bound_session_id
+            try:
+                switched = False
+                with self._provider_call_lock:
+                    with self._session_boundary_lock:
+                        if generation != self._session_boundary_generation:
+                            self._complete_session_boundary(generation)
+                            logger.debug(
+                                "Skipping superseded memory boundary %d before extraction",
+                                generation,
+                            )
+                            return
+                        bound_session_id = self._bound_session_id
 
-                extraction_allowed = not (
-                    snapshot
-                    and parent_session_id
-                    and bound_session_id
-                    and bound_session_id != parent_session_id
-                )
-                if snapshot and not extraction_allowed:
-                    logger.warning(
-                        "Skipping memory extraction for unbound parent session %s "
-                        "(provider is bound to %s)",
-                        parent_session_id,
-                        bound_session_id,
+                    extraction_allowed = not (
+                        snapshot
+                        and parent_session_id
+                        and bound_session_id
+                        and bound_session_id != parent_session_id
                     )
-                elif snapshot:
-                    self._notify_session_end_locked(snapshot)
+                    if snapshot and not extraction_allowed:
+                        logger.warning(
+                            "Skipping memory extraction for unbound parent session %s "
+                            "(provider is bound to %s)",
+                            parent_session_id,
+                            bound_session_id,
+                        )
+                    elif snapshot:
+                        self._notify_session_end_locked(snapshot)
+
+                    with self._session_boundary_lock:
+                        if generation != self._session_boundary_generation:
+                            self._complete_session_boundary(generation)
+                            logger.debug(
+                                "Skipping superseded memory boundary %d provider switch",
+                                generation,
+                            )
+                            return
+
+                    switched = self._switch_providers_on_worker(
+                        new_session_id,
+                        parent_session_id=parent_session_id,
+                        reset=True,
+                        reason=reason,
+                    )
 
                 with self._session_boundary_lock:
                     if generation != self._session_boundary_generation:
                         self._complete_session_boundary(generation)
-                        logger.debug(
-                            "Skipping superseded memory boundary %d provider switch",
+                        return
+                    self._session_switch_failed = not switched
+                    if not switched:
+                        logger.warning(
+                            "Memory session boundary %d rebind failed; "
+                            "memory remains disabled",
                             generation,
                         )
-                        return
-
-                switched = self._switch_providers_on_worker(
-                    new_session_id,
-                    parent_session_id=parent_session_id,
-                    reset=True,
-                    reason=reason,
-                )
-
-            with self._session_boundary_lock:
-                if generation != self._session_boundary_generation:
                     self._complete_session_boundary(generation)
-                    return
-                if switched and on_switched is not None:
-                    try:
-                        on_switched()
-                    except Exception as e:
-                        switched = False
-                        logger.warning(
-                            "Session-boundary completion callback failed; "
-                            "memory remains disabled: %s",
-                            e,
-                        )
-                self._session_switch_failed = not switched
-                if not switched:
-                    logger.warning(
-                        "Memory session boundary %d rebind failed; "
+            except Exception:
+                with self._session_boundary_lock:
+                    failed_current = generation == self._session_boundary_generation
+                    if failed_current:
+                        self._session_switch_failed = True
+                        self._complete_session_boundary(generation)
+                if failed_current:
+                    logger.exception(
+                        "Memory session boundary %d failed unexpectedly; "
                         "memory remains disabled",
                         generation,
                     )
-                self._complete_session_boundary(generation)
+                else:
+                    logger.exception(
+                        "Superseded memory session boundary %d failed unexpectedly",
+                        generation,
+                    )
+                raise
 
         if not self._submit_background(_run):
             with self._session_boundary_lock:
@@ -1126,6 +1134,24 @@ class MemoryManager:
                     self._session_switch_failed = not switched
                     self._complete_session_boundary(generation)
                     outcome["switched"] = switched
+            except Exception:
+                with self._session_boundary_lock:
+                    failed_current = generation == self._session_boundary_generation
+                    if failed_current:
+                        self._session_switch_failed = True
+                        self._complete_session_boundary(generation)
+                if failed_current:
+                    logger.exception(
+                        "Memory session boundary %d failed unexpectedly; "
+                        "memory remains disabled",
+                        generation,
+                    )
+                else:
+                    logger.exception(
+                        "Superseded memory session boundary %d failed unexpectedly",
+                        generation,
+                    )
+                raise
             finally:
                 completed.set()
 
