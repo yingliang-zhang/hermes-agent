@@ -1789,26 +1789,6 @@ def compress_context(
         cached_system_prompt = agent._cached_system_prompt
         agent._invalidate_system_prompt()
 
-        # Built-in memory is the only system-prompt input that a normal
-        # compaction reloads. When the cached prompt already embeds the
-        # freshly-reloaded memory blocks verbatim, keep the exact cached
-        # prompt so local backends retain their KV-cache prefix. Containment
-        # (not before/after snapshot equality) is required: fresh-agent
-        # surfaces restore the cached prompt from the session DB, where it
-        # can predate mid-session memory writes the in-memory snapshot has
-        # already absorbed. External providers can change their own prompt
-        # block during on_pre_compress(), so they retain the rebuild path.
-        if (
-            cached_system_prompt is not None
-            and getattr(agent, "_memory_manager", None) is None
-            and _cached_prompt_reflects_builtin_memory(agent, cached_system_prompt)
-        ):
-            new_system_prompt = cached_system_prompt
-            agent._cached_system_prompt = cached_system_prompt
-        else:
-            new_system_prompt = agent._build_system_prompt(system_message)
-            agent._cached_system_prompt = new_system_prompt
-
         _session_commit_succeeded = False
         split_status = "not_applicable"
         if agent._session_db:
@@ -1997,7 +1977,6 @@ def compress_context(
                 # in-place keeps and rotation has already reassigned to the new id):
                 # refresh the stored system prompt and reset the flush cursor so the
                 # next turn re-bases its append diff.
-                agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
                 if in_place:
                     agent._last_flushed_db_idx = 0
                 else:
@@ -2029,11 +2008,11 @@ def compress_context(
                     logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
 
         # Compaction-boundary bookkeeping, computed once. `old_session_id` is only
-        # bound in the rotation branch; in-place leaves it unset. `_boundary_parent`
-        # is the id the boundary notifications attribute the prior state to: the old
-        # id on rotation, the (unchanged) current id in-place.
+        # bound in the rotation branch; in-place and DB-less compression leave it
+        # unset. `_boundary_parent` is the id the notifications attribute the
+        # prior state to: the old id on rotation, or the unchanged current id.
         _old_sid = locals().get("old_session_id")
-        _is_boundary = bool(_old_sid) or in_place
+        _is_boundary = bool(_old_sid) or in_place or agent._session_db is None
         _context_engine_boundary_committed = _session_commit_succeeded and (
             bool(_old_sid) or compacted_in_place
         )
@@ -2075,6 +2054,33 @@ def compress_context(
                 )
         except Exception as _me_err:
             logger.debug("memory manager on_session_switch (compression): %s", _me_err)
+
+        # Provider rebinding can change session-templated memory banks. Decide
+        # whether to reuse or rebuild only after that switch so the cached and
+        # persisted prompt advertise the bank that subsequent recall/tool
+        # operations will actually use. Built-in memory is the only prompt
+        # input that normal compaction reloads, so when the old prompt already
+        # embeds the freshly reloaded blocks verbatim, preserve its exact bytes
+        # for local-backend KV-cache reuse. External providers always rebuild.
+        if (
+            cached_system_prompt is not None
+            and getattr(agent, "_memory_manager", None) is None
+            and _cached_prompt_reflects_builtin_memory(agent, cached_system_prompt)
+        ):
+            new_system_prompt = cached_system_prompt
+        else:
+            new_system_prompt = agent._build_system_prompt(system_message)
+        agent._cached_system_prompt = new_system_prompt
+        if agent._session_db:
+            try:
+                agent._session_db.update_system_prompt(
+                    agent.session_id, new_system_prompt
+                )
+            except Exception as _prompt_db_err:
+                logger.warning(
+                    "Could not persist rebuilt post-compression system prompt: %s",
+                    _prompt_db_err,
+                )
 
         # Warn on repeated compressions (quality degrades with each pass).
         # Route through _emit_status (like the other compression warnings above)

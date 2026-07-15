@@ -1758,25 +1758,30 @@ class AIAgent:
             return persisted
 
         override = getattr(self, "_persist_user_message_override", None)
-        if isinstance(override, list):
-            persisted["content"] = override
-        elif override is not None:
-            content = message.get("content")
-            if isinstance(content, list):
-                clean_parts = []
-                replaced_text = False
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        if not replaced_text:
-                            clean_parts.append({**part, "text": override})
-                            replaced_text = True
-                        continue
-                    clean_parts.append(part)
-                if not replaced_text:
-                    clean_parts.insert(0, {"type": "text", "text": override})
-                persisted["content"] = clean_parts
-            else:
+        # Preflight compaction can re-anchor this index at a user row whose
+        # content already contains the merged summary. Replacing that content
+        # would silently remove the summary from durable history; timestamp
+        # provenance below still applies independently.
+        if not message.get(COMPRESSED_SUMMARY_METADATA_KEY):
+            if isinstance(override, list):
                 persisted["content"] = override
+            elif override is not None:
+                content = message.get("content")
+                if isinstance(content, list):
+                    clean_parts = []
+                    replaced_text = False
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            if not replaced_text:
+                                clean_parts.append({**part, "text": override})
+                                replaced_text = True
+                            continue
+                        clean_parts.append(part)
+                    if not replaced_text:
+                        clean_parts.insert(0, {"type": "text", "text": override})
+                    persisted["content"] = clean_parts
+                else:
+                    persisted["content"] = override
 
         timestamp = getattr(self, "_persist_user_message_timestamp", None)
         if timestamp is not None:

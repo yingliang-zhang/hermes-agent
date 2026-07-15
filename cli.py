@@ -7372,7 +7372,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
 
         # No provider extraction to queue when no memory manager is
-        # configured — new_session() falls back to the inline switch path.
+        # configured; the context-engine boundary above is still complete.
         if getattr(agent, "_memory_manager", None) is None:
             return None
         return history_snapshot
@@ -7394,6 +7394,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         elif self.agent:
             # First session or empty history — still finalize the old session
             self._notify_session_boundary("on_session_finalize")
+
+        # Close memory before the new id is visible anywhere. Reservation is
+        # only a generation increment; extraction and provider rebinding stay
+        # asynchronous on MemoryManager's single accepted-work worker.
+        _mm = getattr(self.agent, "_memory_manager", None) if self.agent else None
+        _boundary_generation = None
+        if _mm is not None and getattr(_mm, "providers", None):
+            try:
+                _boundary_generation = _mm.reserve_session_boundary()
+            except Exception:
+                logger.warning(
+                    "Could not reserve memory session boundary", exc_info=True
+                )
 
         if self._session_db and old_session_id:
             # Flush any un-persisted messages from the current turn to the
@@ -7549,31 +7562,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # per-session state (_session_turns, _turn_counter, _document_id).
             # Fires BEFORE the plugin on_session_reset hook (shell hooks only
             # see the new id; Python providers see the transition). See #6672.
-            #
-            # When the old session has history, end-of-session extraction
-            # (LLM-bound, seconds) and this switch are queued as ONE task on
-            # the memory manager's serialized worker — end strictly before
-            # switch, without blocking /new (#16454). With no history there
-            # is nothing to extract; switch inline as before.
+            # Empty and non-empty histories use the same serialized boundary.
+            # A newer /new can therefore supersede queued extraction or a
+            # stale post-extraction switch without mutating providers inline.
             try:
-                _mm = getattr(self.agent, "_memory_manager", None)
                 if _mm is not None:
-                    if _boundary_snapshot:
-                        _mm.commit_session_boundary_async(
-                            _boundary_snapshot,
-                            new_session_id=self.session_id,
-                            parent_session_id=old_session_id or "",
-                            reason="new_session",
-                        )
-                    else:
-                        _mm.on_session_switch(
-                            self.session_id,
-                            parent_session_id=old_session_id or "",
-                            reset=True,
-                            reason="new_session",
-                        )
+                    _mm.commit_session_boundary_async(
+                        list(_boundary_snapshot or []),
+                        new_session_id=self.session_id,
+                        parent_session_id=old_session_id or "",
+                        reason="new_session",
+
+                        generation=_boundary_generation,
+                    )
             except Exception:
-                pass
+                logger.warning(
+                    "Could not queue memory session boundary; memory remains disabled",
+                    exc_info=True,
+                )
             self._notify_session_boundary("on_session_reset")
 
         if not silent:

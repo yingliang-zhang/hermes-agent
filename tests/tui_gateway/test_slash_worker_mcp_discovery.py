@@ -14,19 +14,56 @@ import threading
 import pytest
 import yaml
 
+from tui_gateway import slash_worker
+
 pytest.importorskip("mcp.server.fastmcp")
+
+
+def test_tools_command_waits_for_configured_mcp_discovery(monkeypatch):
+    joins: list[object] = []
+    monkeypatch.setattr(
+        "hermes_cli.mcp_startup.join_mcp_discovery",
+        lambda timeout=None: joins.append(timeout) or True,
+    )
+
+    slash_worker._wait_for_command_readiness("/tools")
+    assert joins == [slash_worker._MCP_COMMAND_READINESS_TIMEOUT_S]
+
+    joins.clear()
+    slash_worker._wait_for_command_readiness("/status")
+    assert joins == []
+
+def test_tools_command_reports_permanently_stalled_discovery(monkeypatch):
+    stalled = threading.Event()
+    monkeypatch.setattr(slash_worker, "_MCP_COMMAND_READINESS_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(
+        "hermes_cli.mcp_startup.join_mcp_discovery",
+        lambda timeout=None: stalled.wait(timeout),
+    )
+
+    with pytest.raises(RuntimeError, match="MCP tool discovery did not finish") as exc:
+        slash_worker._wait_for_command_readiness("/tools")
+
+    message = str(exc.value)
+    assert "retry /tools" in message
+    assert "/reload-mcp" in message
+
+
 
 
 def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
     profile_home = tmp_path / "profile-home"
     profile_home.mkdir()
     marker = "profile-local-61922"
+    readiness_gate = tmp_path / "allow-mcp-startup"
     server = tmp_path / "fastmcp_probe.py"
     server.write_text(
         textwrap.dedent(
             f"""
-            from mcp.server.fastmcp import FastMCP
+            import time
+            from pathlib import Path
 
+            from mcp.server.fastmcp import FastMCP
             mcp = FastMCP("profileprobe")
 
             @mcp.tool()
@@ -34,6 +71,11 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
                 return {marker!r}
 
             if __name__ == "__main__":
+                deadline = time.monotonic() + 10
+                while not Path({str(readiness_gate)!r}).exists():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("readiness gate was never released")
+                    time.sleep(0.01)
                 mcp.run(transport="stdio")
             """
         ),
@@ -42,13 +84,15 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
     (profile_home / "config.yaml").write_text(
         yaml.safe_dump(
             {
+                "mcp_discovery_timeout": 0.01,
                 "mcp_servers": {
                     "profileprobe": {
                         "enabled": True,
                         "command": sys.executable,
                         "args": [str(server)],
+                        "connect_timeout": 10,
                     }
-                }
+                },
             }
         ),
         encoding="utf-8",
@@ -78,22 +122,30 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         env=env,
         cwd=tmp_path,
     )
-    output: queue.Queue[str] = queue.Queue()
+    output: queue.Queue[dict] = queue.Queue()
     try:
         assert proc.stdin is not None
         assert proc.stdout is not None
         stdout = proc.stdout
-        threading.Thread(
-            target=lambda: output.put(stdout.readline()),
-            daemon=True,
-        ).start()
+
+        def read_output() -> None:
+            for line in stdout:
+                output.put(json.loads(line))
+
+        threading.Thread(target=read_output, daemon=True).start()
+        try:
+            ready = output.get(timeout=30)
+        except queue.Empty:
+            pytest.fail("slash worker did not report readiness within 30 seconds")
+        assert ready == {"event": "ready"}
+
+        readiness_gate.touch()
         proc.stdin.write(json.dumps({"id": 1, "command": "/tools"}) + "\n")
         proc.stdin.flush()
         try:
-            line = output.get(timeout=10)
+            response = output.get(timeout=10)
         except queue.Empty:
-            pytest.fail("slash worker produced no /tools response within 10 seconds")
-        response = json.loads(line)
+            pytest.fail("ready slash worker produced no /tools response within 10 seconds")
         assert response["ok"] is True
         assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]
     finally:

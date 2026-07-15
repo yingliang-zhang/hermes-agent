@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
+import threading
+import time
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -192,12 +195,412 @@ def test_new_session_queues_boundary_commit_with_snapshot(tmp_path):
     assert kwargs["new_session_id"] == cli.session_id
     assert kwargs["parent_session_id"] == old_session_id
     assert kwargs["reason"] == "new_session"
+    assert "on_switched" not in kwargs
     # The queued path replaces the inline switch — not both.
     mm.on_session_switch.assert_not_called()
 
 
-def test_new_session_without_history_switches_inline(tmp_path):
-    """No old-session history → nothing to extract → plain inline switch."""
+def test_new_session_reserves_boundary_before_publishing_session_id(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    old_session_id = cli.session_id
+    observed_session_ids = []
+
+    mm = MagicMock()
+    mm.providers = [object()]
+    mm.reserve_session_boundary.side_effect = (
+        lambda: observed_session_ids.append(cli.session_id) or 7
+    )
+    cli.agent._memory_manager = mm
+
+    cli.process_command("/new")
+
+    assert observed_session_ids == [old_session_id]
+    assert cli.session_id != old_session_id
+    assert mm.commit_session_boundary_async.call_args.kwargs["generation"] == 7
+
+
+def test_new_session_fail_closes_memory_until_provider_rebind(tmp_path):
+    """A slow extraction cannot expose the old bank to the new session."""
+    from agent.memory_manager import MemoryManager
+    from agent.memory_provider import MemoryProvider
+    extraction_started = threading.Event()
+    release_extraction = threading.Event()
+
+    class _SessionBankProvider(MemoryProvider):
+        def __init__(self):
+            self.session_id = ""
+            self.prefetch_calls = []
+            self.tool_calls = []
+            self.prompt_calls = 0
+
+        @property
+        def name(self):
+            return "session-bank"
+
+        def is_available(self):
+            return True
+
+        def initialize(self, session_id, **kwargs):
+            del kwargs
+            self.session_id = session_id
+
+        def get_tool_schemas(self):
+            return [
+                {
+                    "name": "session_bank_recall",
+                    "description": "Recall",
+                    "parameters": {},
+                }
+            ]
+
+        def system_prompt_block(self):
+            self.prompt_calls += 1
+            return f"Active bank: {self.session_id}"
+
+        def prefetch(self, query, *, session_id=""):
+            self.prefetch_calls.append((query, self.session_id, session_id))
+            return f"bank:{self.session_id}"
+
+        def handle_tool_call(self, tool_name, args, **kwargs):
+            del args
+            self.tool_calls.append(
+                (tool_name, self.session_id, kwargs.get("session_id"))
+            )
+            return json.dumps({"bank": self.session_id})
+
+        def on_session_end(self, messages):
+            del messages
+            extraction_started.set()
+            release_extraction.wait(timeout=10)
+
+        def on_session_switch(self, new_session_id, **kwargs):
+            del kwargs
+            self.session_id = new_session_id
+
+    cli = _prepare_cli_with_active_session(tmp_path)
+    old_session_id = cli.session_id
+    manager = MemoryManager()
+    provider = _SessionBankProvider()
+    manager.add_provider(provider)
+    manager.initialize_all(old_session_id)
+    assert manager._bound_session_id == old_session_id
+    cli.agent._memory_manager = manager
+
+    started_at = time.monotonic()
+    cli.process_command("/new")
+    assert time.monotonic() - started_at < 0.5
+    assert extraction_started.wait(timeout=1)
+    assert provider.session_id == old_session_id
+
+    try:
+        assert manager.prefetch_all("new-session query", session_id=cli.session_id) == ""
+
+        blocked_tool = json.loads(
+            manager.handle_tool_call(
+                "session_bank_recall", {}, session_id=cli.session_id
+            )
+        )
+        assert "error" in blocked_tool
+        assert provider.prefetch_calls == []
+        assert provider.tool_calls == []
+    finally:
+        release_extraction.set()
+
+    assert manager.flush_pending(timeout=2)
+    assert provider.session_id == cli.session_id
+
+    assert manager.build_system_prompt() == f"Active bank: {cli.session_id}"
+    assert manager.prefetch_all("ready", session_id=cli.session_id) == (
+        f"bank:{cli.session_id}"
+    )
+    ready_tool = json.loads(
+        manager.handle_tool_call(
+            "session_bank_recall", {}, session_id=cli.session_id
+        )
+    )
+    assert ready_tool == {"bank": cli.session_id}
+    manager.shutdown_all()
+
+
+def test_first_new_session_prompt_waits_and_remains_byte_stable(tmp_path):
+    from agent.memory_manager import MemoryManager
+    from agent.memory_provider import MemoryProvider
+
+    extraction_started = threading.Event()
+    release_extraction = threading.Event()
+
+    class _PromptBankProvider(MemoryProvider):
+        def __init__(self):
+            self.session_id = ""
+            self.prompt_calls = 0
+
+        @property
+        def name(self):
+            return "prompt-bank"
+
+        def is_available(self):
+            return True
+
+        def initialize(self, session_id, **kwargs):
+            del kwargs
+            self.session_id = session_id
+
+        def get_tool_schemas(self):
+            return []
+
+        def system_prompt_block(self):
+            self.prompt_calls += 1
+            return f"Active bank: {self.session_id}"
+
+        def on_session_end(self, messages):
+            del messages
+            extraction_started.set()
+            release_extraction.wait(timeout=5)
+
+        def on_session_switch(self, new_session_id, **kwargs):
+            del kwargs
+            self.session_id = new_session_id
+
+    cli = _prepare_cli_with_active_session(tmp_path)
+    manager = MemoryManager()
+    provider = _PromptBankProvider()
+    manager.add_provider(provider)
+    manager.initialize_all(cli.session_id)
+    cli.agent._memory_manager = manager
+    cli.agent._cached_system_prompt = None
+
+    cli.process_command("/new")
+    assert extraction_started.wait(timeout=1)
+
+    prompts = []
+
+    def build_turn_prompt() -> None:
+        if cli.agent._cached_system_prompt is None:
+            memory_block = manager.build_system_prompt()
+            cli.agent._cached_system_prompt = f"stable-base\n\n{memory_block}"
+        prompts.append(cli.agent._cached_system_prompt)
+
+    first_turn = threading.Thread(target=build_turn_prompt)
+    first_turn.start()
+    first_turn.join(timeout=0.1)
+    waited_for_boundary = first_turn.is_alive()
+
+    release_extraction.set()
+    first_turn.join(timeout=2)
+
+    assert waited_for_boundary
+    assert not first_turn.is_alive()
+    assert manager.flush_pending(timeout=2)
+    assert prompts == [f"stable-base\n\nActive bank: {cli.session_id}"]
+
+    build_turn_prompt()
+    assert prompts[1] == prompts[0]
+    assert provider.prompt_calls == 1
+    manager.shutdown_all()
+
+
+def test_overlapping_new_sessions_never_rebind_to_superseded_session(tmp_path):
+    """A→B extraction followed by B→C must finish bound to C only."""
+    from agent.memory_manager import MemoryManager
+    from agent.memory_provider import MemoryProvider
+
+    extraction_started = threading.Event()
+    release_extraction = threading.Event()
+
+    class _BlockingBoundaryProvider(MemoryProvider):
+        def __init__(self):
+            self.session_id = ""
+            self.switches = []
+
+        @property
+        def name(self):
+            return "blocking-boundary"
+
+        def is_available(self):
+            return True
+
+        def initialize(self, session_id="", **kwargs):
+            del kwargs
+            self.session_id = session_id
+
+        def get_tool_schemas(self):
+            return []
+
+        def on_session_end(self, messages):
+            del messages
+            extraction_started.set()
+            release_extraction.wait(timeout=5)
+
+        def on_session_switch(self, new_session_id, **kwargs):
+            del kwargs
+            self.session_id = new_session_id
+            self.switches.append(new_session_id)
+
+    cli = _prepare_cli_with_active_session(tmp_path)
+    session_a = cli.session_id
+    manager = MemoryManager()
+    provider = _BlockingBoundaryProvider()
+    manager.add_provider(provider)
+    manager.initialize_all(session_a)
+    cli.agent._memory_manager = manager
+
+    cli.process_command("/new")
+    session_b = cli.session_id
+    assert extraction_started.wait(timeout=1)
+
+    started_at = time.monotonic()
+    cli.process_command("/new")
+    session_c = cli.session_id
+    assert time.monotonic() - started_at < 0.5
+    assert session_c not in {session_a, session_b}
+
+    try:
+        assert manager.session_boundary_pending
+    finally:
+        release_extraction.set()
+
+    assert manager.flush_pending(timeout=2)
+    assert provider.switches == [session_c]
+    assert provider.session_id == session_c
+    manager.shutdown_all()
+
+
+def test_second_new_returns_while_first_provider_switch_is_running(tmp_path):
+    """A newer reservation never waits for an older provider switch."""
+    from agent.memory_manager import MemoryManager
+    from agent.memory_provider import MemoryProvider
+
+    switch_started = threading.Event()
+    release_switch = threading.Event()
+
+    class _BlockingSwitchProvider(MemoryProvider):
+        def __init__(self):
+            self.session_id = ""
+            self.switches = []
+
+        @property
+        def name(self):
+            return "blocking-switch"
+
+        def is_available(self):
+            return True
+
+        def initialize(self, session_id="", **kwargs):
+            del kwargs
+            self.session_id = session_id
+
+        def get_tool_schemas(self):
+            return []
+
+        def on_session_switch(self, new_session_id, **kwargs):
+            del kwargs
+            if not self.switches:
+                switch_started.set()
+                release_switch.wait(timeout=5)
+            self.session_id = new_session_id
+            self.switches.append(new_session_id)
+
+    cli = _prepare_cli_with_active_session(tmp_path)
+    manager = MemoryManager()
+    provider = _BlockingSwitchProvider()
+    manager.add_provider(provider)
+    manager.initialize_all(cli.session_id)
+    cli.agent._memory_manager = manager
+
+    cli.process_command("/new")
+    session_b = cli.session_id
+    assert switch_started.wait(timeout=1)
+
+    command_thread = threading.Thread(target=lambda: cli.process_command("/new"))
+    command_thread.start()
+    command_thread.join(timeout=0.3)
+    returned_promptly = not command_thread.is_alive()
+    session_c = cli.session_id
+
+    release_switch.set()
+    command_thread.join(timeout=2)
+    assert returned_promptly
+    assert session_c != session_b
+    assert manager.flush_pending(timeout=2)
+    assert provider.session_id == session_c
+    assert provider.switches[-1] == session_c
+    manager.shutdown_all()
+
+
+def _unavailable_worker_new_case(tmp_path):
+    from agent.memory_manager import MemoryManager
+    from agent.memory_provider import MemoryProvider
+
+    extraction_started = threading.Event()
+    release_extraction = threading.Event()
+
+    class _BlockingExtractionProvider(MemoryProvider):
+        @property
+        def name(self):
+            return "unavailable-worker"
+
+        def is_available(self):
+            return True
+
+        def initialize(self, session_id="", **kwargs):
+            del session_id, kwargs
+
+        def get_tool_schemas(self):
+            return []
+
+        def on_session_end(self, messages):
+            del messages
+            extraction_started.set()
+            release_extraction.wait(timeout=5)
+
+    cli = _prepare_cli_with_active_session(tmp_path)
+    manager = MemoryManager()
+    manager.add_provider(_BlockingExtractionProvider())
+    cli.agent._memory_manager = manager
+    return cli, manager, extraction_started, release_extraction
+
+
+def _assert_new_fails_closed_without_worker(
+    cli, manager, extraction_started, release_extraction
+):
+    command_thread = threading.Thread(target=lambda: cli.process_command("/new"))
+    command_thread.start()
+    command_thread.join(timeout=0.3)
+    returned_promptly = not command_thread.is_alive()
+    extraction_ran = extraction_started.is_set()
+
+    release_extraction.set()
+    command_thread.join(timeout=2)
+
+    assert returned_promptly
+    assert not extraction_ran
+    assert not manager.session_boundary_pending
+    assert not manager.memory_enabled
+
+
+def test_new_fails_closed_when_executor_creation_fails(tmp_path):
+    """No worker means /new drops extraction instead of running inline."""
+    case = _unavailable_worker_new_case(tmp_path)
+    with patch(
+        "tools.daemon_pool.DaemonThreadPoolExecutor",
+        side_effect=RuntimeError("cannot create worker"),
+    ):
+        _assert_new_fails_closed_without_worker(*case)
+
+
+def test_new_fails_closed_when_executor_submit_raises(tmp_path):
+    """A rejecting worker must not run extraction on the /new caller."""
+
+    class _RejectingExecutor:
+        def submit(self, _fn):
+            raise RuntimeError("executor rejected task")
+
+    case = _unavailable_worker_new_case(tmp_path)
+    case[1]._sync_executor = _RejectingExecutor()
+    _assert_new_fails_closed_without_worker(*case)
+
+def test_new_session_without_history_queues_boundary_commit(tmp_path):
+    """Empty-history /new uses the same serialized provider boundary."""
     cli = _prepare_cli_with_active_session(tmp_path)
     cli.conversation_history = []
 
@@ -206,10 +609,12 @@ def test_new_session_without_history_switches_inline(tmp_path):
 
     cli.process_command("/new")
 
-    mm.commit_session_boundary_async.assert_not_called()
-    mm.on_session_switch.assert_called_once()
-    _, kwargs = mm.on_session_switch.call_args
-    assert kwargs["reset"] is True
+    mm.commit_session_boundary_async.assert_called_once()
+    args, kwargs = mm.commit_session_boundary_async.call_args
+    assert args[0] == []
+    assert kwargs["reason"] == "new_session"
+    mm.on_session_switch.assert_not_called()
+
 
 
 def test_new_session_delivers_context_engine_boundary_synchronously(tmp_path):

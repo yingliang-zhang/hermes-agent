@@ -1,6 +1,6 @@
 """Persistent slash-command worker — one HermesCLI per TUI session.
 
-Protocol: reads JSON lines from stdin {id, command}, writes {id, ok, output|error} to stdout.
+Protocol: emits {event: "ready"}, then reads {id, command} JSON lines and writes {id, ok, output|error}.
 """
 
 # Stop a ``utils/`` (or ``proxy/``, ``ui/``) package in the launch directory
@@ -25,6 +25,8 @@ import sys
 import threading
 import time
 
+import psutil
+
 import cli as cli_mod
 from cli import HermesCLI
 from tui_gateway._stdin_recovery import handle_spurious_eof
@@ -47,12 +49,27 @@ def _env_float(name: str, default: float) -> float:
 
 _WATCHDOG_POLL_S = max(0.05, _env_float("HERMES_SLASH_WATCHDOG_POLL_S", 2.0))
 _ORPHAN_GRACE_S = max(0.0, _env_float("HERMES_SLASH_WATCHDOG_GRACE_S", 5.0))
+_PARENT_SLASH_TIMEOUT_S = max(
+    5.0, _env_float("HERMES_TUI_SLASH_TIMEOUT_S", 45.0)
+)
+# Return an actionable child error before the parent protocol deadline so the
+# response can be delivered without killing and replacing the worker.
+_MCP_COMMAND_READINESS_TIMEOUT_S = max(1.0, _PARENT_SLASH_TIMEOUT_S - 2.0)
 _in_flight = threading.Event()  # set while a command is executing
 
 
-def _is_orphaned(original_ppid, getppid=os.getppid) -> bool:
-    """Return whether this worker no longer has its original POSIX parent."""
-    return getppid() != original_ppid
+def _is_orphaned(original_ppid, parent_create_time, getppid=os.getppid) -> bool:
+    """True once our spawning gateway is gone. Compare to the ORIGINAL ppid
+    (never ==1: Linux reparents to a subreaper) and guard PID reuse via
+    create_time."""
+    if getppid() != original_ppid:
+        return True
+    try:
+        if not psutil.pid_exists(original_ppid):
+            return True
+        return psutil.Process(original_ppid).create_time() != parent_create_time
+    except psutil.Error:
+        return True
 
 
 def _prepare_slash_worker_runtime() -> None:
@@ -76,9 +93,31 @@ def _prepare_slash_worker_runtime() -> None:
     wait_for_mcp_discovery()
 
 
-def _start_parent_death_watchdog(original_ppid) -> None:
+def _wait_for_command_readiness(command: str) -> None:
+    """Fence registry-backed commands behind bounded MCP discovery.
+
+    ``/tools`` waits less than the parent slash-worker timeout so a stalled MCP
+    server produces an actionable response instead of forcing worker teardown.
+    """
+    normalized = (command or "").strip().lower()
+    if not normalized.startswith("/"):
+        normalized = f"/{normalized}"
+    if normalized.split(maxsplit=1)[0] != "/tools":
+        return
+
+    from hermes_cli.mcp_startup import join_mcp_discovery
+
+    if not join_mcp_discovery(timeout=_MCP_COMMAND_READINESS_TIMEOUT_S):
+        raise RuntimeError(
+            "MCP tool discovery did not finish within "
+            f"{_MCP_COMMAND_READINESS_TIMEOUT_S:.1f}s. Check configured MCP "
+            "servers, then retry /tools or run /reload-mcp."
+        )
+
+
+def _start_parent_death_watchdog(original_ppid, parent_create_time) -> None:
     def _loop():
-        while not _is_orphaned(original_ppid):
+        while not _is_orphaned(original_ppid, parent_create_time):
             time.sleep(_WATCHDOG_POLL_S)
         deadline = time.monotonic() + _ORPHAN_GRACE_S
         while _in_flight.is_set() and time.monotonic() < deadline:
@@ -94,6 +133,7 @@ def _run(cli: HermesCLI, command: str) -> str:
         return ""
     if not cmd.startswith("/"):
         cmd = f"/{cmd}"
+    _wait_for_command_readiness(cmd)
 
     buf = io.StringIO()
 
@@ -135,11 +175,18 @@ def main():
     # Start before the (hundreds-of-ms) HermesCLI build — that window is itself
     # an orphan risk if the gateway dies mid-spawn.
     orig_ppid = os.getppid()
-    _start_parent_death_watchdog(orig_ppid)
+    try:
+        parent_create_time = psutil.Process(orig_ppid).create_time()
+    except psutil.Error:
+        parent_create_time = 0.0
+    _start_parent_death_watchdog(orig_ppid, parent_create_time)
     _prepare_slash_worker_runtime()
 
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         cli = HermesCLI(model=args.model or None, compact=True, resume=args.session_key, verbose=False)
+
+    sys.stdout.write(json.dumps({"event": "ready"}) + "\n")
+    sys.stdout.flush()
 
     # Spurious stdin-EOF recovery (same O_NONBLOCK shared file-description
     # issue as the gateway entry point — any child inheriting fd 0 can flip
@@ -155,7 +202,6 @@ def main():
             if not handle_spurious_eof(_sw_recovery_times, _sw_log):
                 break
             continue
-
         line = raw.strip()
         if not line:
             continue

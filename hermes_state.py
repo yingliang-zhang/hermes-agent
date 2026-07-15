@@ -4421,8 +4421,20 @@ class SessionDB:
                 )
             conn.execute(
                 """INSERT INTO sessions (
-                       id, source, model, model_config, parent_session_id, started_at
-                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                       id, source, user_id, session_key, chat_id, chat_type,
+                       thread_id, display_name, origin_json, model, model_config,
+                       parent_session_id, started_at, cwd, git_branch,
+                       git_repo_root, billing_provider, billing_base_url,
+                       billing_mode, profile_name
+                   )
+                   SELECT ?, ?, parent.user_id, parent.session_key,
+                          parent.chat_id, parent.chat_type, parent.thread_id,
+                          parent.display_name, parent.origin_json, ?, ?, ?, ?,
+                          parent.cwd, parent.git_branch, parent.git_repo_root,
+                          parent.billing_provider, parent.billing_base_url,
+                          parent.billing_mode, parent.profile_name
+                     FROM sessions AS parent
+                    WHERE parent.id = ?""",
                 (
                     child_session_id,
                     source,
@@ -4430,6 +4442,7 @@ class SessionDB:
                     json.dumps(model_config) if model_config else None,
                     parent_session_id,
                     now,
+                    parent_session_id,
                 ),
             )
             return True

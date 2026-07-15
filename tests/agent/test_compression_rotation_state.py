@@ -200,6 +200,114 @@ class TestPlatformForwardedAtBoundary:
         assert kwargs.get("boundary_reason") == "compression"
 
 
+class TestMemoryBankPromptOrdering:
+    def test_provider_switch_precedes_rebuilt_system_prompt(self, tmp_path: Path):
+        """The prompt persisted for a compression child must advertise the
+        provider bank after that provider has rebound to the child session."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_MEMORY_BANK_ROT"
+        db.create_session(parent, source="cli")
+        agent = _build_agent_with_db(db, parent, platform="cli")
+        events = []
+
+        class _BankManager:
+            def __init__(self):
+                self.bank = f"bank-{parent}"
+
+            def on_session_switch(self, new_session_id, **kwargs):
+                events.append(("switch", new_session_id))
+                self.bank = f"bank-{new_session_id}"
+
+        manager = _BankManager()
+        agent._memory_manager = manager
+        agent.commit_memory_session = MagicMock()
+        agent._cached_system_prompt = f"Active bank: bank-{parent}"
+
+        def _invalidate_prompt():
+            events.append(("invalidate", agent.session_id))
+            agent._cached_system_prompt = None
+
+        def _build_prompt(_system_message):
+            events.append(("build", manager.bank))
+            return f"Active bank: {manager.bank}"
+
+        agent._invalidate_system_prompt = _invalidate_prompt
+        agent._build_system_prompt = _build_prompt
+
+        _, new_prompt = agent._compress_context(
+            _msgs(), "sys", approx_tokens=120_000
+        )
+
+        child = agent.session_id
+        assert child != parent
+        assert [event[0] for event in events].index("switch") < [
+            event[0] for event in events
+        ].index("build")
+        assert new_prompt == f"Active bank: bank-{child}"
+        assert agent._cached_system_prompt == new_prompt
+        assert db.get_session(child)["system_prompt"] == new_prompt
+
+    @staticmethod
+    def _exercise_direct_boundary(agent, parent):
+        events = []
+
+        class _BankManager:
+            def __init__(self):
+                self.bank = f"bank-{parent}"
+
+            def on_session_switch(self, new_session_id, **kwargs):
+                del kwargs
+                events.append(("switch", new_session_id))
+                self.bank = f"bank-{new_session_id}"
+
+        manager = _BankManager()
+        agent._memory_manager = manager
+        agent.commit_memory_session = MagicMock()
+        agent._cached_system_prompt = f"Active bank: bank-{parent}"
+
+        def _build_prompt(_system_message):
+            events.append(("build", manager.bank))
+            return f"Active bank: {manager.bank}"
+
+        agent._build_system_prompt = _build_prompt
+        _, new_prompt = agent._compress_context(
+            _msgs(), "sys", approx_tokens=120_000
+        )
+        return events, new_prompt
+
+    def test_in_place_provider_switch_precedes_prompt_rebuild(self, tmp_path: Path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "IN_PLACE_MEMORY_BANK"
+        db.create_session(session_id, source="cli")
+        agent = _build_agent_with_db(db, session_id, platform="cli")
+        agent.compression_in_place = True
+
+        events, new_prompt = self._exercise_direct_boundary(agent, session_id)
+
+        assert agent.session_id == session_id
+        assert [event[0] for event in events].index("switch") < [
+            event[0] for event in events
+        ].index("build")
+        assert new_prompt == f"Active bank: bank-{session_id}"
+        assert db.get_session(session_id)["system_prompt"] == new_prompt
+
+    def test_dbless_provider_switch_precedes_prompt_rebuild(self, tmp_path: Path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "DBLESS_MEMORY_BANK"
+        db.create_session(session_id, source="cli")
+        agent = _build_agent_with_db(db, session_id, platform="cli")
+        agent._session_db = None
+        agent.compression_in_place = False
+
+        events, new_prompt = self._exercise_direct_boundary(agent, session_id)
+
+        assert agent.session_id == session_id
+        assert [event[0] for event in events].index("switch") < [
+            event[0] for event in events
+        ].index("build")
+        assert new_prompt == f"Active bank: bank-{session_id}"
+
+
 class TestFallbackStreakFollowsRotation:
     def test_fallback_boundary_persists_on_child_session(self, tmp_path: Path):
         db = SessionDB(db_path=tmp_path / "state.db")
