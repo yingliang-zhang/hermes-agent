@@ -1678,9 +1678,9 @@ def init_agent(
         )
         codex_app_server_auto_compaction = "native"
     # Hard message-count safety valve (mirrors gateway hygiene, #2153/#4750).
-    # When >0, this count triggers TUI/CLI preflight compression regardless
-    # of token estimates, breaking the death spiral where real-usage deferral
-    # continues until the provider disconnects.
+    # When >0, this count triggers bounded TUI/CLI preflight and in-turn
+    # compression regardless of ordinary suppression gates, breaking the death
+    # spiral where missing provider usage prevents token-based recovery.
     compression_hard_msg_limit = int(
         _compression_cfg.get("hygiene_hard_message_limit", 0) or 0
     )

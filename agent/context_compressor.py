@@ -1304,9 +1304,9 @@ class ContextCompressor(ContextEngine):
         # deterministic "summary unavailable" handoff and drop the middle window.
         self.abort_on_summary_failure = abort_on_summary_failure
         # Hard message-count safety valve: trigger automatic compression at
-        # this count regardless of token estimates. Normal automatic cooldown
-        # and anti-thrashing protections still apply. Mirrors gateway hygiene
-        # (gateway/run.py, #2153/#4750). 0 = disabled.
+        # this count regardless of token estimates or ordinary automatic
+        # suppression gates. Each entrypoint bounds its own recovery attempts.
+        # Mirrors gateway hygiene (gateway/run.py, #2153/#4750). 0 = disabled.
         self.hygiene_hard_message_limit = max(0, int(hygiene_hard_message_limit or 0))
 
         self.context_length = get_model_context_length(
@@ -1516,17 +1516,23 @@ class ContextCompressor(ContextEngine):
         self.last_rough_tokens_when_real_prompt_fit = max(baseline, rough_tokens)
         return True
 
-    def should_compress(self, prompt_tokens: int = None) -> bool:
+    def should_compress(
+        self,
+        prompt_tokens: int = None,
+        *,
+        force: bool = False,
+    ) -> bool:
         """Check if context exceeds the compression threshold.
 
-        Includes anti-thrashing protection: if the last two compressions
-        each saved less than 10%, skip compression to avoid infinite loops
-        where each pass removes only 1-2 messages.
+        ``force`` bypasses the ordinary summary-failure cooldown and
+        ineffective-compaction breakers, but never the token threshold itself.
+        Hard message-count entrypoints raise their check value to the threshold
+        before using this escape hatch, and bound retries at the call site.
         """
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if tokens < self.threshold_tokens:
             return False
-        return not self._automatic_compression_blocked()
+        return force or not self._automatic_compression_blocked()
 
     def _automatic_compression_blocked(self) -> bool:
         """Return whether automatic compaction is in cooldown or tripped."""
@@ -3145,8 +3151,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                 related to this topic and be more aggressive about compressing
                 everything else.  Inspired by Claude Code's ``/compact``.
             force: If True, clear any active summary-failure cooldown before
-                running so a manual ``/compress`` can retry immediately after
-                an auto-compression abort.  Auto-compress callers pass False.
+                running. Manual ``/compress`` and the bounded hard message-count
+                safety valve use this; ordinary auto-compress callers pass False.
         """
         # Reset per-call summary failure state — callers inspect these fields
         # after compress() returns to decide whether to surface a warning.

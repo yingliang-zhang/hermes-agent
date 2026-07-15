@@ -12098,7 +12098,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if _raw_hard_limit is not None:
                             try:
                                 _parsed = int(_raw_hard_limit)
-                                if _parsed > 0:
+                                if _parsed >= 0:
                                     _hyg_hard_msg_limit = _parsed
                             except (TypeError, ValueError):
                                 pass
@@ -12192,7 +12192,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _HARD_MSG_LIMIT = _hyg_hard_msg_limit
                 _needs_compress = (
                     _approx_tokens >= _compress_token_threshold
-                    or _msg_count >= _HARD_MSG_LIMIT
+                    or (
+                        _HARD_MSG_LIMIT > 0
+                        and _msg_count >= _HARD_MSG_LIMIT
+                    )
                 )
 
                 if _needs_compress:
@@ -12274,6 +12277,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         lambda: _hyg_agent._compress_context(
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,
+                                            force=(
+                                                _HARD_MSG_LIMIT > 0
+                                                and _msg_count >= _HARD_MSG_LIMIT
+                                            ),
                                         ),
                                     )
 

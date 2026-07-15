@@ -433,7 +433,7 @@ def build_turn_context(
             "should_defer_preflight_to_real_usage",
             lambda _tokens: False,
         )
-        _preflight_deferred = _defer_preflight(_preflight_tokens)
+        _preflight_deferred = False if _hard_limit_breached else _defer_preflight(_preflight_tokens)
         # Codex app-server threads are compacted by the codex agent itself;
         # Hermes only initiates compaction in "hermes" mode (#36801).
         _codex_native_auto = (
@@ -449,10 +449,10 @@ def build_turn_context(
             in {"native", "off"}
         )
 
-        # A count breach overrides noisy real-usage deferral and the token
-        # threshold, while normal cooldown and anti-thrashing protections stay
-        # in force. This mirrors gateway hygiene (#2153/#4750) without making
-        # automatic compression equivalent to the user's forced /compress.
+        # A count breach is the last-resort recovery path: it overrides noisy
+        # real-usage deferral, the token threshold, summary-failure cooldown,
+        # and ineffective-compaction breakers. The loop below remains bounded
+        # to three passes and stops immediately when a pass makes no progress.
 
         if not _preflight_deferred or _hard_limit_breached:
             _last = _compressor.last_prompt_tokens
@@ -460,7 +460,7 @@ def build_turn_context(
             if _last >= 0 and _preflight_tokens > _last:
                 _compressor.last_prompt_tokens = _preflight_tokens
 
-        _compression_cooldown = getattr(
+        _compression_cooldown = None if _hard_limit_breached else getattr(
             _compressor,
             "get_active_compression_failure_cooldown",
             lambda: None,
@@ -493,7 +493,11 @@ def build_turn_context(
                 "(mode=%s); Hermes will not start thread compaction here.",
                 getattr(agent, "codex_app_server_auto_compaction", "native"),
             )
-        elif _compressor.should_compress(_compression_check_tokens):
+        elif (
+            _compressor.should_compress(_compression_check_tokens, force=True)
+            if _hard_limit_breached
+            else _compressor.should_compress(_compression_check_tokens)
+        ):
             if _hard_limit_breached:
                 logger.info(
                     "Preflight compression: hard message limit %d reached "
@@ -526,6 +530,7 @@ def build_turn_context(
                 messages, active_system_prompt = agent._compress_context(
                     messages, system_message, approx_tokens=_preflight_tokens,
                     task_id=effective_task_id,
+                    force=_hard_limit_breached,
                 )
                 # Re-estimate now so size-only compression (same row count,
                 # lower token count — e.g. summarising tool outputs) is
@@ -548,7 +553,23 @@ def build_turn_context(
                 agent._last_content_with_tools = None
                 agent._last_content_tools_all_housekeeping = False
                 agent._mute_post_response = False
-                if not _compressor.should_compress(_preflight_tokens):
+                _hard_limit_breached = (
+                    _hard_limit > 0 and len(messages) >= _hard_limit
+                )
+                _compression_check_tokens = (
+                    max(_preflight_tokens, _compressor.threshold_tokens)
+                    if _hard_limit_breached
+                    else _preflight_tokens
+                )
+                _should_continue_compressing = (
+                    _compressor.should_compress(
+                        _compression_check_tokens,
+                        force=True,
+                    )
+                    if _hard_limit_breached
+                    else _compressor.should_compress(_compression_check_tokens)
+                )
+                if not _should_continue_compressing:
                     break
 
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).

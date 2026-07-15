@@ -981,9 +981,11 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
             self._print_fn = None
             self.shutdown_memory_provider = MagicMock()
             self.close = MagicMock()
+            self.compress_kwargs = None
             type(self).last_instance = self
 
-        def _compress_context(self, messages, *_args, **_kwargs):
+        def _compress_context(self, messages, *_args, **kwargs):
+            self.compress_kwargs = kwargs
             self.session_id = f"{self.session_id}_compressed"
             return ([{"role": "assistant", "content": "compressed"}], None)
 
@@ -1073,15 +1075,27 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
         "Expected hygiene compression to fire when message count (12) "
         "exceeds configured hygiene_hard_message_limit (10)"
     )
+    assert FakeCompressAgent.last_instance.compress_kwargs["force"] is True
 
 
 @pytest.mark.asyncio
-async def test_session_hygiene_default_hard_message_limit_does_not_fire_at_12_messages(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize(
+    ("config_text", "message_count"),
+    [
+        (None, 12),
+        (
+            "compression:\n"
+            "  enabled: true\n"
+            "  hygiene_hard_message_limit: 0\n",
+            5_001,
+        ),
+    ],
+    ids=["default", "explicit-zero-disabled"],
+)
+async def test_session_hygiene_default_or_disabled_hard_limit_does_not_fire(
+    monkeypatch, tmp_path, config_text, message_count
 ):
-    """Sanity check for the companion test above: without config override,
-    12 messages must NOT trigger the default hard limit.  If this test
-    passes without changes, the override test's finding is meaningful."""
+    """The default stays high, while an explicit zero disables the count valve."""
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -1103,7 +1117,9 @@ async def test_session_hygiene_default_hard_message_limit_does_not_fire_at_12_me
     fake_run_agent.AIAgent = FakeCompressAgent
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
-    # No config.yaml — use defaults (hard_limit=5000)
+    if config_text is not None:
+        (tmp_path / "config.yaml").write_text(config_text)
+
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
 
@@ -1124,7 +1140,9 @@ async def test_session_hygiene_default_hard_message_limit_does_not_fire_at_12_me
         platform=Platform.TELEGRAM,
         chat_type="private",
     )
-    runner.session_store.load_transcript.return_value = _make_history(12, content_size=40)
+    runner.session_store.load_transcript.return_value = _make_history(
+        message_count, content_size=40
+    )
     runner.session_store.has_any_sessions.return_value = True
     runner.session_store.rewrite_transcript = MagicMock()
     runner.session_store.append_to_transcript = MagicMock()
@@ -1167,7 +1185,7 @@ async def test_session_hygiene_default_hard_message_limit_does_not_fire_at_12_me
     result = await runner._handle_message(event)
 
     assert result == "ok"
-    # No compression agent instantiated — 12 messages well under 5000 default.
+    # No compression agent instantiated: either below the default or disabled.
     assert FakeCompressAgent.last_instance is None, (
-        "Compression should NOT fire at 12 messages with default hard_limit=5000"
+        "Compression should not fire below the default or when the hard limit is 0"
     )

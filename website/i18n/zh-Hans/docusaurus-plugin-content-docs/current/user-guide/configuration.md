@@ -555,7 +555,7 @@ compression:
   threshold: 0.50                                   # 在上下文限制的此百分比时压缩
   target_ratio: 0.20                                # 保留为最近尾部的阈值分数
   protect_last_n: 20                                # 保持未压缩的最少最近消息数
-  hygiene_hard_message_limit: 5000                  # Gateway 安全阀 —— 见下文
+  hygiene_hard_message_limit: 5000                  # 所有界面的消息数安全阀 —— 见下文
 
 # 摘要模型/provider 在 auxiliary: 下配置：
 auxiliary:
@@ -569,7 +569,7 @@ auxiliary:
 带有 `compression.summary_model`、`compression.summary_provider` 和 `compression.summary_base_url` 的旧版配置在首次加载时自动迁移到 `auxiliary.compression.*`（配置版本 17）。无需手动操作。
 :::
 
-`hygiene_hard_message_limit` 是仅限 gateway 的**预压缩安全阀**。它的存在是为了打破一个死循环：当超大会话的 API 调用持续断开时，gateway 永远收不到 token 使用数据，基于 token 的阈值因此无法触发，于是 transcript 持续增长、断开愈发严重。这个基于消息数的下限仅凭消息数量触发（无论 API 是否失败，消息数始终已知），强制压缩以恢复会话。默认 `5000` —— 远高于任何正常会话，包括做数千次短轮次的大上下文（1M+）模型，它们早就在 token 阈值处压缩了。对于异常平台可调得更高；要强制更积极的压缩则调低。在运行中的 gateway 上编辑此值将在下一条消息时生效（见下文）。
+`hygiene_hard_message_limit` 是适用于所有界面的**预压缩安全阀**，由 gateway 会话清理以及交互式 CLI/TUI 的轮次预检和轮次内 API 调用前压力检查共同使用。它用于打破超大请求在返回 token 使用量之前就断开、导致基于 token 的压缩始终无法触发的死循环。当消息数达到或超过此值时，即使普通自动压缩会被过时的真实使用量、仍有效的摘要失败冷却期或连续无效压缩所抑制，Hermes 也会启动有界恢复。轮次预检最多执行三次，并在某次压缩没有取得进展时立即停止；轮次内恢复每轮最多尝试三次，随后继续请求 provider。消息数低于该值时，普通 token 阈值和所有抑制门保持原有行为。默认值为 `5000`，远高于正常会话；包括大上下文（1M+）模型在内的会话通常会先因 token 压力触发压缩。异常高轮次工作负载可调高此值，需要更早兜底时可调低，设为 `0` 可禁用消息数安全阀。在运行中的 gateway 上修改此值会在下一条消息时生效（见下文）；CLI/TUI 进程会在 agent 启动时读取它。
 
 :::tip Gateway 热重载压缩和上下文长度
 从最近的版本开始，在运行中的 gateway 上编辑 `config.yaml` 中的 `model.context_length` 或任何 `compression.*` 键将在下一条消息时生效 —— 无需 gateway 重启、`/reset` 或会话轮换。缓存的 agent 签名包含这些键，因此 gateway 在检测到更改时会透明地重建 agent。API 密钥和工具/技能配置仍需要通常的重载路径。

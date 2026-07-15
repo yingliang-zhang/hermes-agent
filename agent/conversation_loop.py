@@ -1076,48 +1076,78 @@ def run_conversation(
         # case. Re-check here against the current request estimate.
         #
         # Mirror the turn-prologue preflight's guard chain exactly (see
-        # turn_context.py): (1) defer when the rough estimate is known-noisy
-        # relative to a recent real provider prompt that fit under threshold
-        # (schema overhead / post-compaction over-count, #36718); (2) skip
-        # while a same-session compression-failure cooldown is active; (3) then
-        # should_compress() — reusing the canonical threshold_tokens (output
-        # room already reserved by _compute_threshold_tokens) and its summary-
-        # LLM cooldown + anti-thrash guards (#11529). compression_attempts is a
-        # hard per-turn backstop shared with the overflow error handlers.
+        # turn_context.py). Ordinary token pressure honors real-usage deferral,
+        # same-session summary-failure cooldown, and anti-thrashing. A configured
+        # hard message-count breach is the last-resort escape hatch and bypasses
+        # those gates. ``compression_attempts`` bounds forced recovery to three
+        # attempts per turn, shared with the overflow error handlers.
         _compressor = agent.context_compressor
+        _hard_limit = getattr(_compressor, "hygiene_hard_message_limit", 0)
+        _hard_limit_breached = _hard_limit > 0 and len(messages) >= _hard_limit
         _defer_preflight = getattr(
             _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
         )
-        _compression_cooldown = getattr(
+        _pre_api_deferred = (
+            False
+            if _hard_limit_breached
+            else _defer_preflight(request_pressure_tokens)
+        )
+        _compression_cooldown = None if _hard_limit_breached else getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
+        _compression_check_tokens = (
+            max(request_pressure_tokens, _compressor.threshold_tokens)
+            if _hard_limit_breached
+            else request_pressure_tokens
+        )
+        _pressure_should_compress = False
         if (
             agent.compression_enabled
             and len(messages) > 1
             and compression_attempts < 3
-            and not _defer_preflight(request_pressure_tokens)
+            and not _pre_api_deferred
             and not _compression_cooldown
-            and _compressor.should_compress(request_pressure_tokens)
         ):
+            _pressure_should_compress = (
+                _compressor.should_compress(_compression_check_tokens, force=True)
+                if _hard_limit_breached
+                else _compressor.should_compress(_compression_check_tokens)
+            )
+        if _pressure_should_compress:
             compression_attempts += 1
-            logger.info(
-                "Pre-API compression: ~%s request tokens >= %s threshold "
-                "(context=%s, attempt=%s/3)",
-                f"{request_pressure_tokens:,}",
-                f"{int(getattr(_compressor, 'threshold_tokens', 0) or 0):,}",
-                f"{int(getattr(_compressor, 'context_length', 0) or 0):,}"
-                if getattr(_compressor, "context_length", 0) else "unknown",
-                compression_attempts,
-            )
-            agent._emit_status(
-                f"📦 Pre-API compression: ~{request_pressure_tokens:,} tokens "
-                f"near the context/output limit. Compacting before the next model call."
-            )
+            if _hard_limit_breached:
+                logger.info(
+                    "Pre-API compression: hard message limit %d reached "
+                    "(%d messages, ~%s tokens, attempt=%s/3)",
+                    _hard_limit,
+                    len(messages),
+                    f"{request_pressure_tokens:,}",
+                    compression_attempts,
+                )
+                agent._emit_status(
+                    f"📦 Pre-API compression: {len(messages)} messages "
+                    f">= hard limit {_hard_limit}. Compacting before the next model call."
+                )
+            else:
+                logger.info(
+                    "Pre-API compression: ~%s request tokens >= %s threshold "
+                    "(context=%s, attempt=%s/3)",
+                    f"{request_pressure_tokens:,}",
+                    f"{int(getattr(_compressor, 'threshold_tokens', 0) or 0):,}",
+                    f"{int(getattr(_compressor, 'context_length', 0) or 0):,}"
+                    if getattr(_compressor, "context_length", 0) else "unknown",
+                    compression_attempts,
+                )
+                agent._emit_status(
+                    f"📦 Pre-API compression: ~{request_pressure_tokens:,} tokens "
+                    "near the context/output limit. Compacting before the next model call."
+                )
             messages, active_system_prompt = agent._compress_context(
                 messages,
                 system_message,
                 approx_tokens=request_pressure_tokens,
                 task_id=effective_task_id,
+                force=_hard_limit_breached,
             )
             # Reset retry/empty-response state so the compacted request
             # gets a fresh chance instead of inheriting stale recovery

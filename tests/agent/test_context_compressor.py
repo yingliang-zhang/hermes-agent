@@ -97,6 +97,22 @@ class TestShouldCompress:
         assert compressor.should_compress(prompt_tokens=90000) is True
         assert compressor.should_compress(prompt_tokens=50000) is False
 
+    def test_force_bypasses_active_summary_failure_cooldown(self, compressor):
+        compressor._summary_failure_cooldown_until = time.monotonic() + 60
+
+        assert compressor.should_compress(prompt_tokens=90_000) is False
+        assert compressor.should_compress(prompt_tokens=90_000, force=True) is True
+
+    def test_force_bypasses_ineffective_compaction_breaker(self, compressor):
+        compressor._ineffective_compression_count = 2
+
+        assert compressor.should_compress(prompt_tokens=90_000) is False
+        assert compressor.should_compress(prompt_tokens=90_000, force=True) is True
+
+    def test_force_does_not_bypass_token_threshold(self, compressor):
+        assert compressor.should_compress(prompt_tokens=50_000, force=True) is False
+
+
 
 
 class TestUpdateFromResponse:
