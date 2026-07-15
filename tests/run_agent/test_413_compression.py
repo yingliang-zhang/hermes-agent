@@ -974,6 +974,37 @@ class TestToolResultPreflightCompression:
         assert result["completed"] is True
         assert result["final_response"] == "Done after bounded recovery"
 
+    @pytest.mark.parametrize("auto_mode", ["native", "off"])
+    def test_hard_message_limit_preserves_codex_owned_compaction_policy(
+        self, agent, auto_mode
+    ):
+        """Codex-owned modes skip Hermes preflight and bypass the tool loop."""
+        agent.api_mode = "codex_app_server"
+        agent.codex_app_server_auto_compaction = auto_mode
+        agent.context_compressor.hygiene_hard_message_limit = 1
+        history = [
+            {"role": "user", "content": "previous"},
+            {"role": "assistant", "content": "answer"},
+        ]
+
+        with (
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(
+                agent,
+                "_run_codex_app_server_turn",
+                return_value={"completed": True, "final_response": "codex result"},
+            ) as mock_codex_turn,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=history)
+
+        mock_compress.assert_not_called()
+        mock_codex_turn.assert_called_once()
+        assert result["completed"] is True
+        assert result["final_response"] == "codex result"
+
     def test_anthropic_prompt_too_long_safety_net(self, agent):
         """Anthropic 'prompt is too long' error triggers compression as safety net."""
         err_400 = Exception(
