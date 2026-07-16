@@ -2398,6 +2398,62 @@ def _sync_bundled_skills_quietly() -> None:
         pass
 
 
+def _config_migrate_command(profile_name: str | None) -> str:
+    """Return the profile-scoped command for a manual config migration."""
+    if profile_name and profile_name not in {"default", "custom"}:
+        return f"hermes -p {profile_name} config migrate"
+    return "hermes config migrate"
+
+
+def _migrate_config_if_safe(*, profile_name: str | None = None) -> bool:
+    """Migrate the current config only when no settings need user input.
+
+    Returns ``True`` when a migration ran. A stale config that needs manual
+    review is left untouched and gets an actionable profile-scoped warning.
+    Migration errors propagate so each startup caller can report its context.
+    """
+    from hermes_cli.config import (
+        check_config_version,
+        get_missing_config_fields,
+        get_missing_env_vars,
+        migrate_config,
+    )
+
+    current_ver, latest_ver = check_config_version()
+    if current_ver >= latest_ver:
+        return False
+
+    missing_env = get_missing_env_vars(required_only=True)
+    missing_config = get_missing_config_fields()
+    if missing_env or missing_config:
+        label = f" for profile '{profile_name}'" if profile_name else ""
+        print(
+            f"⚠️  Config v{current_ver}{label} is outdated (current: v{latest_ver}) "
+            f"and has new settings to review. Run "
+            f"`{_config_migrate_command(profile_name)}` to update."
+        )
+        return False
+
+    migrate_config(interactive=False, quiet=True)
+    return True
+
+
+def _migrate_profile_config(profile) -> bool:
+    """Run a non-interactive migration in one profile's context.
+
+    The context-local override is required here: mutating ``HERMES_HOME``
+    would retarget unrelated threads while ``hermes update`` iterates over
+    profiles. The token reset also restores any outer profile override.
+    """
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(profile.path)
+    try:
+        return _migrate_config_if_safe(profile_name=profile.name)
+    finally:
+        reset_hermes_home_override(token)
+
+
 def _resolve_use_tui(args) -> bool:
     """Decide whether to launch the TUI for a chat/bare invocation.
 
@@ -11752,6 +11808,29 @@ def _cmd_update_impl(args, gateway_mode: bool):
         else:
             print("  ✓ Configuration is up to date")
 
+        # Catch up every profile after the active config migration above.
+        # Per-profile scoping is context-local so concurrent work cannot be
+        # redirected into another profile while update walks the list.
+        try:
+            from hermes_cli.profiles import list_profiles
+
+            all_profiles = list_profiles()
+        except Exception as exc:
+            print(
+                "  ⚠️  Could not inspect named profiles for config migration: "
+                f"{exc}. Run `hermes profile list` and migrate stale profiles manually."
+            )
+            all_profiles = []
+
+        for profile in all_profiles:
+            try:
+                _migrate_profile_config(profile)
+            except Exception as exc:
+                print(
+                    f"  ⚠️  Config migration failed for profile '{profile.name}': "
+                    f"{exc}. Run `{_config_migrate_command(profile.name)}` to retry."
+                )
+
         # Safety net: config-version migrations have been observed to leave
         # cron/jobs.json valid-but-empty, silently dropping every scheduled
         # job (issue #34600). The desktop scheduler can also overwrite with
@@ -13826,6 +13905,19 @@ def cmd_dashboard(args):
     # cmd_chat does this in its own pre-dispatch block; the dashboard
     # backend is the desktop's primary entrypoint and needs the same.
     _sync_bundled_skills_quietly()
+
+    # A desktop-spawned named-profile backend reaches this point with that
+    # profile already selected by the early HERMES_HOME override. Migrate
+    # before reading terminal config so every startup consumer sees the new
+    # schema. Configs requiring user input remain untouched with a clear hint.
+    try:
+        _migrate_config_if_safe(profile_name=_launch_profile)
+    except Exception as exc:
+        print(
+            f"⚠ Config migration failed for profile '{_launch_profile}': {exc}. "
+            f"Run `{_config_migrate_command(_launch_profile)}` to retry.",
+            file=sys.stderr,
+        )
 
     # Bridge terminal.* config into the TERMINAL_* env vars for THIS process,
     # mirroring the CLI (cli.py env_mappings) and gateway (gateway/run.py
