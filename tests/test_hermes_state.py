@@ -475,6 +475,23 @@ class TestMessageStorage:
 
 
 
+
+    def test_interrupted_tool_tail_metadata_round_trips_through_session_db(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(
+            "s1",
+            role="tool",
+            content="ok edited",
+            tool_call_id="c1",
+        )
+
+        assert db.mark_tool_tail_interrupted("s1", "c1") is True
+        resumed = db.get_messages_as_conversation("s1")
+        assert resumed[0]["_interrupted_tool_tail"] is True
+
+        db.replace_messages("s1", resumed)
+        assert db.get_messages_as_conversation("s1")[0]["_interrupted_tool_tail"] is True
+
     def test_get_messages_as_conversation_strips_leaked_memory_context(self, db):
         db.create_session(session_id="s1", source="cli")
         db.append_message(

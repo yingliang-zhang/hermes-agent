@@ -258,6 +258,7 @@ CREATE TABLE IF NOT EXISTS messages (
     tool_calls TEXT,
     tool_name TEXT,
     effect_disposition TEXT,
+    interrupted_tool_tail INTEGER NOT NULL DEFAULT 0,
     timestamp REAL NOT NULL,
     token_count INTEGER,
     finish_reason TEXT,

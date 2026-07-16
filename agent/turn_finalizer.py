@@ -26,6 +26,7 @@ import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
+from agent.message_sanitization import mark_interrupted_tool_tail
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -266,12 +267,22 @@ def finalize_turn(
     # same empty-response loop again.
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
+        # Mark the tool tail as interrupt-originated so the per-request API
+        # copy (``sanitize_api_messages``) can defer the synthetic closure to
+        # wire time, preserving the real tool result in the canonical
+        # transcript (#63292 / #48879). When the marker is set, the inline
+        # close below is skipped — the closure belongs to the API copy, not
+        # the durable session.
+        tool_tail_marked = False
+        if interrupted:
+            tool_tail_marked = mark_interrupted_tool_tail(messages)
 
         # Drop verification-continuation nudges (synthetic user messages)
         # from the live history before the tail-assistant check — only the
         # nudges need stripping; the assistant candidate persists in
         # state.db. (#65919 §7)
         _drop_verification_continuation_scaffolding(messages)
+
 
         # Some recovery/fallback paths return a real final_response without
         # adding a closing assistant message to the transcript (e.g. the
