@@ -169,6 +169,48 @@ def resolve_cron_scheduler() -> "CronScheduler":
         return InProcessCronScheduler()
 
 
+_PERIODIC_REAPER_MIN_INTERVAL_SECONDS = 60.0
+
+
+def _minimum_cron_interval_seconds(interval: Any) -> float:
+    """Return the shortest interval represented by a ticker cadence.
+
+    Numeric cadences are already seconds. Five-field cron expressions have
+    minute resolution; sample successive occurrences so step expressions such
+    as ``*/1 * * * *`` retain their exact 60-second boundary.
+    """
+    if isinstance(interval, (int, float)):
+        return max(0.0, float(interval))
+
+    text = str(interval or "").strip()
+    try:
+        return max(0.0, float(text))
+    except ValueError:
+        pass
+    if len(text.split()) != 5:
+        raise ValueError(f"Invalid cron ticker interval: {interval!r}")
+
+    from datetime import datetime, timezone
+    from croniter import croniter
+
+    occurrences = croniter(text, datetime(2024, 1, 1, tzinfo=timezone.utc))
+    previous = occurrences.get_next(datetime)
+    minimum = float("inf")
+    for _ in range(64):
+        current = occurrences.get_next(datetime)
+        minimum = min(minimum, (current - previous).total_seconds())
+        previous = current
+    return max(_PERIODIC_REAPER_MIN_INTERVAL_SECONDS, minimum)
+
+
+def _should_reap_stale_sessions_periodically(interval: Any) -> bool:
+    """Whether this cadence is one minute or slower."""
+    return (
+        _minimum_cron_interval_seconds(interval)
+        >= _PERIODIC_REAPER_MIN_INTERVAL_SECONDS
+    )
+
+
 class InProcessCronScheduler(CronScheduler):
     """Default provider: the historical in-process 60s ticker.
 
@@ -194,7 +236,7 @@ class InProcessCronScheduler(CronScheduler):
         profile_homes=None,
     ):
         import logging
-        from cron.scheduler import tick as cron_tick
+        from cron.scheduler import _reap_stale_cron_sessions, tick as cron_tick
         from cron.jobs import (
             clear_ticker_error,
             record_ticker_error,
@@ -203,6 +245,19 @@ class InProcessCronScheduler(CronScheduler):
 
         logger = logging.getLogger("cron.scheduler_provider")
         logger.info("In-process cron scheduler started (interval=%ds)", interval)
+
+        interval_seconds = _minimum_cron_interval_seconds(interval)
+        periodic_reaping = _should_reap_stale_sessions_periodically(
+            interval_seconds
+        )
+
+        # Recover crash leftovers before scheduling can dispatch anything. This
+        # pass is independent of the loop, so even an already-stopped process
+        # performs restart recovery before returning.
+        try:
+            _reap_stale_cron_sessions()
+        except Exception:
+            logger.debug("Cron startup session reaper failed", exc_info=True)
 
         # ── Multiplex profiles ────────────────────────────────────────────
         # When profile_homes is set (multiplex_profiles on), tick EACH profile's
@@ -229,6 +284,10 @@ class InProcessCronScheduler(CronScheduler):
                 "Marked %d interrupted cron execution(s) unknown after restart",
                 recovered,
             )
+
+        logger.info(
+            "In-process cron scheduler started (interval=%gs)", interval_seconds
+        )
         # Heartbeat once before the first sleep so `hermes cron status` sees a
         # live ticker immediately after startup, not only after the first tick.
         record_ticker_heartbeat()
@@ -244,6 +303,7 @@ class InProcessCronScheduler(CronScheduler):
                         loop=loop,
                         sync=False,
                         can_dispatch=can_dispatch,
+                        reap_stale_sessions=periodic_reaping,
                     )
                 ok = True
             except BaseException as e:
@@ -268,7 +328,7 @@ class InProcessCronScheduler(CronScheduler):
             record_ticker_heartbeat(success=ok)
             if ok:
                 clear_ticker_error()
-            stop_event.wait(interval)
+            stop_event.wait(interval_seconds)
 
     def _start_multiplex(
         self,
