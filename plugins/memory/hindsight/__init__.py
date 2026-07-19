@@ -68,6 +68,7 @@ _MAX_CLIENT_VERSION = "0.10"
 _CLIENT_REQUIREMENT = (
     f"hindsight-client>={_MIN_CLIENT_VERSION},<{_MAX_CLIENT_VERSION}"
 )
+_EMBED_REQUIREMENT = f"hindsight-embed>={_MIN_CLIENT_VERSION},<{_MAX_CLIENT_VERSION}"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 _VALID_BUDGETS = {"low", "mid", "high"}
@@ -155,16 +156,11 @@ def _export_port_health_grace_timeout(config: dict[str, Any]) -> None:
 
 
 def _check_local_runtime() -> tuple[bool, str | None]:
-    """Return whether local embedded Hindsight imports cleanly.
-
-    On older CPUs, importing the local Hindsight stack can raise a runtime
-    error from NumPy before the daemon starts. Treat that as "unavailable"
-    so Hermes can degrade gracefully instead of repeatedly trying to start
-    a broken local memory backend.
-    """
+    """Return whether the lightweight embedded runtime imports cleanly."""
     try:
-        importlib.import_module("hindsight")
+        importlib.import_module("hindsight_client")
         importlib.import_module("hindsight_embed.daemon_embed_manager")
+        importlib.import_module("plugins.memory.hindsight.embedded_runtime")
         return True, None
     except Exception as exc:
         return False, str(exc)
@@ -1017,9 +1013,8 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # Step 2: Install/upgrade deps for selected mode
         cloud_dep = _CLIENT_REQUIREMENT
-        local_dep = "hindsight-all"
         if mode == "local_embedded":
-            deps_to_install = [local_dep]
+            deps_to_install = [cloud_dep, _EMBED_REQUIREMENT]
         elif mode == "local_external":
             deps_to_install = [cloud_dep]
         else:
@@ -1239,12 +1234,6 @@ class HindsightMemoryProvider(MemoryProvider):
     def _create_client(self):
         """Construct a client without changing provider ownership."""
         if self._mode == "local_embedded":
-            available, reason = _check_local_runtime()
-            if not available:
-                raise RuntimeError(
-                    "Hindsight local runtime is unavailable"
-                    + (f": {reason}" if reason else "")
-                )
             try:
                 from tools.lazy_deps import ensure as _lazy_ensure
 
@@ -1253,14 +1242,19 @@ class HindsightMemoryProvider(MemoryProvider):
                 pass
             except Exception as exc:
                 raise ImportError(str(exc)) from exc
-            from hindsight import HindsightEmbedded
+            available, reason = _check_local_runtime()
+            if not available:
+                raise RuntimeError(
+                    "Hindsight local runtime is unavailable"
+                    + (f": {reason}" if reason else "")
+                )
+            from .embedded_runtime import DedicatedEmbeddedClient
 
-            HindsightEmbedded.__del__ = lambda self: None
             llm_provider = self._config.get("llm_provider", "")
             if llm_provider in {"openai_compatible", "openrouter"}:
                 llm_provider = "openai"
             logger.debug(
-                "Creating HindsightEmbedded client (profile=%s, provider=%s)",
+                "Creating dedicated Hindsight embedded client (profile=%s, provider=%s)",
                 self._config.get("profile", "hermes"),
                 llm_provider,
             )
@@ -1271,6 +1265,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 or self._config.get("llm_api_key")
                 or os.environ.get("HINDSIGHT_LLM_API_KEY", ""),
                 "llm_model": self._config.get("llm_model", ""),
+                "server_executable": self._config.get("server_executable"),
             }
             if self._llm_base_url:
                 kwargs["llm_base_url"] = self._llm_base_url
@@ -1282,7 +1277,7 @@ class HindsightMemoryProvider(MemoryProvider):
             )
             self._idle_timeout = idle_timeout
             kwargs["idle_timeout"] = idle_timeout
-            return HindsightEmbedded(**kwargs)
+            return DedicatedEmbeddedClient(**kwargs)
 
         _ensure_cloud_client_dependency()
         from hindsight_client import Hindsight

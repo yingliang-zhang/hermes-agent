@@ -48,6 +48,12 @@ class TestRealSubagentInterrupt(unittest.TestCase):
     def test_interrupt_child_during_api_call(self):
         """Real AIAgent child interrupted while making API call."""
         from run_agent import AIAgent, IterationBudget
+        context_length_patch = patch(
+            "agent.context_compressor.get_model_context_length", return_value=128_000
+        )
+        context_length_patch.start()
+        self.addCleanup(context_length_patch.stop)
+
 
         # Create a real parent agent (just enough to be a parent)
         parent = AIAgent.__new__(AIAgent)

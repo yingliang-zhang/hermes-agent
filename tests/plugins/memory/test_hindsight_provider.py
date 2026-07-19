@@ -87,10 +87,13 @@ def _expected_scope_tag(dimension: str, value: str) -> str:
     return f"scope:{dimension}:{digest}"
 
 
-def test_hindsight_client_declarations_share_supported_interval():
-    """Every install path must preserve current compatible Hindsight clients."""
+def test_hindsight_core_declarations_share_supported_interval():
+    """Every core install path contains exactly the lightweight split client."""
     repo_root = Path(__file__).resolve().parents[3]
-    package_name = canonicalize_name("hindsight-client")
+    package_names = {
+        canonicalize_name("hindsight-client"),
+        canonicalize_name("hindsight-embed"),
+    }
 
     project = tomllib.loads(
         (repo_root / "pyproject.toml").read_text(encoding="utf-8")
@@ -100,11 +103,6 @@ def test_hindsight_client_declarations_share_supported_interval():
             encoding="utf-8"
         )
     )
-    provider_requirement = getattr(
-        hindsight_plugin,
-        "_CLIENT_REQUIREMENT",
-        f"hindsight-client>={_MIN_CLIENT_VERSION}",
-    )
     declaration_groups = {
         "pyproject hindsight extra": project["project"]["optional-dependencies"][
             "hindsight"
@@ -113,7 +111,10 @@ def test_hindsight_client_declarations_share_supported_interval():
             "tools.lazy_deps", fromlist=["LAZY_DEPS"]
         ).LAZY_DEPS["memory.hindsight"],
         "plugin manifest": manifest["pip_dependencies"],
-        "provider setup and auto-upgrade": [provider_requirement],
+        "provider setup and auto-upgrade": [
+            hindsight_plugin._CLIENT_REQUIREMENT,
+            hindsight_plugin._EMBED_REQUIREMENT,
+        ],
     }
 
     minimum = Version(_MIN_SCORES_CLIENT_VERSION)
@@ -132,21 +133,16 @@ def test_hindsight_client_declarations_share_supported_interval():
     }
 
     for source, specs in declaration_groups.items():
-        requirements = [
-            requirement
-            for spec in specs
-            if canonicalize_name((requirement := Requirement(spec)).name)
-            == package_name
-        ]
-        assert len(requirements) == 1, (
-            f"{source} must declare hindsight-client exactly once, got {specs!r}"
+        requirements = [Requirement(spec) for spec in specs]
+        assert {canonicalize_name(requirement.name) for requirement in requirements} == package_names, (
+            f"{source} must contain only hindsight-client and hindsight-embed, got {specs!r}"
         )
-        specifier = requirements[0].specifier
-        for version, should_accept in expected_compatibility.items():
-            assert (version in specifier) is should_accept, (
-                f"{source} has incompatible interval {specifier}: expected "
-                f"version {version} acceptance to be {should_accept}"
-            )
+        for requirement in requirements:
+            for version, should_accept in expected_compatibility.items():
+                assert (version in requirement.specifier) is should_accept, (
+                    f"{source} has incompatible interval {requirement.specifier}: expected "
+                    f"version {version} acceptance to be {should_accept}"
+                )
 
     assert _MIN_CLIENT_VERSION == _MIN_SCORES_CLIENT_VERSION, (
         "provider compatibility and min_scores floors must share one source of truth"
@@ -708,15 +704,26 @@ class TestConfig:
 
 
 
-    def test_get_client_passes_idle_timeout_to_hindsight_embedded(self, monkeypatch):
+    def test_get_client_passes_settings_to_dedicated_embedded_adapter(
+        self, monkeypatch
+    ):
+        from plugins.memory.hindsight import embedded_runtime
+
         captured = {}
 
-        class FakeHindsightEmbedded:
+        class FakeDedicatedEmbeddedClient:
             def __init__(self, **kwargs):
                 captured.update(kwargs)
 
-        monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded))
-        monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
+        monkeypatch.setattr(
+            embedded_runtime,
+            "DedicatedEmbeddedClient",
+            FakeDedicatedEmbeddedClient,
+        )
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_local_runtime", lambda: (True, "")
+        )
+        monkeypatch.setattr("tools.lazy_deps.ensure", lambda *args, **kwargs: None)
 
         p = HindsightMemoryProvider()
         p._mode = "local_embedded"
@@ -726,6 +733,7 @@ class TestConfig:
             "llm_api_key": "test-key",
             "llm_model": "test-model",
             "idle_timeout": 0,
+            "server_executable": "/managed/current/bin/hindsight-api",
         }
         p._llm_base_url = "http://localhost:8060/v1"
 
@@ -733,6 +741,7 @@ class TestConfig:
 
         assert captured["idle_timeout"] == 0
         assert captured["llm_provider"] == "openai"
+        assert captured["server_executable"] == "/managed/current/bin/hindsight-api"
 
 
 class TestPostSetup:

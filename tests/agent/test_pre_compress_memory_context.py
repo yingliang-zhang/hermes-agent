@@ -13,6 +13,7 @@ def _make_compressor():
     compressor = ContextCompressor.__new__(ContextCompressor)
     compressor.protect_first_n = 2
     compressor.protect_last_n = 5
+    compressor.max_tail_message_floor = 0
     compressor.tail_token_budget = 20_000
     compressor.context_length = 200_000
     compressor.threshold_percent = 0.80

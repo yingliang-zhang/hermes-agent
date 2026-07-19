@@ -105,7 +105,6 @@ def _install_dependencies(provider_name: str) -> None:
         "honcho-ai": "honcho",
         "mem0ai": "mem0",
         "hindsight-client": "hindsight_client",
-        "hindsight-all": "hindsight",
     }
 
     # Check which packages are missing
