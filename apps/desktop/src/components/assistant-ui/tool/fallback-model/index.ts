@@ -1207,6 +1207,14 @@ export function toolCopyPayload(part: ToolPart, view: ToolView): { label: string
   }
 
   if (isFileEditTool(part.toolName)) {
+    if (part.toolName === 'write_file' && typeof args.content === 'string') {
+      return { label: copy.file, text: args.content }
+    }
+
+    if (part.toolName === 'patch' && typeof result.diff === 'string' && result.diff.trim()) {
+      return { label: copy.file, text: result.diff }
+    }
+
     if (view.inlineDiff.trim()) {
       return { label: copy.file, text: view.inlineDiff }
     }

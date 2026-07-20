@@ -520,7 +520,17 @@ class TestWebServerEndpoints:
         assert resp.status_code == 200
         data = resp.json()
         fields = self._provider_field_map(data)
-        assert set(fields) == {"mode", "api_key", "api_url", "bank_id", "recall_budget"}
+        assert set(fields) == {
+            "mode",
+            "api_key",
+            "llm_api_key",
+            "llm_provider",
+            "llm_base_url",
+            "llm_model",
+            "api_url",
+            "bank_id",
+            "recall_budget",
+        }
         assert fields["mode"]["kind"] == "select"
         assert fields["api_key"]["kind"] == "secret"
 
@@ -554,6 +564,53 @@ class TestWebServerEndpoints:
         assert provider_config["mode"] == "local_external"
         assert provider_config["api_url"] == "http://localhost:8888"
         assert "api_key" not in provider_config
+
+    def test_declared_surface_put_round_trips_local_embedded_config(self, monkeypatch):
+        from hermes_constants import get_hermes_home
+        from hermes_cli import web_server
+
+        saved_env = {}
+        monkeypatch.setattr(web_server, "save_env_value", saved_env.__setitem__)
+        monkeypatch.setattr(web_server, "load_env", lambda: dict(saved_env))
+
+        resp = self.client.put(
+            "/api/memory/providers/hindsight/config?surface=declared",
+            json={
+                "values": {
+                    "mode": "local_embedded",
+                    "llm_provider": "openai_compatible",
+                    "llm_base_url": "http://localhost:8080/v1",
+                    "llm_model": "local-model",
+                    "llm_api_key": "llm-declared-key",
+                }
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True}
+        assert saved_env == {"HINDSIGHT_LLM_API_KEY": "llm-declared-key"}
+
+        config_path = get_hermes_home() / "hindsight" / "config.json"
+        provider_config = json.loads(config_path.read_text(encoding="utf-8"))
+        assert provider_config == {
+            "mode": "local_embedded",
+            "llm_provider": "openai_compatible",
+            "llm_base_url": "http://localhost:8080/v1",
+            "llm_model": "local-model",
+        }
+
+        get_resp = self.client.get(
+            "/api/memory/providers/hindsight/config?surface=declared"
+        )
+        assert get_resp.status_code == 200
+        data = get_resp.json()
+        fields = self._provider_field_map(data)
+        assert fields["llm_provider"]["value"] == "openai_compatible"
+        assert fields["llm_base_url"]["value"] == "http://localhost:8080/v1"
+        assert fields["llm_model"]["value"] == "local-model"
+        assert fields["llm_api_key"]["is_set"] is True
+        assert fields["llm_api_key"]["value"] == ""
+        assert "llm-declared-key" not in json.dumps(data)
 
     def test_declared_surface_put_rejects_undeclared_provider(self):
         resp = self.client.put(

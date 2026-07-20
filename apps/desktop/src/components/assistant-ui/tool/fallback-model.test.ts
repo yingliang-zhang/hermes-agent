@@ -9,6 +9,7 @@ import {
   inlineDiffFromResult,
   MAX_TOOL_RENDER_CHARS,
   prettyJson,
+  toolCopyPayload,
   type ToolPart
 } from './fallback-model'
 
@@ -391,5 +392,71 @@ describe('prettyJson caps serialized result size', () => {
 describe('countDiffLineStats', () => {
   it('counts added and removed lines', () => {
     expect(countDiffLineStats(`--- a/x\n+++ b/x\n@@\n-old\n+new\n context\n+another`)).toEqual({ added: 2, removed: 1 })
+  })
+})
+
+describe('toolCopyPayload file-edit copy', () => {
+  it('copies full write_file content instead of the display-truncated diff', () => {
+    const content = 'line\n'.repeat(200)
+    const inlineDiff = '--- /dev/null\n+++ b/file.txt\n' + '+line\n'.repeat(70) + '\n… omitted 130 diff line(s)'
+    const toolPart = part({
+      args: { content, path: '/tmp/file.txt' },
+      result: { bytes_written: content.length },
+      toolName: 'write_file'
+    })
+
+    const payload = toolCopyPayload(toolPart, buildToolView(toolPart, inlineDiff))
+
+    expect(payload.text).toBe(content)
+    expect(payload.text).not.toContain('omitted')
+  })
+
+  it('preserves leading and trailing whitespace from write_file args.content', () => {
+    const content = '\n  first line\nlast line  \n\n'
+    const inlineDiff = '--- /dev/null\n+++ b/file.txt\n+first line\n+last line'
+    const toolPart = part({
+      args: { content, path: '/tmp/file.txt' },
+      result: { bytes_written: content.length },
+      toolName: 'write_file'
+    })
+
+    expect(toolCopyPayload(toolPart, buildToolView(toolPart, inlineDiff)).text).toBe(content)
+  })
+
+  it('preserves an explicitly empty write_file args.content', () => {
+    const inlineDiff = '--- a/file.txt\n+++ /dev/null\n-previous content'
+    const toolPart = part({
+      args: { content: '', path: '/tmp/file.txt' },
+      result: { bytes_written: 0 },
+      toolName: 'write_file'
+    })
+
+    expect(toolCopyPayload(toolPart, buildToolView(toolPart, inlineDiff)).text).toBe('')
+  })
+
+  it('copies full patch result.diff instead of inline_diff truncated for display', () => {
+    const diff = '--- a/x\n+++ b/x\n@@\n' + '+new\n'.repeat(200)
+    const inlineDiff = '--- a/x\n+++ b/x\n@@\n' + '+new\n'.repeat(70) + '\n… omitted 130 diff line(s)'
+    const toolPart = part({
+      args: { mode: 'replace', path: 'x' },
+      result: { diff, inline_diff: inlineDiff, success: true },
+      toolName: 'patch'
+    })
+
+    const payload = toolCopyPayload(toolPart, buildToolView(toolPart, inlineDiff))
+
+    expect(payload.text).toBe(diff)
+    expect(payload.text).not.toContain('omitted')
+  })
+
+  it('falls back to the inline diff when write_file has no args.content', () => {
+    const inlineDiff = '--- /dev/null\n+++ b/file.txt\n+content'
+    const toolPart = part({
+      args: { path: '/tmp/file.txt' },
+      result: { bytes_written: 8 },
+      toolName: 'write_file'
+    })
+
+    expect(toolCopyPayload(toolPart, buildToolView(toolPart, inlineDiff)).text).toBe(inlineDiff)
   })
 })
