@@ -103,3 +103,31 @@ def test_agent_cbs_interim_callback_passes_already_streamed_false():
 
     assert emitted[0][2]["already_streamed"] is False
     assert emitted[0][2]["text"] == "interim text"
+
+
+def test_agent_cbs_interim_callback_does_not_settle_inflight_turn():
+    from tui_gateway import server
+
+    sid = "interim-callback-session"
+    inflight_turn = {"assistant_text": "full attempted reply"}
+    emitted: list[tuple] = []
+    server._sessions[sid] = {"inflight_turn": inflight_turn, "running": True}
+
+    try:
+        with patch("tui_gateway.server._load_cfg", return_value={}), patch(
+            "tui_gateway.server._emit",
+            side_effect=lambda event, event_sid, payload=None: emitted.append((event, event_sid, payload)),
+        ):
+            server._agent_cbs(sid)["interim_assistant_callback"]("full attempted reply")
+
+        assert emitted == [
+            (
+                "message.interim",
+                sid,
+                {"text": "full attempted reply", "already_streamed": False},
+            )
+        ]
+        assert server._sessions[sid]["inflight_turn"] is inflight_turn
+        assert server._sessions[sid]["running"] is True
+    finally:
+        server._sessions.pop(sid, None)

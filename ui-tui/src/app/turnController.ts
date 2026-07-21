@@ -276,6 +276,7 @@ class TurnController {
     this.bufRef = ''
     this.pendingSegmentTools = []
     this.segmentMessages = []
+    this.interimBoundaryIndex = null
 
     patchTurnState({
       streamPendingTools: [],

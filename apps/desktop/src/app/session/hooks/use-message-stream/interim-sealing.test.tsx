@@ -233,6 +233,19 @@ describe('useMessageStream interim text sealing', () => {
     expect(texts).toHaveLength(2)
   })
 
+  it('keeps post-interim deltas in a distinct stream when timestamps collide', async () => {
+    await mountStream()
+    vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000)
+    await start()
+
+    await delta('interim reply')
+    await interim('interim reply')
+    await delta('final reply')
+    await complete('final reply')
+
+    expect(assistantMessages()).toEqual(['interim reply', 'final reply'])
+  })
+
   it('settles an identical final completion onto the interim when response_previewed', async () => {
     await mountStream()
     await start()
