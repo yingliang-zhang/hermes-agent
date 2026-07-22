@@ -161,6 +161,23 @@ def test_interrupt_after_tool_keeps_delivered_text_when_present():
     assert messages[-1]["role"] == "assistant"
     # Real delivered text is preserved, not clobbered by the placeholder.
     assert messages[-1]["content"] == "Partial answer so far"
+    assert messages[-2]["_interrupted_tool_tail"] is True
+    assert agent.persisted_messages == messages
+
+
+def test_interrupt_after_tool_does_not_persist_control_status():
+    agent = _StubAgent()
+    messages = _interrupted_tool_tail()
+    _finalize(
+        agent,
+        messages,
+        interrupted=True,
+        final_response="Operation interrupted: waiting for model response (1.0s elapsed).",
+    )
+
+    assert messages[-1]["role"] == "tool"
+    assert messages[-1]["_interrupted_tool_tail"] is True
+    assert agent.persisted_messages == messages
 
 
 def test_non_interrupted_tool_tail_is_left_untouched():

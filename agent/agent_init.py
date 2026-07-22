@@ -1904,6 +1904,7 @@ def init_agent(
     _codex_gpt55_autoraise = str(
         _compression_cfg.get("codex_gpt55_autoraise", True)
     ).lower() in {"true", "1", "yes"}
+    agent._codex_gpt55_autoraise = _codex_gpt55_autoraise
     _codex_gpt55_autoraise_notice = str(
         _compression_cfg.get("codex_gpt55_autoraise_notice", True)
     ).lower() in {"true", "1", "yes"}

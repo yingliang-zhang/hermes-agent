@@ -42,7 +42,8 @@ function renderQueueHook(overrides: { busy?: boolean; onCancel?: () => void } = 
         onSubmit,
         queueEditRef,
         queueSessionKey: SESSION_KEY,
-        sessionId: 'rt-session-queue-hook'
+        sessionId: 'rt-session-queue-hook',
+        storedSessionId: SESSION_KEY
       }),
     { initialProps: { busy: overrides.busy ?? false } }
   )

@@ -423,9 +423,17 @@ def test_session_resume_active_turn_payload_matches_desktop_fixture(server, monk
         "inflight_turn": active_turn,
         "running": True,
         "session_key": fixture["session_key"],
+        "turn_generation": fixture["turn_generation"],
+        "turn_origin": fixture["turn_origin"],
+        "turn_state_revision": fixture["turn_state_revision"],
+        "turn_state_running": True,
     }
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
-    monkeypatch.setattr(server, "_session_info", lambda _agent: fixture["info"])
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda _agent, _session=None, **_kwargs: fixture["info"],
+    )
 
     # JSON round-trip the real RPC envelope: the desktop fixture must stay
     # faithful to what the gateway actually serializes, not a copied shape.

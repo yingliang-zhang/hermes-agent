@@ -75,6 +75,7 @@ function renderSubmitHook({
       queueEdit: null,
       queuedPrompts: [],
       sessionId: 'runtime-session',
+      storedSessionId: 'stored-session',
       setComposerText: vi.fn(),
       stashAt: vi.fn(),
       turnOrigin: null
@@ -216,6 +217,7 @@ function renderSubmit(turnOrigin: TurnOrigin) {
       queueEdit: null,
       queuedPrompts: [],
       sessionId: 'runtime-session',
+      storedSessionId: 'stored-session',
       setComposerText: vi.fn(),
       stashAt: vi.fn(),
       turnOrigin
@@ -337,7 +339,8 @@ function NotificationPreemptionHarness({
     onSubmit: actions.submitText,
     queueEditRef,
     queueSessionKey: STORED_SESSION_ID,
-    sessionId: RUNTIME_SESSION_ID
+    sessionId: RUNTIME_SESSION_ID,
+    storedSessionId: STORED_SESSION_ID
   })
 
   const submit = useComposerSubmit({
@@ -364,6 +367,7 @@ function NotificationPreemptionHarness({
     queueEdit: queue.queueEdit,
     queuedPrompts: queue.queuedPrompts,
     sessionId: RUNTIME_SESSION_ID,
+    storedSessionId: STORED_SESSION_ID,
     setComposerText: () => undefined,
     stashAt: () => undefined,
     turnOrigin: state.turnOrigin ?? null

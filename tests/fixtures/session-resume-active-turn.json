@@ -3,8 +3,12 @@
     "cwd": "/workspace",
     "lazy": false,
     "model": "test/model",
+    "running": true,
     "skills": {},
-    "tools": {}
+    "tools": {},
+    "turn_generation": 7,
+    "turn_origin": "notification",
+    "turn_state_revision": 11
   },
   "inflight": {
     "assistant": "partial answer",
@@ -24,5 +28,8 @@
   "session_key": "stored-running",
   "started_at": 1700000000.0,
   "status": "working",
+  "turn_generation": 7,
+  "turn_origin": "notification",
+  "turn_state_revision": 11,
   "turn_started_at": 1700000123.5
 }

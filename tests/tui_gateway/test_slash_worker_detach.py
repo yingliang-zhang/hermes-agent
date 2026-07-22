@@ -9,6 +9,7 @@ These tests cover the new fixes in this PR. Related work by other contributors:
 
 from __future__ import annotations
 
+import threading
 from unittest.mock import MagicMock
 
 from tui_gateway import server
@@ -32,6 +33,7 @@ def test_close_sessions_for_transport_closes_worker_on_detach():
     sid = "detach-test-sid"
     session = {
         "transport": fake_transport,
+        "history_lock": threading.Lock(),
         "slash_worker": fake_worker,
         "close_on_disconnect": False,
         "session_key": "detach-test",
@@ -96,6 +98,7 @@ def test_close_sessions_for_transport_handles_worker_close_exception():
     sid = "exception-test-sid"
     session = {
         "transport": fake_transport,
+        "history_lock": threading.Lock(),
         "slash_worker": fake_worker,
         "close_on_disconnect": False,
         "session_key": "exception-test",

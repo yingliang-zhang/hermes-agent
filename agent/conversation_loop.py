@@ -1519,6 +1519,8 @@ def run_conversation(
         # configured per-turn cap shared with the overflow error handlers.
         _compressor = agent.context_compressor
         _hard_limit = getattr(_compressor, "hygiene_hard_message_limit", 0)
+        if isinstance(_hard_limit, bool) or not isinstance(_hard_limit, (int, float)):
+            _hard_limit = 0
         _hard_limit_breached = _hard_limit > 0 and len(messages) >= _hard_limit
         _preflight_threshold = int(
             getattr(_compressor, "threshold_tokens", 0) or 0

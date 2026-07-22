@@ -2018,26 +2018,6 @@ def compress_context(
         )
         _boundary_parent = _old_sid or agent.session_id or ""
 
-        # Notify the context engine that a compaction boundary occurred. Plugin
-        # engines (e.g. hermes-lcm) use boundary_reason="compression" to preserve
-        # DAG lineage / checkpoint per-session state across the boundary instead of
-        # re-initializing fresh. See hermes-lcm#68. Built-in ContextCompressor
-        # ignores kwargs. Fires in BOTH modes: rotation passes old→new ids; in-place
-        # passes the SAME id (the boundary is real even though the id didn't move).
-        if _context_engine_boundary_committed:
-            if defer_context_engine_notification:
-                _queue_context_engine_compression_notification(
-                    agent,
-                    new_session_id=agent.session_id or "",
-                    old_session_id=_boundary_parent,
-                )
-            else:
-                _notify_context_engine_compression_complete(
-                    agent,
-                    new_session_id=agent.session_id or "",
-                    old_session_id=_boundary_parent,
-                )
-
         # Notify memory providers of the compaction boundary so provider-cached
         # per-session state (Hindsight's _document_id, accumulated turn buffers,
         # counters) refreshes. reset=False because the logical conversation
@@ -2077,9 +2057,29 @@ def compress_context(
                     agent.session_id, new_system_prompt
                 )
             except Exception as _prompt_db_err:
+                _context_engine_boundary_committed = False
                 logger.warning(
                     "Could not persist rebuilt post-compression system prompt: %s",
                     _prompt_db_err,
+                )
+
+        # Notify the context engine only after every core persistence step,
+        # including the child session's rebuilt prompt, has committed. Plugin
+        # engines may checkpoint or advance their own DAG at this edge, so an
+        # early callback would publish state that core persistence can still
+        # fail to make resumable.
+        if _context_engine_boundary_committed:
+            if defer_context_engine_notification:
+                _queue_context_engine_compression_notification(
+                    agent,
+                    new_session_id=agent.session_id or "",
+                    old_session_id=_boundary_parent,
+                )
+            else:
+                _notify_context_engine_compression_complete(
+                    agent,
+                    new_session_id=agent.session_id or "",
+                    old_session_id=_boundary_parent,
                 )
 
         # Warn on repeated compressions (quality degrades with each pass).

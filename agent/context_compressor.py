@@ -566,6 +566,11 @@ _ACTIVE_TASK_MAX_CHARS = 1400
 # ``compression.max_tail_message_floor`` in config.yaml (#45259 hardened the
 # floor from 3 to ``min(protect_last_n, 8)``; this makes the 8 configurable).
 _DEFAULT_MAX_TAIL_MESSAGE_FLOOR = 8
+# Hard cap for the token-pressure pruning floor. Unlike the configurable
+# tail-cut floor above, pressure recovery must bound how many bulky recent
+# messages are exempt from demotion or an all-tool tail can become impossible
+# to compress. Keep the shared default value while retaining distinct semantics.
+_MAX_TAIL_MESSAGE_FLOOR = _DEFAULT_MAX_TAIL_MESSAGE_FLOOR
 # Under context pressure (protected-tail tool bodies alone exceed the soft
 # tail budget), demote large completed tool/file outputs even inside the
 # protected region — but always keep this many trailing messages verbatim so
@@ -2325,7 +2330,7 @@ class ContextCompressor(ContextEngine):
         # force=True, which clears this cooldown in compress() before running,
         # so it still retries immediately.
         _cooldown_remaining = self._summary_failure_cooldown_until - time.monotonic()
-        if _cooldown_remaining > 0:
+        if not force and _cooldown_remaining > 0:
             if not self.quiet_mode:
                 logger.debug(
                     "Compression deferred — summary LLM in cooldown for %.0fs more",

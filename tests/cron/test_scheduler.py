@@ -1077,6 +1077,7 @@ class TestRunJobSessionPersistence:
         """The real finally path keeps the lease when DB closure fails."""
         job = {"id": "test-job", "name": "test", "prompt": "hello"}
         fake_db = MagicMock()
+        fake_db.get_compression_tip.side_effect = lambda session_id: session_id
         fake_db.end_session.side_effect = RuntimeError("DB locked")
 
         with patch("cron.scheduler._hermes_home", tmp_path), \

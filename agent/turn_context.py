@@ -722,12 +722,10 @@ def build_turn_context(
     # Hard message-count safety valve: at or above this count, bypass noisy
     # real-usage deferral and automatic-compression breakers. The per-turn
     # compression-pass cap still bounds recovery.
-    _hard_limit = getattr(_compressor, "hygiene_hard_message_limit", 0) or 0
-    _hard_limit_breached = (
-        isinstance(_hard_limit, (int, float))
-        and _hard_limit > 0
-        and len(messages) >= _hard_limit
-    )
+    _hard_limit = getattr(_compressor, "hygiene_hard_message_limit", 0)
+    if isinstance(_hard_limit, bool) or not isinstance(_hard_limit, (int, float)):
+        _hard_limit = 0
+    _hard_limit_breached = _hard_limit > 0 and len(messages) >= _hard_limit
     if agent.compression_enabled and (
         _hard_limit_breached
         or _should_run_preflight_estimate(

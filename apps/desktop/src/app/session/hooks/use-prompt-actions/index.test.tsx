@@ -289,7 +289,8 @@ function QueueHarness({
     onSubmit: actions.submitText,
     queueEditRef,
     queueSessionKey: activeQueueSessionKey,
-    sessionId: activeSessionId
+    sessionId: activeSessionId,
+    storedSessionId: activeQueueSessionKey
   })
 
   useEffect(() => {

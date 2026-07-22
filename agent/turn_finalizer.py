@@ -243,6 +243,13 @@ def finalize_turn(
         and not interrupted
         and not failed
     )
+    delivered_interrupted_response = (
+        interrupted
+        and not failed
+        and isinstance(final_response, str)
+        and bool(final_response.strip())
+        and not final_response.strip().startswith("Operation interrupted")
+    )
 
     # Post-loop cleanup must never lose the response.  Trajectory save,
     # resource teardown, and session persistence all touch fallible
@@ -284,14 +291,20 @@ def finalize_turn(
     # same empty-response loop again.
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
+        _marked_interrupted_tool_tail = False
         if interrupted:
-            mark_interrupted_tool_tail(messages)
+            _marked_interrupted_tool_tail = mark_interrupted_tool_tail(messages)
 
         # Drop verification-continuation nudges (synthetic user messages)
         # from the live history before the tail-assistant check — only the
         # nudges need stripping; the assistant candidate persists in
         # state.db. (#65919 §7)
         _drop_verification_continuation_scaffolding(messages)
+        # Keep cancellation prose API-local, but persist assistant text that was
+        # genuinely delivered before the interrupt. The marked tool row retains
+        # provenance while this real assistant row closes canonical alternation.
+        if _marked_interrupted_tool_tail and delivered_interrupted_response:
+            messages.append({"role": "assistant", "content": final_response})
 
 
         # Some recovery/fallback paths return a real final_response without
