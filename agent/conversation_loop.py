@@ -859,6 +859,7 @@ def run_conversation(
     persist_user_timestamp: Optional[float] = None,
     moa_config: Optional[dict[str, Any]] = None,
     persist_user_message_id: Optional[str] = None,
+    deferred_notification_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -879,6 +880,8 @@ def run_conversation(
         moa_config: Optional mixture-of-agents configuration for this turn.
         persist_user_message_id: Optional stable source identity to retain on
             the canonical user message and persisted row.
+        deferred_notification_ids: Durable completion identities represented by
+            the closing assistant transcript row when this turn succeeds.
 
     Returns:
         Dict: Complete conversation result with final response and message history
@@ -921,6 +924,7 @@ def run_conversation(
         persist_user_message,
         persist_user_timestamp,
         persist_user_message_id,
+        deferred_notification_ids,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,
         install_safe_stdio=_install_safe_stdio,
         sanitize_surrogates=_sanitize_surrogates,

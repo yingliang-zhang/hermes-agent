@@ -7,6 +7,7 @@ import threading
 import time
 import types
 from unittest.mock import MagicMock, patch
+from pathlib import Path
 
 import pytest
 
@@ -368,7 +369,7 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
     monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_id=None, session_db=None, **_kwargs: object())
     monkeypatch.setattr(server, "_init_session", lambda sid, key, agent, history, cols=80, **_kwargs: None)
-    monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None: {"model": "test/model"})
+    monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None, **_kwargs: {"model": "test/model"})
 
     resp = server.handle_request(
         {
@@ -388,6 +389,62 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
         {"role": "tool", "name": "tool", "context": ""},
     ]
 
+
+
+def test_session_resume_active_turn_payload_matches_desktop_fixture(server, monkeypatch):
+    """A live resume serializes the exact timer payload consumed by Desktop."""
+    fixture = json.loads(
+        (Path(__file__).parents[1] / "fixtures" / "session-resume-active-turn.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    class _DB:
+        def get_session(self, session_id):
+            return {"id": session_id}
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, session_id):
+            return session_id
+
+    active_turn = {
+        "assistant": "partial answer",
+        "started_at": fixture["turn_started_at"],
+        "streaming": True,
+        "user": "current prompt",
+    }
+    server._sessions[fixture["session_id"]] = {
+        "agent": types.SimpleNamespace(session_id=fixture["session_key"]),
+        "created_at": fixture["started_at"],
+        "history": [{"content": "earlier prompt", "role": "user"}],
+        "history_lock": threading.Lock(),
+        "inflight_turn": active_turn,
+        "running": True,
+        "session_key": fixture["session_key"],
+    }
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_session_info", lambda _agent: fixture["info"])
+
+    # JSON round-trip the real RPC envelope: the desktop fixture must stay
+    # faithful to what the gateway actually serializes, not a copied shape.
+    response = json.loads(
+        json.dumps(
+            server.handle_request(
+                {
+                    "id": "resume-running",
+                    "method": "session.resume",
+                    "params": {"session_id": fixture["session_key"]},
+                }
+            )
+        )
+    )
+    result = response["result"]
+
+    assert result["running"] is True
+    assert result["turn_started_at"] == active_turn["started_at"]
+    assert result == fixture
 
 def test_session_resume_defaults_to_deferred_build(server, monkeypatch):
     """A normal cold resume (no ``eager_build``) must return the full display
@@ -580,7 +637,7 @@ def test_session_resume_handles_multimodal_list_content(server, monkeypatch):
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
     monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_id=None, session_db=None, **_kwargs: object())
     monkeypatch.setattr(server, "_init_session", lambda sid, key, agent, history, cols=80, **_kwargs: None)
-    monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None: {"model": "test/model"})
+    monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None, **_kwargs: {"model": "test/model"})
 
     resp = server.handle_request(
         {
@@ -920,7 +977,7 @@ def test_session_resume_reuses_existing_live_session(server, monkeypatch):
     monkeypatch.setattr(
         server,
         "_session_info",
-        lambda _agent, _session=None: {"model": "test/model"},
+        lambda _agent, _session=None, **_kwargs: {"model": "test/model"},
     )
 
     fake_approval = types.SimpleNamespace(
@@ -1017,7 +1074,7 @@ def test_session_resume_reuses_live_agent_after_compression_rotation(server, mon
     monkeypatch.setattr(
         server,
         "_session_info",
-        lambda _agent, _session=None: {"model": "test/model"},
+        lambda _agent, _session=None, **_kwargs: {"model": "test/model"},
     )
 
     result = server.handle_request(
@@ -1136,7 +1193,7 @@ def test_session_resume_live_payload_uses_current_history_with_ancestors(server,
     monkeypatch.setattr(
         server,
         "_session_info",
-        lambda _agent, _session=None: {"model": "test/model"},
+        lambda _agent, _session=None, **_kwargs: {"model": "test/model"},
     )
 
     fake_approval = types.SimpleNamespace(
@@ -1211,7 +1268,7 @@ def test_session_activate_rebinds_orphaned_ws_session_to_current_transport(serve
     monkeypatch.setattr(
         server,
         "_session_info",
-        lambda _agent, _session=None: {"model": "test/model"},
+        lambda _agent, _session=None, **_kwargs: {"model": "test/model"},
     )
 
     resp = server.handle_request(

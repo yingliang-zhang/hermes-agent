@@ -302,6 +302,8 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
         *,
         submitted_at=None,
         message_id=None,
+        origin="user",
+        **_kw,
     ):
         inline_calls.append((rid, sid, text, submitted_at, message_id))
 
@@ -478,7 +480,7 @@ def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
     monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
-    monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None: dict(fixed_info))
+    monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None, **_kw: dict(fixed_info))
     monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
     monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
     fake_title = types.ModuleType("agent.title_generator")
@@ -509,9 +511,9 @@ def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
         class _FakeSupervisor:
             def submit_turn(self, frame, *, on_complete=None):
                 sid = frame["sid"]
-                server._emit("message.start", sid)
+                server._emit("message.start", sid, {"turn_generation": 1, "turn_origin": "user", "turn_state_revision": 1})
                 server._emit("message.delta", sid, {"text": "hi"})
-                server._emit("message.complete", sid, {"text": "hi", "usage": usage, "status": "complete"})
+                server._emit("message.complete", sid, {"text": "hi", "usage": usage, "status": "complete", "turn_origin": "user", "turn_generation": 1, "turn_state_revision": 2})
                 server._emit("session.info", sid, dict(fixed_info))
                 if on_complete is not None:
                     on_complete(
@@ -3289,7 +3291,7 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
 
-    def _deliver(_rid, sid, session, text):
+    def _deliver(_rid, sid, session, text, **_kwargs):
         delivered["a" if sid == "sid-a-live-handoff" else "b"].append(text)
         session["running"] = False
 
@@ -3398,7 +3400,7 @@ def test_notification_poller_live_loop_drops_addressed_orphan(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     server._sessions["sid-live-orphan"] = session
     process_registry._completion_consumed.discard(event["session_id"])
@@ -3439,7 +3441,7 @@ def test_notification_poller_drops_orphaned_events(monkeypatch, routing):
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
@@ -3505,7 +3507,7 @@ def test_notification_poller_delivers_owned_events(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: _CompressionDB())
 
@@ -3565,7 +3567,7 @@ def _configure_immediate_prompt_run(
     monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
     monkeypatch.setattr(server, "_set_session_context", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
-    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_session_info", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
     monkeypatch.setattr(
         server, "_sync_session_key_after_compress", lambda *_args, **_kwargs: None
@@ -7286,6 +7288,19 @@ def test_session_info_includes_session_title(monkeypatch):
     assert info["title"] == "Dashboard title"
 
 
+def test_session_info_includes_turn_started_at():
+    agent = types.SimpleNamespace(tools=[], model="", provider="")
+    session = {
+        "history": [],
+        "inflight_turn": {"started_at": 1_700_000_123.5},
+        "running": True,
+    }
+
+    assert server._session_info(agent, session)["turn_started_at"] == 1_700_000_123.5
+
+    session["inflight_turn"] = None
+    session["running"] = False
+    assert server._session_info(agent, session)["turn_started_at"] is None
 # ---------------------------------------------------------------------------
 # History-mutating commands must reject while session.running is True.
 # Without these guards, prompt.submit's post-run history write either
@@ -9330,7 +9345,11 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda agent, *_args, **_kwargs: {"model": agent.model},
+    )
 
     def _emit(event, sid, payload=None):
         if event == "message.complete":
@@ -9363,6 +9382,9 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
             "streaming": True,
             "user": "write a long answer",
         }
+        turn_started_at = resp["result"]["turn_started_at"]
+        assert turn_started_at == server._sessions["sid-live"]["inflight_turn"]["started_at"]
+        assert turn_started_at > 0
         assert resp["result"]["messages"] == []
 
         release.set()
@@ -9375,6 +9397,7 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
             }
         )
         assert completed["result"].get("inflight") is None
+        assert completed["result"]["turn_started_at"] is None
         assert completed["result"]["messages"] == [
             {"role": "user", "text": "write a long answer"},
             {"role": "assistant", "text": "partial answer complete"},
@@ -9393,7 +9416,7 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
     that copy without leaking the transport object.
     """
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, _session, **_kwargs: {"model": agent.model})
     agent = types.SimpleNamespace(model="model-live")
     session = _session(
         agent=agent,
@@ -9426,7 +9449,11 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
 
 
 def test_session_activate_switches_live_session_without_closing_siblings(monkeypatch):
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda agent, *_args, **_kwargs: {"model": agent.model},
+    )
     server._sessions["sid-a"] = _session(
         agent=types.SimpleNamespace(model="model-a"),
         history=[{"role": "user", "content": "old"}],
@@ -9452,7 +9479,13 @@ def test_session_activate_switches_live_session_without_closing_siblings(monkeyp
         assert resp["result"]["session_key"] == "key-b"
         assert resp["result"]["running"] is True
         assert resp["result"]["status"] == "working"
-        assert resp["result"]["info"] == {"model": "model-b"}
+        assert resp["result"]["info"] == {
+            "model": "model-b",
+            "running": True,
+            "turn_generation": 0,
+            "turn_origin": None,
+            "turn_state_revision": 0,
+        }
         assert resp["result"]["messages"] == [
             {"role": "user", "text": "new prompt"},
             {"role": "assistant", "text": "new answer"},
@@ -10916,10 +10949,12 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
     from tools.process_registry import process_registry
 
     turns = []
+    origins = []
     emitted = []
 
-    def _fake_run_prompt_submit(rid, sid, session, text):
+    def _fake_run_prompt_submit(rid, sid, session, text, *, origin):
         turns.append(text)
+        origins.append(origin)
         with session["history_lock"]:
             session["running"] = False
 
@@ -10954,6 +10989,7 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
         assert "READY on port 8000" in status_text
         assert "READY on port 9000" in status_text
         assert len(turns) == 3
+        assert origins == ["notification", "notification", "notification"]
     finally:
         server._sessions.pop("sid_watch_dedup", None)
         while not process_registry.completion_queue.empty():

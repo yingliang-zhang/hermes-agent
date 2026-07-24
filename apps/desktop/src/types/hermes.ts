@@ -360,6 +360,8 @@ export interface PaginatedSessions {
   errors?: Array<{ profile: string; error: string }>
 }
 
+export type TurnOrigin = 'user' | 'notification' | 'goal'
+
 export interface RpcEvent<T = unknown> {
   payload?: T
   profile?: string
@@ -468,12 +470,17 @@ export interface SessionResumeResponse {
   info?: SessionRuntimeInfo
   message_count: number
   messages: SessionMessage[]
-  resumed: string
   running?: boolean
+  turn_generation?: number
+  turn_origin?: TurnOrigin | null
+  turn_state_revision?: number
+  resumed: string
   session_id: string
   session_key?: string
   started_at?: number
   status?: string
+  /** Epoch seconds the current turn started, or null when idle. */
+  turn_started_at?: number | null
 }
 
 export interface SessionRuntimeInfo {
@@ -496,6 +503,9 @@ export interface SessionRuntimeInfo {
   usage?: Partial<UsageStats>
   version?: string
   yolo?: boolean
+  turn_origin?: TurnOrigin | null
+  turn_generation?: number
+  turn_state_revision?: number
 }
 
 export interface UsageStats {

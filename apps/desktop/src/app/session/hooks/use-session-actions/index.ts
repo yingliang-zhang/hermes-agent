@@ -2,10 +2,16 @@ import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 import type { NavigateFunction } from 'react-router-dom'
 
+import { reconcileClientTurnState } from '@/app/session/turn-state'
 import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import {
+  type ChatMessage,
+  type GatewayEventPayload,
+  preserveLocalAssistantErrors,
+  toChatMessages
+} from '@/lib/chat-messages'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { migrateSessionDraft } from '@/store/composer'
@@ -721,6 +727,11 @@ export function useSessionActions({
 
               const running = Boolean(activated.running ?? cachedViewState.busy)
 
+              const activatedTurnStartedAt =
+                typeof activated.turn_started_at === 'number' && activated.turn_started_at > 0
+                  ? activated.turn_started_at * 1000
+                  : null
+
               // While idle, the persisted REST transcript is the display
               // authority: session.activate returns the runtime's compressed
               // context projection, not necessarily the complete conversation.
@@ -752,7 +763,8 @@ export function useSessionActions({
                   ...(runtimeInfo ?? {}),
                   messages: activatedMessages,
                   busy: running,
-                  awaitingResponse: running
+                  awaitingResponse: running,
+                  turnStartedAt: running ? (activatedTurnStartedAt ?? state.turnStartedAt ?? Date.now()) : null
                 }),
                 storedSessionId
               )
@@ -934,17 +946,51 @@ export function useSessionActions({
 
         patchSessionWorkspace(storedSessionId, runtimeInfo?.cwd)
 
-        resumedRunning = Boolean((resumed as { running?: boolean }).running)
+        const turnSnapshot: GatewayEventPayload = { ...(resumed.info ?? {}) }
 
-        updateSessionState(
+        if (Object.hasOwn(resumed, 'running')) {
+          turnSnapshot.running = resumed.running
+        }
+
+        if (Object.hasOwn(resumed, 'turn_generation')) {
+          turnSnapshot.turn_generation = resumed.turn_generation
+        }
+
+        if (Object.hasOwn(resumed, 'turn_origin')) {
+          turnSnapshot.turn_origin = resumed.turn_origin
+        }
+
+        if (Object.hasOwn(resumed, 'turn_state_revision')) {
+          turnSnapshot.turn_state_revision = resumed.turn_state_revision
+        }
+
+        if (Object.hasOwn(resumed, 'turn_started_at')) {
+          turnSnapshot.turn_started_at = resumed.turn_started_at
+        }
+
+        const resumedTurnStartedAt =
+          typeof turnSnapshot.turn_started_at === 'number' && turnSnapshot.turn_started_at > 0
+            ? turnSnapshot.turn_started_at * 1000
+            : null
+
+        const resumedState = updateSessionState(
           resumed.session_id,
-          state => ({
-            ...state,
-            ...(runtimeInfo ?? {}),
-            messages: messagesForView,
-            busy: resumedRunning,
-            awaitingResponse: resumedRunning
-          }),
+          state => {
+            const reconciled = reconcileClientTurnState(state, turnSnapshot, 'snapshot')
+            const turnState = reconciled.accepted ? reconciled.state : state
+
+            return {
+              ...turnState,
+              ...(runtimeInfo ?? {}),
+              messages: messagesForView,
+              awaitingResponse: reconciled.accepted ? turnState.busy : state.awaitingResponse,
+              turnStartedAt: reconciled.accepted
+                ? turnState.busy && resumedTurnStartedAt !== null
+                  ? resumedTurnStartedAt
+                  : null
+                : state.turnStartedAt
+            }
+          },
           storedSessionId
         )
 
@@ -955,6 +1001,7 @@ export function useSessionActions({
         if (!chatMessageArraysEquivalent($messages.get(), messagesForView)) {
           setMessages(messagesForView)
         }
+        resumedRunning = Boolean(resumedState.busy)
       } catch (err) {
         if (!isCurrentResume()) {
           return
