@@ -119,28 +119,27 @@ class TestGoalMigratesOnRotation:
             goals._DB_CACHE.clear()
 
 
-class TestOrphanRollbackOnCreateFailure:
-    def test_rolls_back_to_parent_when_child_create_fails(self, tmp_path: Path):
+class TestAtomicRotationFailure:
+    def test_keeps_parent_live_when_atomic_rotation_fails(self, tmp_path: Path):
         db = SessionDB(db_path=tmp_path / "state.db")
-        parent = "PARENT_ORPHAN_ROT"
+        parent = "PARENT_ATOMIC_ROT"
         db.create_session(parent, source="cli")
         agent = _build_agent_with_db(db, parent)
 
-        # Make the CHILD create_session raise, but let the initial parent
-        # end_session/reopen work. We patch create_session to blow up.
-        real_create = db.create_session
-
-        def _boom(*a, **k):
-            raise RuntimeError("FOREIGN KEY constraint failed")
-
-        with patch.object(db, "create_session", side_effect=_boom):
+        with patch.object(
+            db,
+            "complete_compression_rotation",
+            side_effect=RuntimeError("simulated transaction failure"),
+        ):
             agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
 
-        # The live id must roll back to the still-indexed parent — NOT a
-        # phantom child id that has no row in state.db.
+        # The transaction never committed, so the agent stays on the live,
+        # indexed parent instead of switching to an unindexed child id.
         assert agent.session_id == parent
-        assert db.get_session(parent) is not None
-        _ = real_create  # silence unused
+        persisted_parent = db.get_session(parent)
+        assert persisted_parent is not None
+        assert persisted_parent["ended_at"] is None
+        assert persisted_parent["end_reason"] is None
 
 
 class TestWorkspaceMetadataFollowsRotation:

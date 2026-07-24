@@ -144,6 +144,16 @@ _COMPRESSION_CHILD_SQL = (
     "        AND p.end_reason = 'compression')"
 )
 
+# A durable compression rotation requires a real continuation child, not merely
+# an ended parent. Explicit branch/delegate/tool children share the same parent
+# column but do not complete the rotation.
+_COMPRESSION_CONTINUATION_CHILD_SQL = (
+    "{child}.parent_session_id = {parent}.id"
+    " AND json_extract(COALESCE({child}.model_config, '{{}}'), '$._branched_from') IS NULL"
+    " AND json_extract(COALESCE({child}.model_config, '{{}}'), '$._delegate_from') IS NULL"
+    " AND COALESCE({child}.source, '') != 'tool'"
+)
+
 # Rows that surface in pickers: roots + branch children (subagent runs and
 # compression continuations stay hidden).
 _LISTABLE_CHILD_SQL = f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')})"
@@ -4246,18 +4256,21 @@ class SessionDB:
 
         Returns ``True`` on success (caller now owns the lock and must
         release via :meth:`release_compression_lock`).  Returns ``False``
-        if another holder already owns a non-expired lock — the caller
-        MUST NOT proceed with compression in that case (its rotation would
-        race against the holder's, splitting the session lineage).
+        if another holder already owns a non-expired lock or if the session
+        has already completed a compression rotation. The caller MUST NOT
+        proceed in either case: a late AIAgent can still carry the ended
+        parent id after the winner releases its lock, and rotating that stale
+        parent would split the session lineage.
 
         Expired locks (``expires_at < now``) are reclaimed transparently.
         Structured holders whose local ``pid=`` no longer exists are reclaimed
         immediately, so a gateway killed during compression does not stall the
         replacement process for the full lease TTL.
 
-        Implementation: single-transaction DELETE-expired + INSERT-or-IGNORE,
-        followed by a SELECT to confirm we got the row. SQLite serialises
-        writes, so the whole sequence is atomic against other writers.
+        Implementation: one transaction rejects only a parent with a valid
+        continuation child, then performs DELETE-expired + INSERT-or-IGNORE
+        followed by a SELECT to confirm ownership. SQLite serialises writes,
+        so the sequence is atomic against other writers and completed rotations.
         """
         if not session_id:
             return False
@@ -4265,6 +4278,26 @@ class SessionDB:
         expires_at = now + ttl_seconds
 
         def _do(conn):
+            # A compression end marker is not sufficient: legacy rotation ends
+            # the parent before creating its child, so a crash between those
+            # writes must remain reclaimable after lease expiry. Only a linked
+            # continuation child makes the completed rotation durable.
+            continuation = _COMPRESSION_CONTINUATION_CHILD_SQL.format(
+                child="child", parent="parent"
+            )
+            already_rotated = conn.execute(
+                f"""SELECT 1
+                    FROM sessions parent
+                    WHERE parent.id = ?
+                      AND parent.ended_at IS NOT NULL
+                      AND parent.end_reason = 'compression'
+                      AND EXISTS (
+                          SELECT 1 FROM sessions child WHERE {continuation}
+                      )""",
+                (session_id,),
+            ).fetchone()
+            if already_rotated is not None:
+                return False, None
             reclaimed_holder = None
             row = conn.execute(
                 "SELECT holder, expires_at FROM compression_locks "
@@ -4323,6 +4356,85 @@ class SessionDB:
             # Fail open: returning False makes the caller skip compression,
             # which is the safe behaviour when the lock subsystem is broken.
             return False
+
+    def complete_compression_rotation(
+        self,
+        *,
+        parent_session_id: str,
+        child_session_id: str,
+        holder: str,
+        source: str,
+        model: str = None,
+        model_config: Dict[str, Any] = None,
+    ) -> bool:
+        """Atomically end a parent and create its compression continuation.
+
+        The caller must own the parent's unexpired compression lease. A lost
+        holder is fenced before either row changes. Legacy crash state where
+        the parent is already compression-ended but has no continuation remains
+        recoverable by the current lease holder.
+        """
+        if not parent_session_id or not child_session_id or not holder:
+            return False
+        now = time.time()
+        continuation = _COMPRESSION_CONTINUATION_CHILD_SQL.format(
+            child="child", parent="parent"
+        )
+
+        def _do(conn):
+            owns_lease = conn.execute(
+                "SELECT 1 FROM compression_locks "
+                "WHERE session_id = ? AND holder = ? AND expires_at >= ?",
+                (parent_session_id, holder, now),
+            ).fetchone()
+            if owns_lease is None:
+                return False
+
+            parent = conn.execute(
+                "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                (parent_session_id,),
+            ).fetchone()
+            if parent is None:
+                return False
+            ended_at = parent["ended_at"] if isinstance(parent, sqlite3.Row) else parent[0]
+            end_reason = parent["end_reason"] if isinstance(parent, sqlite3.Row) else parent[1]
+            if ended_at is not None and end_reason != "compression":
+                return False
+
+            existing_child = conn.execute(
+                f"""SELECT 1
+                    FROM sessions parent
+                    WHERE parent.id = ?
+                      AND EXISTS (
+                          SELECT 1 FROM sessions child WHERE {continuation}
+                      )""",
+                (parent_session_id,),
+            ).fetchone()
+            if existing_child is not None:
+                return False
+
+            if ended_at is None:
+                conn.execute(
+                    "UPDATE sessions SET ended_at = ?, end_reason = 'compression' "
+                    "WHERE id = ? AND ended_at IS NULL",
+                    (now, parent_session_id),
+                )
+            conn.execute(
+                """INSERT INTO sessions (
+                       id, source, model, model_config, parent_session_id, started_at
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    child_session_id,
+                    source,
+                    model,
+                    json.dumps(model_config) if model_config else None,
+                    parent_session_id,
+                    now,
+                ),
+            )
+            return True
+
+        return bool(self._execute_write(_do))
 
     def release_compression_lock(self, session_id: str, holder: str) -> None:
         """Release the compression lock for ``session_id`` iff we own it.

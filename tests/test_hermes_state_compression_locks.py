@@ -13,6 +13,7 @@ diagnostic accessor) — not the wiring into compression.
 from __future__ import annotations
 
 import os
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -51,6 +52,146 @@ def test_release_allows_reacquire(db: SessionDB) -> None:
     db.release_compression_lock("sess1", "holder1")
     assert db.get_compression_lock_holder("sess1") is None
     assert db.try_acquire_compression_lock("sess1", "holder2") is True
+
+
+def test_atomic_rotation_rolls_back_parent_end_when_child_insert_fails(
+    db: SessionDB,
+) -> None:
+    db.create_session("sess1", source="discord")
+    assert db.try_acquire_compression_lock("sess1", "winner") is True
+    db._conn.execute(
+        """
+        CREATE TEMP TRIGGER abort_compression_child_insert
+        BEFORE INSERT ON sessions
+        WHEN NEW.parent_session_id = 'sess1'
+        BEGIN
+            SELECT RAISE(ABORT, 'simulated crash between parent end and child create');
+        END
+        """
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="simulated crash"):
+        db.complete_compression_rotation(
+            parent_session_id="sess1",
+            child_session_id="child1",
+            holder="winner",
+            source="discord",
+        )
+
+    parent = db.get_session("sess1")
+    assert parent is not None
+    assert parent["ended_at"] is None
+    assert parent["end_reason"] is None
+    assert db.get_session("child1") is None
+
+
+def test_valid_completed_rotation_blocks_stale_reacquire(db: SessionDB) -> None:
+    db.create_session("sess1", source="discord")
+    assert db.try_acquire_compression_lock("sess1", "winner") is True
+    assert db.complete_compression_rotation(
+        parent_session_id="sess1",
+        child_session_id="child1",
+        holder="winner",
+        source="discord",
+    ) is True
+    db.release_compression_lock("sess1", "winner")
+
+    assert db.try_acquire_compression_lock("sess1", "stale-agent") is False
+    assert db.get_compression_lock_holder("sess1") is None
+    child = db.get_session("child1")
+    assert child is not None
+    assert child["parent_session_id"] == "sess1"
+
+
+@pytest.mark.parametrize(
+    ("model_config", "source"),
+    [
+        ({"_branched_from": "sess1"}, "discord"),
+        ({"_delegate_from": "sess1"}, "discord"),
+        ({}, "tool"),
+    ],
+)
+def test_non_continuation_child_does_not_mark_rotation_complete(
+    db: SessionDB,
+    model_config: dict[str, str],
+    source: str,
+) -> None:
+    db.create_session("sess1", source="discord")
+    assert db.try_acquire_compression_lock("sess1", "crashed-holder") is True
+    db.end_session("sess1", "compression")
+    db.create_session(
+        "unrelated-child",
+        source=source,
+        model_config=model_config,
+        parent_session_id="sess1",
+    )
+    db.release_compression_lock("sess1", "crashed-holder")
+
+    assert db.try_acquire_compression_lock("sess1", "recovery") is True
+
+
+def test_expired_incomplete_rotation_is_recoverable(
+    db: SessionDB,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_state
+
+    db.create_session("sess1", source="discord")
+    monkeypatch.setattr(hermes_state.time, "time", lambda: 1000.0)
+    assert db.try_acquire_compression_lock(
+        "sess1", "crashed-holder", ttl_seconds=1.0
+    ) is True
+    db.end_session("sess1", "compression")
+
+    monkeypatch.setattr(hermes_state.time, "time", lambda: 1002.0)
+    assert db.try_acquire_compression_lock(
+        "sess1", "recovery", ttl_seconds=10.0
+    ) is True
+    assert db.complete_compression_rotation(
+        parent_session_id="sess1",
+        child_session_id="recovered-child",
+        holder="recovery",
+        source="discord",
+    ) is True
+
+    child = db.get_session("recovered-child")
+    assert child is not None
+    assert child["parent_session_id"] == "sess1"
+
+
+def test_expired_holder_is_fenced_after_concurrent_reclaim(
+    db: SessionDB,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_state
+
+    db.create_session("sess1", source="discord")
+    monkeypatch.setattr(hermes_state.time, "time", lambda: 1000.0)
+    assert db.try_acquire_compression_lock(
+        "sess1", "expired-holder", ttl_seconds=1.0
+    ) is True
+
+    monkeypatch.setattr(hermes_state.time, "time", lambda: 1002.0)
+    assert db.try_acquire_compression_lock(
+        "sess1", "new-holder", ttl_seconds=10.0
+    ) is True
+    assert db.complete_compression_rotation(
+        parent_session_id="sess1",
+        child_session_id="stale-child",
+        holder="expired-holder",
+        source="discord",
+    ) is False
+    assert db.complete_compression_rotation(
+        parent_session_id="sess1",
+        child_session_id="winner-child",
+        holder="new-holder",
+        source="discord",
+    ) is True
+
+    assert db.get_session("stale-child") is None
+    winner = db.get_session("winner-child")
+    assert winner is not None
+    assert winner["parent_session_id"] == "sess1"
 
 
 def test_release_with_wrong_holder_is_noop(db: SessionDB) -> None:

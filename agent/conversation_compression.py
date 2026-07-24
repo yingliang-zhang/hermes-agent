@@ -1414,8 +1414,9 @@ def compress_context(
             except Exception:
                 existing = None
             logger.warning(
-                "compression skipped: another path is compressing session=%s "
-                "(holder=%s) — returning messages unchanged to avoid session fork",
+                "compression skipped: lock unavailable, held, or session already "
+                "rotated for session=%s (holder=%s) — returning messages "
+                "unchanged to avoid session fork",
                 _lock_sid, existing,
             )
             _lock_holder = None  # don't release a lock we don't own
@@ -1429,9 +1430,9 @@ def compress_context(
                 agent._last_compression_lock_warning_sid = _lock_sid
                 try:
                     agent._emit_warning(
-                        "⚠ Skipping concurrent compression — another path "
-                        "is already compressing this session. Will retry "
-                        "after it finishes."
+                        "⚠ Skipping compression — another path is compressing "
+                        "or has already rotated this session. Keeping messages "
+                        "unchanged for this attempt."
                     )
                 except Exception:
                     pass
@@ -1851,7 +1852,7 @@ def compress_context(
                     # diff) to re-baseline transcript handling.
                     compacted_in_place = True
                 else:
-                    # ── Rotation (legacy): end this session, fork a continuation ─
+                    # ── Rotation: end this session, fork a continuation ───────
                     # Flush any un-persisted current-turn messages to the OLD
                     # session before ending it, so they survive in the preserved
                     # parent transcript (#47202). (In-place skips this — see above.)
@@ -1880,81 +1881,99 @@ def compress_context(
                         )
                     except Exception:
                         pass  # best-effort — don't block compression on a flush error
-                    # Propagate title to the new session with auto-numbering
+                    # Propagate title to the new session with auto-numbering.
                     old_title = agent._session_db.get_session_title(agent.session_id)
-                    agent._session_db.end_session(agent.session_id, "compression")
                     old_session_id = agent.session_id
-                    agent.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-                    # Ordering contract: the agent thread updates the contextvar here;
-                    # the gateway propagates to SessionEntry after run_in_executor returns.
+                    new_session_id = (
+                        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+                        f"{uuid.uuid4().hex[:6]}"
+                    )
+                    source = agent.platform or os.environ.get(
+                        "HERMES_SESSION_SOURCE", "cli"
+                    )
+                    agent._session_db_created = False
+                    complete_rotation = getattr(
+                        agent._session_db, "complete_compression_rotation", None
+                    )
+                    if _lock_holder is not None and callable(complete_rotation):
+                        try:
+                            completed = complete_rotation(
+                                parent_session_id=old_session_id,
+                                child_session_id=new_session_id,
+                                holder=_lock_holder,
+                                source=source,
+                                model=agent.model,
+                                model_config=agent._session_init_model_config,
+                            )
+                            if not completed:
+                                raise RuntimeError(
+                                    "compression rotation lease was lost or a "
+                                    "continuation already exists"
+                                )
+                        except Exception as _rotation_err:
+                            logger.warning(
+                                "Atomic compression rotation failed (%s) — "
+                                "continuing on parent session %s.",
+                                _rotation_err,
+                                old_session_id,
+                            )
+                            # The transaction did not commit, so the parent is
+                            # still live. Clear the boundary marker without
+                            # reopening it: another valid continuation may have
+                            # won after this holder lost its lease.
+                            old_session_id = None
+                            agent._session_db_created = True
+                            raise
+                    else:
+                        # Compatibility for a live SessionDB instance loaded
+                        # before the atomic API existed. The durable-completion
+                        # predicate still requires a child, so a crash between
+                        # these writes remains reclaimable after lease expiry.
+                        try:
+                            agent._session_db.end_session(
+                                old_session_id, "compression"
+                            )
+                            agent._session_db.create_session(
+                                session_id=new_session_id,
+                                source=source,
+                                model=agent.model,
+                                model_config=agent._session_init_model_config,
+                                parent_session_id=old_session_id,
+                            )
+                        except Exception as _cs_err:
+                            logger.warning(
+                                "Compression child session create failed (%s) — "
+                                "rolling back to parent session %s to avoid an orphan.",
+                                _cs_err,
+                                old_session_id,
+                            )
+                            # Legacy rotation ended the parent in a separate
+                            # transaction; reopen only this compatibility path.
+                            try:
+                                agent._session_db.reopen_session(old_session_id)
+                            except Exception:
+                                pass
+                            old_session_id = None  # no rotation happened
+                            agent._session_db_created = True
+                            raise
+
+                    agent.session_id = new_session_id
+                    # Ordering contract: publish the new id only after the
+                    # parent-end + child-create transaction commits. The gateway
+                    # propagates to SessionEntry after run_in_executor returns.
                     try:
                         from gateway.session_context import set_current_session_id
 
                         set_current_session_id(agent.session_id)
                     except Exception:
                         os.environ["HERMES_SESSION_ID"] = agent.session_id
-                    # The gateway/tools session context (ContextVar + env) and the
-                    # logging session context are SEPARATE mechanisms. The call above
-                    # moves the former; the ``[session_id]`` tag on log lines comes
-                    # from ``hermes_logging._session_context`` (set once per turn in
-                    # conversation_loop.py). Without this, post-rotation log lines in
-                    # the same turn keep the STALE old id while the message/DB/gateway
-                    # state carry the new one — breaking log correlation exactly at the
-                    # compaction boundary (see #34089). Guarded separately so a logging
-                    # failure can never regress the routing update above.
+                    # Gateway/tools routing and logging use separate contexts.
                     try:
                         from hermes_logging import set_session_context
 
                         set_session_context(agent.session_id)
                     except Exception:
                         pass
-                    agent._session_db_created = False
-                    try:
-                        agent._session_db.create_session(
-                            session_id=agent.session_id,
-                            source=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
-                            model=agent.model,
-                            model_config=agent._session_init_model_config,
-                            parent_session_id=old_session_id,
-                        )
-                    except Exception as _cs_err:
-                        # The child row could not be created (e.g. FK constraint,
-                        # contended write). Previously the outer handler simply
-                        # warned and let the agent continue on the NEW id — which
-                        # has no row in state.db, producing an orphan: the parent
-                        # is ended, the child is never indexed, and every
-                        # subsequent message is attributed to a session that
-                        # doesn't exist (#33906/#33907). Roll the live id back to
-                        # the parent so the conversation stays attached to a real,
-                        # indexed session instead of a phantom.
-                        logger.warning(
-                            "Compression child session create failed (%s) — "
-                            "rolling back to parent session %s to avoid an orphan.",
-                            _cs_err, old_session_id,
-                        )
-                        agent.session_id = old_session_id
-                        try:
-                            from gateway.session_context import set_current_session_id
-                            set_current_session_id(agent.session_id)
-                        except Exception:
-                            os.environ["HERMES_SESSION_ID"] = agent.session_id
-                        try:
-                            from hermes_logging import set_session_context
-                            set_session_context(agent.session_id)
-                        except Exception:
-                            pass
-                        # Re-open the parent: it was ended above, but we're
-                        # continuing on it, so it must not stay closed.
-                        try:
-                            agent._session_db.reopen_session(old_session_id)
-                        except Exception:
-                            pass
-                        old_session_id = None  # no rotation happened
-                        # The parent row already exists in state.db, so mark the
-                        # session as created — _ensure_db_session would otherwise
-                        # retry a (harmless INSERT OR IGNORE) create next turn.
-                        agent._session_db_created = True
-                        raise
                     agent._session_db_created = True
                     split_status = "rotated_committed"
                     # Carry a persistent /goal onto the continuation session.
