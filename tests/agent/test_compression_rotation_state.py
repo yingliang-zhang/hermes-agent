@@ -968,6 +968,34 @@ class TestTodoSnapshotScaffoldingTails:
             for previous, current in zip(compressed, compressed[1:])
         )
 
+    def test_snapshot_merge_preserves_real_user_metadata(self, tmp_path: Path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        agent = self._agent_with_todo(
+            db,
+            "PARENT_TODO_METADATA",
+            {
+                "role": "user",
+                "content": "keep this request",
+                "_source_message_id": "human-message-1",
+                "timestamp": 1234.5,
+            },
+        )
+
+        compressed, _ = agent._compress_context(
+            _msgs(), "sys", approx_tokens=120_000
+        )
+
+        tail = compressed[-1]
+        assert tail["role"] == "user"
+        assert tail["_source_message_id"] == "human-message-1"
+        assert tail["timestamp"] == 1234.5
+        assert "keep this request" in tail["content"]
+        assert "task A" in tail["content"]
+        assert not any(
+            previous.get("role") == current.get("role") == "user"
+            for previous, current in zip(compressed, compressed[1:])
+        )
+
     def test_empty_todo_store_injects_nothing(self, tmp_path: Path):
         from tools.todo_tool import TODO_INJECTION_HEADER
 
