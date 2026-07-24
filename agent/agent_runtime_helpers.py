@@ -2076,10 +2076,30 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     _snapshot["_credential_pool"] = getattr(agent, "_credential_pool", _MISSING)
 
     try:
-        # Clear the per-config context_length override so the new model's
-        # actual context window is resolved via get_model_context_length()
-        # instead of inheriting the stale value from the previous model.
-        agent._config_context_length = None
+        # Re-read model.context_length from config so the endpoint-level
+        # context_length override survives model switches. The previous code
+        # cleared this to None, but model.context_length is a global setting
+        # (endpoint capacity), not a per-model attribute — clearing it causes
+        # get_model_context_length() to fall through to hardcoded catalog
+        # defaults, ignoring the user's explicit config. See #41944.
+        try:
+            from hermes_cli.config import load_config
+
+            _sm_model_cfg = load_config().get("model")
+            _sm_cfg_ctx = (
+                _sm_model_cfg.get("context_length")
+                if isinstance(_sm_model_cfg, dict)
+                else None
+            )
+            try:
+                _sm_cfg_ctx = int(_sm_cfg_ctx) if _sm_cfg_ctx is not None else None
+            except (TypeError, ValueError):
+                _sm_cfg_ctx = None
+            agent._config_context_length = (
+                _sm_cfg_ctx if _sm_cfg_ctx is not None and _sm_cfg_ctx > 0 else None
+            )
+        except Exception:
+            agent._config_context_length = None
 
         # ── Swap core runtime fields ──
         agent.model = new_model
@@ -2291,7 +2311,63 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             config_context_length=getattr(agent, "_config_context_length", None),
             custom_providers=_sm_custom_providers,
         )
-        agent.context_compressor.update_model(
+
+        # Resolve every model from the immutable session baseline before
+        # update_model() derives live threshold and tail budgets. In particular,
+        # switching away from an autoraised Codex route must not treat 0.85 as
+        # the user's configured value.
+        from agent.context_compressor import ContextCompressor
+        _sm_compressor = agent.context_compressor
+        if isinstance(_sm_compressor, ContextCompressor):
+            _sm_threshold_baseline = getattr(
+                agent, "_compression_global_threshold", None,
+            )
+            if _sm_threshold_baseline is None:
+                # Compatibility for direct ``AIAgent.__new__`` callers: recover
+                # the global config value, never the compressor's potentially
+                # autoraised 0.85. Real agents always capture this during init.
+                try:
+                    from hermes_cli.config import load_config
+
+                    _sm_cfg = load_config()
+                    _sm_compression_cfg = _sm_cfg.get("compression", {})
+                except Exception:
+                    _sm_compression_cfg = {}
+                if not isinstance(_sm_compression_cfg, dict):
+                    _sm_compression_cfg = {}
+                _sm_threshold_baseline = float(
+                    _sm_compression_cfg.get("threshold", 0.50)
+                )
+                agent._compression_global_threshold = _sm_threshold_baseline
+            _sm_effective_threshold = _sm_threshold_baseline
+            try:
+                from agent.agent_init import _resolve_model_compression_threshold
+
+                _sm_effective_threshold, _ = (
+                    _resolve_model_compression_threshold(
+                        _sm_threshold_baseline,
+                        model=agent.model,
+                        provider=agent.provider,
+                        allow_codex_gpt55_autoraise=getattr(
+                            agent, "_codex_gpt55_autoraise", True,
+                        ),
+                        api_mode=agent.api_mode,
+                        context_length=new_context_length,
+                    )
+                )
+            except Exception:
+                logger.debug(
+                    "compression threshold resolution skipped on switch_model",
+                    exc_info=True,
+                )
+            _sm_compressor._configured_threshold_percent = _sm_effective_threshold
+            # update_model() derives its base threshold from this field. Keep
+            # it synchronized with the resolved model threshold so the
+            # effective Codex autoraise is applied for this switch and a later
+            # non-Codex switch starts from the immutable session baseline.
+            _sm_compressor._config_threshold_percent = _sm_effective_threshold
+
+        _sm_compressor.update_model(
             model=agent.model,
             context_length=new_context_length,
             base_url=agent.base_url,

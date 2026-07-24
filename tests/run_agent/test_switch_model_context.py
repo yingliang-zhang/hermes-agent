@@ -115,7 +115,9 @@ def _make_direct_start_agent(
         )
 
 
-def _make_agent_with_compressor(config_context_length=None) -> AIAgent:
+def _make_agent_with_compressor(
+    config_context_length=None, global_threshold=0.50,
+) -> AIAgent:
     """Build a minimal AIAgent with a context_compressor, skipping __init__."""
     agent = AIAgent.__new__(AIAgent)
 
@@ -128,13 +130,14 @@ def _make_agent_with_compressor(config_context_length=None) -> AIAgent:
     agent.client = MagicMock()
     agent.quiet_mode = True
 
-    # Store the initial config_context_length override used at agent construction.
+    # Store session-static config used by model switches.
     agent._config_context_length = config_context_length
+    agent._compression_global_threshold = global_threshold
+    agent._codex_gpt55_autoraise = True
 
-    # Context compressor with primary model values
     compressor = ContextCompressor(
         model="primary-model",
-        threshold_percent=0.50,
+        threshold_percent=global_threshold,
         base_url="https://openrouter.ai/api/v1",
         api_key="sk-primary",
         provider="openrouter",
@@ -142,20 +145,76 @@ def _make_agent_with_compressor(config_context_length=None) -> AIAgent:
         config_context_length=config_context_length,
     )
     agent.context_compressor = compressor
-
-    # For switch_model
     agent._primary_runtime = {}
-
     return agent
 
 
+def _make_initialized_agent(
+    *,
+    model: str,
+    provider: str,
+    api_mode: str,
+    context_length: int,
+    threshold: float | None,
+    autoraise: bool = True,
+) -> AIAgent:
+    compression = {
+        "enabled": True,
+        "codex_gpt55_autoraise": autoraise,
+    }
+    if threshold is not None:
+        compression["threshold"] = threshold
+    config = {"agent": {}, "compression": compression}
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=config),
+        patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=context_length,
+        ),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            model=model,
+            provider=provider,
+            api_mode=api_mode,
+            api_key="test-key-1234567890",
+            base_url="https://example.invalid/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    agent._create_openai_client = MagicMock(return_value=MagicMock())
+    return agent
+
+
+@pytest.mark.parametrize(
+    ("configured_context_length", "expected_context_length"),
+    [(32_768, 32_768), ("131072", 131_072)],
+    ids=("integer", "quoted-numeric"),
+)
+@patch("hermes_cli.config.load_config")
 @patch("agent.model_metadata.get_model_context_length", return_value=131_072)
-def test_switch_model_clears_previous_config_context_length(mock_ctx_len):
-    """Switching models must not reuse the previous model.context_length override."""
-    agent = _make_agent_with_compressor(config_context_length=32_768)
+def test_switch_model_preserves_config_context_length(
+    mock_ctx_len,
+    mock_load_cfg,
+    configured_context_length,
+    expected_context_length,
+):
+    """Switching models must preserve valid model.context_length values."""
+    mock_load_cfg.return_value = {
+        "model": {"context_length": configured_context_length}
+    }
+
+    agent = _make_agent_with_compressor(
+        config_context_length=expected_context_length
+    )
 
     assert agent.context_compressor.model == "primary-model"
-    assert agent.context_compressor.context_length == 32_768  # From config override
+    assert agent.context_compressor.context_length == expected_context_length
 
     # Switch model
     agent.switch_model("new-model", "openrouter", api_key="sk-new", base_url="https://openrouter.ai/api/v1")
@@ -163,15 +222,47 @@ def test_switch_model_clears_previous_config_context_length(mock_ctx_len):
     # Verify the old config override is not passed to the new model.
     mock_ctx_len.assert_called_once()
     call_kwargs = mock_ctx_len.call_args.kwargs
-    assert call_kwargs.get("config_context_length") is None
-
-    # Verify compressor was updated from the newly resolved model metadata.
+    assert call_kwargs.get("config_context_length") == expected_context_length
     assert agent.context_compressor.model == "new-model"
     assert agent.context_compressor.context_length == 131_072
 
 
-def test_switch_model_without_config_context_length():
-    """When switching models without config override, config_context_length should be None."""
+@pytest.mark.parametrize(
+    "configured_context_length",
+    ["256K", 0, -1],
+    ids=("non-numeric", "zero", "negative"),
+)
+@patch("hermes_cli.config.load_config")
+@patch("agent.model_metadata.get_model_context_length", return_value=128_000)
+def test_switch_model_rejects_invalid_config_context_length(
+    mock_ctx_len,
+    mock_load_cfg,
+    configured_context_length,
+):
+    """Invalid, non-positive, and boolean overrides fall back safely."""
+    mock_load_cfg.return_value = {
+        "model": {"context_length": configured_context_length}
+    }
+    agent = _make_agent_with_compressor(config_context_length=32_768)
+
+    agent.switch_model(
+        "new-model",
+        "openrouter",
+        api_key="sk-new",
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    assert agent._config_context_length is None
+    mock_ctx_len.assert_called_once()
+    assert mock_ctx_len.call_args.kwargs.get("config_context_length") is None
+    assert agent.context_compressor.context_length == 128_000
+
+
+@patch("hermes_cli.config.load_config")
+@patch("agent.model_metadata.get_model_context_length", return_value=128_000)
+def test_switch_model_without_config_context_length(mock_ctx_len, mock_load_cfg):
+    """A switch without a configured context override resolves normally."""
+    mock_load_cfg.return_value = {"model": {}}
     agent = _make_agent_with_compressor(config_context_length=None)
 
     with patch("agent.model_metadata.get_model_context_length", return_value=128_000) as mock_ctx_len:
@@ -1020,3 +1111,130 @@ def test_direct_start_runtime_first_provider_names_require_explicit_custom_prefi
             base_url=base_url,
         )
         assert custom_agent.context_compressor.config_context_length == 1_048_576
+
+
+@pytest.mark.parametrize(
+    ("configured_threshold", "expected_baseline"),
+    [(0.42, 0.42), (None, 0.50)],
+)
+@patch("agent.model_metadata.get_model_context_length", return_value=1_050_000)
+def test_initialized_codex_switch_restores_preserved_baseline(
+    mock_ctx_len, configured_threshold, expected_baseline,
+):
+    agent = _make_initialized_agent(
+        model="gpt-5.6-sol",
+        provider="openai-codex",
+        api_mode="codex_responses",
+        context_length=372_000,
+        threshold=configured_threshold,
+    )
+
+    assert agent._compression_global_threshold == expected_baseline
+    assert agent.context_compressor._configured_threshold_percent == 0.85
+    assert agent.context_compressor.threshold_percent == 0.85
+
+    agent.switch_model(
+        "glm-5.2-heavy",
+        "custom",
+        api_key="test-key-1234567890",
+        base_url="https://example.invalid/v1",
+        api_mode="chat_completions",
+    )
+
+    assert agent._compression_global_threshold == expected_baseline
+    assert (
+        agent.context_compressor._configured_threshold_percent
+        == expected_baseline
+    )
+    assert agent.context_compressor.threshold_percent == expected_baseline
+    assert agent.context_compressor.threshold_tokens == int(
+        1_050_000 * expected_baseline
+    )
+    mock_ctx_len.assert_called_once()
+
+
+@patch("agent.model_metadata.get_model_context_length", return_value=372_000)
+def test_initialized_agent_switch_honors_codex_autoraise_opt_out(mock_ctx_len):
+    agent = _make_initialized_agent(
+        model="glm-5.2-heavy",
+        provider="custom",
+        api_mode="chat_completions",
+        context_length=1_050_000,
+        threshold=0.42,
+        autoraise=False,
+    )
+
+    agent.switch_model(
+        "gpt-5.6-sol",
+        "custom",
+        api_key="test-key-1234567890",
+        base_url="https://example.invalid/v1",
+        api_mode="codex_responses",
+    )
+
+    assert agent._compression_global_threshold == 0.42
+    assert agent.context_compressor._configured_threshold_percent == 0.42
+    assert agent.context_compressor.threshold_percent == 0.75
+    assert agent.context_compressor.threshold_tokens == int(372_000 * 0.75)
+    mock_ctx_len.assert_called_once()
+
+
+@pytest.mark.parametrize("codex_context_length", [272_000, 372_000])
+@patch("agent.model_metadata.get_model_context_length")
+def test_switch_model_threshold_round_trip(mock_ctx_len, codex_context_length):
+    """A bounded custom Codex route raises, then restores the 0.42 baseline."""
+    mock_ctx_len.side_effect = [codex_context_length, 1_050_000]
+    agent = _make_agent_with_compressor(
+        config_context_length=None, global_threshold=0.42,
+    )
+
+    agent.switch_model(
+        "gpt-5.6-sol",
+        "custom",
+        api_key="sk-sudo",
+        base_url="https://coding.sudoai.cc/v1",
+        api_mode="codex_responses",
+    )
+
+    assert agent._compression_global_threshold == 0.42
+    assert agent.context_compressor._configured_threshold_percent == 0.85
+    assert agent.context_compressor.threshold_percent == 0.85
+    assert agent.context_compressor.threshold_tokens == int(codex_context_length * 0.85)
+
+    agent.switch_model(
+        "glm-5.2-heavy",
+        "custom",
+        api_key="sk-sudo",
+        base_url="https://coding.sudoai.cc/v1",
+        api_mode="chat_completions",
+    )
+
+    assert agent.context_compressor.context_length == 1_050_000
+    assert agent.context_compressor._configured_threshold_percent == 0.42
+    assert agent.context_compressor.threshold_percent == 0.42
+    assert agent.context_compressor.threshold_tokens == int(1_050_000 * 0.42)
+    assert mock_ctx_len.call_count == 2
+
+
+@pytest.mark.parametrize("codex_context_length", [272_000, 372_000])
+@patch("agent.model_metadata.get_model_context_length")
+def test_switch_model_codex_autoraise_respects_opt_out(mock_ctx_len, codex_context_length):
+    mock_ctx_len.return_value = codex_context_length
+    agent = _make_agent_with_compressor(
+        config_context_length=None, global_threshold=0.75,
+    )
+    agent._compression_global_threshold = 0.75
+    agent._codex_gpt55_autoraise = False
+
+    agent.switch_model(
+        "gpt-5.6-sol",
+        "custom",
+        api_key="sk-sudo",
+        base_url="https://coding.sudoai.cc/v1",
+        api_mode="codex_responses",
+    )
+
+    assert agent.context_compressor._configured_threshold_percent == 0.75
+    assert agent.context_compressor.threshold_percent == 0.75
+    assert agent.context_compressor.threshold_tokens == int(codex_context_length * 0.75)
+    mock_ctx_len.assert_called_once()
