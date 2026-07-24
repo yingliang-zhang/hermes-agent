@@ -458,6 +458,35 @@ class TestExtractCacheBustingConfig:
             "gateway's cached agent so the new threshold takes effect."
         )
 
+    def test_max_tail_message_floor_change_invalidates_cache(self):
+        """Changed floor rebuilds the agent; unchanged floor preserves reuse."""
+        from gateway.run import GatewayRunner
+
+        runner = _make_runner()
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+
+        def signature(floor):
+            config = {"compression": {"max_tail_message_floor": floor}}
+            return GatewayRunner._agent_config_signature(
+                "m",
+                runtime,
+                [],
+                "",
+                cache_keys=GatewayRunner._extract_cache_busting_config(config),
+            )
+
+        cached_agent = object()
+        cached_signature = signature(8)
+        runner._agent_cache["telegram:12345"] = (cached_agent, cached_signature)
+
+        unchanged_signature = signature(8)
+        cached = runner._agent_cache["telegram:12345"]
+        assert cached[1] == unchanged_signature
+        assert cached[0] is cached_agent
+
+        changed_signature = signature(20)
+        assert cached[1] != changed_signature
+
 
 class TestAgentCacheLifecycle:
     """End-to-end cache behavior with real AIAgent construction."""

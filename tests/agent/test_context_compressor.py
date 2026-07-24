@@ -97,6 +97,21 @@ class TestShouldCompress:
         assert compressor.should_compress(prompt_tokens=90000) is True
         assert compressor.should_compress(prompt_tokens=50000) is False
 
+    def test_force_bypasses_active_summary_failure_cooldown(self, compressor):
+        compressor._summary_failure_cooldown_until = time.monotonic() + 60
+
+        assert compressor.should_compress(prompt_tokens=90_000) is False
+        assert compressor.should_compress(prompt_tokens=90_000, force=True) is True
+
+    def test_force_bypasses_ineffective_compaction_breaker(self, compressor):
+        compressor._ineffective_compression_count = 2
+
+        assert compressor.should_compress(prompt_tokens=90_000) is False
+        assert compressor.should_compress(prompt_tokens=90_000, force=True) is True
+
+    def test_force_does_not_bypass_token_threshold(self, compressor):
+        assert compressor.should_compress(prompt_tokens=50_000, force=True) is False
+
 
 
 class TestUpdateFromResponse:
@@ -162,6 +177,36 @@ class TestPreflightDeferral:
         # Stale-high real prompt with the flag cleared => the >= threshold
         # short-circuit applies => no deferral.
         assert compressor.should_defer_preflight_to_real_usage(95_000) is False
+
+
+class TestHygieneHardMessageLimit:
+    """Tests for the hard message-count safety valve (#2153/#4750 parity
+    for the TUI/CLI preflight path)."""
+
+    def test_defaults_to_disabled(self, compressor):
+        assert compressor.hygiene_hard_message_limit == 0
+
+    def test_set_via_constructor(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=2,
+                protect_last_n=2,
+                quiet_mode=True,
+                hygiene_hard_message_limit=400,
+            )
+        assert c.hygiene_hard_message_limit == 400
+
+    def test_zero_disables(self):
+        """0 means disabled — only token-based triggers apply."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test/model",
+                quiet_mode=True,
+                hygiene_hard_message_limit=0,
+            )
+        assert c.hygiene_hard_message_limit == 0
 
 
 
@@ -2826,6 +2871,37 @@ class TestTokenBudgetTailProtection:
         assert len(messages) - cut >= 8
         assert messages[cut]["content"] == "middle answer 2"
         assert messages[-1]["content"] == "latest ask"
+
+    def test_configurable_max_tail_message_floor(self):
+        """max_tail_message_floor raises the tail floor above the default 8.
+
+        With max_tail_message_floor=20 and protect_last_n=20, the tail floor
+        should be 20 (not capped at 8), keeping more recent messages verbatim.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.50,
+                protect_first_n=1,
+                protect_last_n=20,
+                max_tail_message_floor=20,
+                quiet_mode=True,
+            )
+        c.tail_token_budget = 10  # tiny budget → floor is the binding constraint
+        messages = [{"role": "system", "content": "sys"}]
+        for i in range(30):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({"role": role, "content": f"msg {i}"})
+        cut = c._find_tail_cut_by_tokens(messages, head_end=1)
+        tail_size = len(messages) - cut
+        # Floor should be min(protect_last_n=20, max_tail_message_floor=20) = 20
+        assert tail_size >= 20, f"Expected ≥20 tail messages with floor=20, got {tail_size}"
+
+    def test_max_tail_message_floor_default_is_8(self, budget_compressor):
+        """When max_tail_message_floor=0 (default), the cap falls back to 8."""
+        c = budget_compressor
+        assert c.max_tail_message_floor == 0
+        assert c._effective_max_tail_message_floor == 8  # module default
 
     def test_soft_ceiling_allows_oversized_message(self, budget_compressor):
         """The 1.5x soft ceiling allows an oversized message to be included

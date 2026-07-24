@@ -481,3 +481,78 @@ def test_expired_cooldown_allows_preflight(tmp_path):
     assert isinstance(ctx, TurnContext)
     agent._emit_status.assert_called_once()
     agent._compress_context.assert_called()
+
+
+def test_configured_hard_limit_preserves_cooldown_below_breach(tmp_path):
+    agent = _make_agent_with_cooldown(
+        tmp_path / "state.db",
+        "sess-1",
+        cooldown_until=4_000_000_000.0,
+    )
+    agent.context_compressor.hygiene_hard_message_limit = 10
+    history = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"message {i}"}
+        for i in range(4)
+    ]
+
+    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
+        ctx = _build(agent, conversation_history=history)
+
+    assert isinstance(ctx, TurnContext)
+    agent._emit_status.assert_not_called()
+    agent._compress_context.assert_not_called()
+
+
+def test_hard_message_limit_bypasses_persisted_cooldown_once(tmp_path):
+    agent = _make_agent_with_cooldown(
+        tmp_path / "state.db",
+        "sess-1",
+        cooldown_until=4_000_000_000.0,
+    )
+    agent.context_compressor.hygiene_hard_message_limit = 1
+
+    with patch("agent.turn_context._should_run_preflight_estimate", return_value=False), \
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=1_000):
+        ctx = _build(agent)
+
+    assert isinstance(ctx, TurnContext)
+    agent._emit_status.assert_called_once()
+    agent._compress_context.assert_called_once()
+    assert agent._compress_context.call_args.kwargs["force"] is True
+
+
+def test_hard_message_limit_bypasses_ineffective_compaction_breaker_once(tmp_path):
+    agent = _make_agent_with_cooldown(tmp_path / "state.db", "sess-1")
+    agent.context_compressor.hygiene_hard_message_limit = 1
+    agent.context_compressor._ineffective_compression_count = 2
+
+    with patch("agent.turn_context._should_run_preflight_estimate", return_value=False), \
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=1_000):
+        ctx = _build(agent)
+
+    assert isinstance(ctx, TurnContext)
+    agent._emit_status.assert_called_once()
+    agent._compress_context.assert_called_once()
+    assert agent._compress_context.call_args.kwargs["force"] is True
+
+
+def test_hard_message_limit_bypasses_deferral_and_token_threshold(tmp_path):
+    agent = _make_agent_with_cooldown(tmp_path / "state.db", "sess-1")
+    agent.context_compressor.hygiene_hard_message_limit = 5
+    agent.context_compressor.awaiting_real_usage_after_compression = True
+    history = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"message {i}"}
+        for i in range(4)
+    ]
+    preflight_gate = MagicMock(return_value=False)
+
+    with patch("agent.turn_context._should_run_preflight_estimate", preflight_gate), \
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=1_000):
+        ctx = _build(agent, conversation_history=history)
+
+    assert isinstance(ctx, TurnContext)
+    preflight_gate.assert_not_called()
+    agent._emit_status.assert_called_once()
+    agent._compress_context.assert_called_once()
+    assert agent._compress_context.call_args.kwargs["force"] is True

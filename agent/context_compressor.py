@@ -559,11 +559,13 @@ _AUTO_FOCUS_MAX_TURNS = 3
 _AUTO_FOCUS_TURN_MAX_CHARS = 260
 _AUTO_FOCUS_MAX_CHARS = 700
 _ACTIVE_TASK_MAX_CHARS = 1400
-# Keep a short run of recent messages verbatim even when the token budget is
-# already exhausted.  The public ``protect_last_n`` default is intentionally
-# high for small/light tails, but using all 20 as a hard floor here would bring
-# back the old large-tool-output case where nothing can be compacted.
-_MAX_TAIL_MESSAGE_FLOOR = 8
+
+# Default cap for the compaction tail message floor.  ``protect_last_n`` is
+# honored up to this cap; the cap avoids preserving a whole run of bulky
+# tool outputs on every compaction.  Overridable via
+# ``compression.max_tail_message_floor`` in config.yaml (#45259 hardened the
+# floor from 3 to ``min(protect_last_n, 8)``; this makes the 8 configurable).
+_DEFAULT_MAX_TAIL_MESSAGE_FLOOR = 8
 # Under context pressure (protected-tail tool bodies alone exceed the soft
 # tail budget), demote large completed tool/file outputs even inside the
 # protected region — but always keep this many trailing messages verbatim so
@@ -1874,7 +1876,9 @@ class ContextCompressor(ContextEngine):
         proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096,
         min_tail_user_messages: int = 1,
-    ):
+        hygiene_hard_message_limit: int = 0,
+        max_tail_message_floor: int = 0,
+    ) -> None:
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
@@ -1943,6 +1947,18 @@ class ContextCompressor(ContextEngine):
         # When False (default = historical behavior), insert a
         # deterministic "summary unavailable" handoff and drop the middle window.
         self.abort_on_summary_failure = abort_on_summary_failure
+        # Hard message-count safety valve: trigger automatic compression at
+        # this count regardless of token estimates or ordinary automatic
+        # suppression gates. Each entrypoint bounds its own recovery attempts.
+        # Mirrors gateway hygiene (gateway/run.py, #2153/#4750). 0 = disabled.
+        self.hygiene_hard_message_limit = max(0, int(hygiene_hard_message_limit or 0))
+        # Configurable cap for the tail message floor (see
+        # _find_tail_cut_by_tokens).  0 = use the module-level default
+        # (_DEFAULT_MAX_TAIL_MESSAGE_FLOOR = 8), preserving backward
+        # compatibility.  Set higher (e.g. 20) to keep more recent
+        # messages verbatim during compaction at the cost of a smaller
+        # summarization window when tool outputs are bulky.
+        self.max_tail_message_floor = max(0, int(max_tail_message_floor or 0))
 
         self.context_length = get_model_context_length(
             model, base_url=base_url, api_key=api_key,
@@ -2179,7 +2195,12 @@ class ContextCompressor(ContextEngine):
         self.last_rough_tokens_when_real_prompt_fit = max(baseline, rough_tokens)
         return True
 
-    def should_compress(self, prompt_tokens: int = None) -> bool:
+    def should_compress(
+        self,
+        prompt_tokens: int = None,
+        *,
+        force: bool = False,
+    ) -> bool:
         """Check if context exceeds the compression threshold.
 
         Returns ``True`` when compression should run now. For the caller-facing
@@ -2191,11 +2212,11 @@ class ContextCompressor(ContextEngine):
         each saved less than 10%, skip compression to avoid infinite loops
         where each pass removes only 1-2 messages.
         """
-        decision, _reason = self.should_compress_info(prompt_tokens)
+        decision, _reason = self.should_compress_info(prompt_tokens, force=force)
         return decision
 
     def should_compress_info(
-        self, prompt_tokens: int = None
+        self, prompt_tokens: int = None, force: bool = False
     ) -> "tuple[bool, str | None]":
         """Check if context exceeds the compression threshold.
 
@@ -2219,11 +2240,16 @@ class ContextCompressor(ContextEngine):
         Includes anti-thrashing protection: if the last two compressions
         each saved less than 10%, skip compression to avoid infinite loops
         where each pass removes only 1-2 messages.
+
+        When *force* is True (e.g. the hard message-count safety valve
+        triggered), the anti-thrashing check is bypassed — the session
+        is too large to leave uncompressed regardless of recent
+        effectiveness.
         """
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if tokens < self.threshold_tokens:
             return False, None
-        if self._automatic_compression_blocked():
+        if self._automatic_compression_blocked(force=force):
             return False, self._compression_block_reason() or "blocked"
         return True, None
 
@@ -2273,9 +2299,9 @@ class ContextCompressor(ContextEngine):
         except Exception as exc:
             logger.debug("compression ineffective-count refresh failed: %s", exc)
 
-    def _automatic_compression_blocked(self) -> bool:
+    def _automatic_compression_blocked(self, force: bool = False) -> bool:
         """Return whether automatic compaction is in cooldown or tripped."""
-        if not self._automatic_compression_blocked_locally():
+        if not self._automatic_compression_blocked_locally(force=force):
             return False
         # Blocked on the in-memory snapshot. Durable guard rows may have
         # been cleared by another agent since bind_session_state() — a
@@ -2285,9 +2311,9 @@ class ContextCompressor(ContextEngine):
         # local block outlive the durable state that justified it. The
         # unblocked hot path above never pays for the DB reads.
         self._refresh_durable_guards()
-        return self._automatic_compression_blocked_locally()
+        return self._automatic_compression_blocked_locally(force=force)
 
-    def _automatic_compression_blocked_locally(self) -> bool:
+    def _automatic_compression_blocked_locally(self, force: bool = False) -> bool:
         """Evaluate the automatic-compaction gate on in-memory state only."""
         # Do not trigger compression while the summary LLM is in cooldown.
         # On a 429/transient failure _generate_summary() sets a cooldown and
@@ -2307,7 +2333,7 @@ class ContextCompressor(ContextEngine):
                 )
             return True
         # Anti-thrashing: back off if recent compressions were ineffective
-        if (
+        if not force and (
             self._ineffective_compression_count >= 2
             or self._fallback_compression_streak >= 2
         ):
@@ -4294,6 +4320,13 @@ This compaction should PRIORITISE preserving all information related to the focu
                 return 0
         return self.protect_first_n
 
+    @property
+    def _effective_max_tail_message_floor(self) -> int:
+        """Resolved tail-floor cap: config override or module default."""
+        if self.max_tail_message_floor > 0:
+            return self.max_tail_message_floor
+        return _DEFAULT_MAX_TAIL_MESSAGE_FLOOR
+
     def _protect_head_size(self, messages: List[Dict[str, Any]]) -> int:
         """Total count of head messages to protect.
 
@@ -4666,7 +4699,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # ``protect_last_n`` remains a minimum up to the cap; the cap avoids
         # preserving a whole run of bulky tool outputs on every compaction.
         available_tail = max(0, n - head_end - 1)
-        min_tail_floor = max(3, min(self.protect_last_n, _MAX_TAIL_MESSAGE_FLOOR))
+        min_tail_floor = max(3, min(self.protect_last_n, self._effective_max_tail_message_floor))
         # Leave at least two non-head messages available to summarize on short
         # transcripts; otherwise compression can replace a tiny middle with a
         # summary and save no messages at all.
@@ -4826,8 +4859,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                 related to this topic and be more aggressive about compressing
                 everything else.  Inspired by Claude Code's ``/compact``.
             force: If True, clear any active summary-failure cooldown before
-                running so a manual ``/compress`` can retry immediately after
-                an auto-compression abort.  Auto-compress callers pass False.
+                running. Manual ``/compress`` and the bounded hard message-count
+                safety valve use this; ordinary auto-compress callers pass False.
             memory_context: Optional provider-supplied context to preserve in
                 the summary prompt. Whitespace-only values are ignored.
         """

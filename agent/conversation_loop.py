@@ -1496,15 +1496,14 @@ def run_conversation(
         # case. Re-check here against the current request estimate.
         #
         # Mirror the turn-prologue preflight's guard chain exactly (see
-        # turn_context.py): (1) defer when the rough estimate is known-noisy
-        # relative to a recent real provider prompt that fit under threshold
-        # (schema overhead / post-compaction over-count, #36718); (2) skip
-        # while a same-session compression-failure cooldown is active; (3) then
-        # should_compress() — reusing the canonical threshold_tokens (output
-        # room already reserved by _compute_threshold_tokens) and its summary-
-        # LLM cooldown + anti-thrash guards (#11529). compression_attempts is a
-        # hard per-turn backstop shared with the overflow error handlers.
+        # turn_context.py). Ordinary token pressure honors real-usage deferral,
+        # same-session summary-failure cooldown, and anti-thrashing. A configured
+        # hard message-count breach is the last-resort escape hatch and bypasses
+        # those gates. ``compression_attempts`` bounds forced recovery to the
+        # configured per-turn cap shared with the overflow error handlers.
         _compressor = agent.context_compressor
+        _hard_limit = getattr(_compressor, "hygiene_hard_message_limit", 0)
+        _hard_limit_breached = _hard_limit > 0 and len(messages) >= _hard_limit
         _preflight_threshold = int(
             getattr(_compressor, "threshold_tokens", 0) or 0
         )
@@ -1517,7 +1516,8 @@ def run_conversation(
         _previous_preflight_pressure = _last_preflight_pressure
         _last_preflight_pressure = None
         if (
-            _previous_preflight_pressure is not None
+            not _hard_limit_breached
+            and _previous_preflight_pressure is not None
             and request_pressure_tokens >= _preflight_threshold
             and not _compression_warrants_another_preflight_pass(
                 _previous_preflight_pressure,
@@ -1539,18 +1539,34 @@ def run_conversation(
         _defer_preflight = getattr(
             _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
         )
-        _compression_cooldown = getattr(
+        _pre_api_deferred = (
+            False
+            if _hard_limit_breached
+            else _defer_preflight(request_pressure_tokens)
+        )
+        _compression_cooldown = None if _hard_limit_breached else getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
+        _compression_check_tokens = (
+            max(request_pressure_tokens, _compressor.threshold_tokens)
+            if _hard_limit_breached
+            else request_pressure_tokens
+        )
+        _pressure_should_compress = False
         if (
             agent.compression_enabled
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
-            and not _preflight_compression_blocked
-            and not _defer_preflight(request_pressure_tokens)
+            and (_hard_limit_breached or not _preflight_compression_blocked)
+            and not _pre_api_deferred
             and not _compression_cooldown
-            and _compressor.should_compress(request_pressure_tokens)
         ):
+            _pressure_should_compress = (
+                _compressor.should_compress(_compression_check_tokens, force=True)
+                if _hard_limit_breached
+                else _compressor.should_compress(_compression_check_tokens)
+            )
+        if _pressure_should_compress:
             if _moa_prepared_request is not None:
                 pending_moa_prepared_request = _moa_prepared_request
             compression_attempts += 1
@@ -1563,43 +1579,89 @@ def run_conversation(
             _clear_warn = getattr(agent, "_clear_context_overflow_warn", None)
             if callable(_clear_warn):
                 _clear_warn()
-            logger.info(
-                "Pre-API compression: ~%s request tokens >= %s threshold "
-                "(context=%s, attempt=%s/%s)",
-                f"{request_pressure_tokens:,}",
-                f"{int(getattr(_compressor, 'threshold_tokens', 0) or 0):,}",
-                f"{int(getattr(_compressor, 'context_length', 0) or 0):,}"
-                if getattr(_compressor, "context_length", 0) else "unknown",
-                compression_attempts,
-                max_compression_attempts,
-            )
-            _pre_api_status = automatic_compaction_status_message(
-                _compressor,
-                phase="pre_api",
-                default_message=PRE_API_COMPRESSION_STATUS_TEMPLATE.format(
-                    tokens=request_pressure_tokens
-                ),
-                approx_tokens=request_pressure_tokens,
-                threshold_tokens=int(
-                    getattr(_compressor, "threshold_tokens", 0) or 0
-                ),
-                context_length=int(
-                    getattr(_compressor, "context_length", 0) or 0
-                ),
-                model=agent.model,
-                attempt=compression_attempts,
-                max_attempts=max_compression_attempts,
-            )
+            if _hard_limit_breached:
+                logger.info(
+                    "Pre-API compression: hard message limit %d reached "
+                    "(%d messages, ~%s tokens, attempt=%s/%s)",
+                    _hard_limit,
+                    len(messages),
+                    f"{request_pressure_tokens:,}",
+                    compression_attempts,
+                    max_compression_attempts,
+                )
+                _pre_api_status = automatic_compaction_status_message(
+                    _compressor,
+                    phase="pre_api",
+                    default_message=(
+                        f"📦 Pre-API compression: {len(messages)} messages "
+                        f">= hard limit {_hard_limit}. "
+                        "Compacting before the next model call."
+                    ),
+                    approx_tokens=request_pressure_tokens,
+                    threshold_tokens=int(
+                        getattr(_compressor, "threshold_tokens", 0) or 0
+                    ),
+                    context_length=int(
+                        getattr(_compressor, "context_length", 0) or 0
+                    ),
+                    model=agent.model,
+                    attempt=compression_attempts,
+                    max_attempts=max_compression_attempts,
+                )
+            else:
+                logger.info(
+                    "Pre-API compression: ~%s request tokens >= %s threshold "
+                    "(context=%s, attempt=%s/%s)",
+                    f"{request_pressure_tokens:,}",
+                    f"{int(getattr(_compressor, 'threshold_tokens', 0) or 0):,}",
+                    f"{int(getattr(_compressor, 'context_length', 0) or 0):,}"
+                    if getattr(_compressor, "context_length", 0) else "unknown",
+                    compression_attempts,
+                    max_compression_attempts,
+                )
+                _pre_api_status = automatic_compaction_status_message(
+                    _compressor,
+                    phase="pre_api",
+                    default_message=PRE_API_COMPRESSION_STATUS_TEMPLATE.format(
+                        tokens=request_pressure_tokens
+                    ),
+                    approx_tokens=request_pressure_tokens,
+                    threshold_tokens=int(
+                        getattr(_compressor, "threshold_tokens", 0) or 0
+                    ),
+                    context_length=int(
+                        getattr(_compressor, "context_length", 0) or 0
+                    ),
+                    model=agent.model,
+                    attempt=compression_attempts,
+                    max_attempts=max_compression_attempts,
+                )
             if _pre_api_status:
                 agent._emit_status(_pre_api_status)
             _last_preflight_pressure = request_pressure_tokens
             _pre_api_input = messages
-            messages, active_system_prompt = agent._compress_context(
-                messages,
-                system_message,
-                approx_tokens=request_pressure_tokens,
-                task_id=effective_task_id,
-            )
+            _compress_kwargs = {
+                "approx_tokens": request_pressure_tokens,
+                "task_id": effective_task_id,
+            }
+            if _hard_limit_breached:
+                try:
+                    messages, active_system_prompt = agent._compress_context(
+                        messages,
+                        system_message,
+                        force=True,
+                        **_compress_kwargs,
+                    )
+                except TypeError as exc:
+                    if "unexpected keyword argument 'force'" not in str(exc):
+                        raise
+                    messages, active_system_prompt = agent._compress_context(
+                        messages, system_message, **_compress_kwargs
+                    )
+            else:
+                messages, active_system_prompt = agent._compress_context(
+                    messages, system_message, **_compress_kwargs
+                )
             if messages is _pre_api_input and compression_skipped_due_to_lock(agent):
                 # #69870 lock-skip: another path holds this session's
                 # compression lock, so this pass no-oped. That is a temporary

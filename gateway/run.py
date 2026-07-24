@@ -13039,7 +13039,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if _raw_hard_limit is not None:
                             try:
                                 _parsed = int(_raw_hard_limit)
-                                if _parsed > 0:
+                                if _parsed >= 0:
                                     _hyg_hard_msg_limit = _parsed
                             except (TypeError, ValueError):
                                 pass
@@ -13166,7 +13166,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _HARD_MSG_LIMIT = _hyg_hard_msg_limit
                 _needs_compress = (
                     _approx_tokens >= _compress_token_threshold
-                    or _msg_count >= _HARD_MSG_LIMIT
+                    or (
+                        _HARD_MSG_LIMIT > 0
+                        and _msg_count >= _HARD_MSG_LIMIT
+                    )
                 )
 
                 if _needs_compress:
@@ -13268,6 +13271,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,
                                             commit_fence=_hyg_commit_fence,
+                                            force=(
+                                                _HARD_MSG_LIMIT > 0
+                                                and _msg_count >= _HARD_MSG_LIMIT
+                                            ),
                                         ),
                                     )
                                     try:
@@ -18262,6 +18269,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ("compression", "proactive_prune_min_result_chars"),
         ("compression", "proactive_prune_min_reclaim_tokens"),
         ("compression", "min_tail_user_messages"),
+        ("compression", "max_tail_message_floor"),
         ("agent", "disabled_toolsets"),
         ("memory", "provider"),
         ("checkpoints", "enabled"),

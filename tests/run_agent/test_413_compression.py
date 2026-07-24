@@ -6,6 +6,7 @@ Verifies that:
 - Preflight compression proactively compresses oversized sessions before API calls
 """
 
+import time
 import pytest
 #pytestmark = pytest.mark.skip(reason="Hangs in non-interactive environments")
 
@@ -1679,6 +1680,85 @@ class TestToolResultPreflightCompression:
         assert result["completed"] is True
         assert result["final_response"] == "Done after one compression"
         assert mock_compress.call_count == 1
+
+    @pytest.mark.parametrize("max_attempts", [3, 5], ids=["default", "configured"])
+    def test_hard_message_limit_bypasses_suppression_with_bounded_retries(
+        self, agent, max_attempts
+    ):
+        """Count pressure uses the configured per-turn compression cap."""
+        agent.context_compressor.hygiene_hard_message_limit = 3
+        agent.max_compression_attempts = max_attempts
+        agent.context_compressor.threshold_tokens = 500
+        agent.context_compressor._summary_failure_cooldown_until = time.monotonic() + 60
+        agent.context_compressor._ineffective_compression_count = 2
+
+        tc = SimpleNamespace(
+            id="tc1", type="function",
+            function=SimpleNamespace(name="web_search", arguments='{"query":"test"}'),
+        )
+        tool_resp = _mock_response(
+            content=None,
+            finish_reason="stop",
+            tool_calls=[tc],
+            usage={"prompt_tokens": 1_000, "completion_tokens": 10, "total_tokens": 1_010},
+        )
+        ok_resp = _mock_response(
+            content="Done after bounded recovery",
+            finish_reason="stop",
+            usage={"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110},
+        )
+        agent.client.chat.completions.create.side_effect = [tool_resp, ok_resp]
+
+        with (
+            patch("agent.conversation_loop.estimate_request_tokens_rough", return_value=100),
+            patch("run_agent.handle_function_call", return_value="tool result"),
+            patch.object(
+                agent,
+                "_compress_context",
+                side_effect=lambda msgs, *a, **k: (msgs, agent._cached_system_prompt),
+            ) as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert mock_compress.call_count == max_attempts
+        assert all(call.kwargs["force"] is True for call in mock_compress.call_args_list)
+        assert agent.client.chat.completions.create.call_count == 2
+        assert result["completed"] is True
+        assert result["final_response"] == "Done after bounded recovery"
+
+    @pytest.mark.parametrize("auto_mode", ["native", "off"])
+    def test_hard_message_limit_preserves_codex_owned_compaction_policy(
+        self, agent, auto_mode
+    ):
+        """Codex-owned modes skip Hermes preflight and bypass the tool loop."""
+        agent.api_mode = "codex_app_server"
+        agent.codex_app_server_auto_compaction = auto_mode
+        agent.context_compressor.hygiene_hard_message_limit = 1
+        history = [
+            {"role": "user", "content": "previous"},
+            {"role": "assistant", "content": "answer"},
+        ]
+
+        with (
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(
+                agent,
+                "_run_codex_app_server_turn",
+                return_value={"completed": True, "final_response": "codex result"},
+            ) as mock_codex_turn,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=history)
+
+        mock_compress.assert_not_called()
+        mock_codex_turn.assert_called_once()
+        assert result["completed"] is True
+        assert result["final_response"] == "codex result"
 
     def test_anthropic_prompt_too_long_safety_net(self, agent):
         """Anthropic 'prompt is too long' error triggers compression as safety net."""

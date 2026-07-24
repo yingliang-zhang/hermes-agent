@@ -1944,6 +1944,12 @@ def init_agent(
     compression_in_place = is_truthy_value(
         _compression_cfg.get("in_place"), default=False
     )
+    # Configurable cap for the tail message floor (see
+    # _find_tail_cut_by_tokens in context_compressor.py).  0 = use the
+    # module-level default (8), preserving backward compatibility.
+    compression_max_tail_message_floor = int(
+        _compression_cfg.get("max_tail_message_floor", 0) or 0
+    )
     codex_app_server_auto_compaction = str(
         _compression_cfg.get("codex_app_server_auto", "native") or "native"
     ).lower()
@@ -1959,6 +1965,13 @@ def init_agent(
     # complements the size-based threshold above. Consumed by build_turn_context().
     compression_idle_compact_after_seconds = max(
         0, int(_compression_cfg.get("idle_compact_after_seconds", 0))
+    )
+    # Hard message-count safety valve (mirrors gateway hygiene, #2153/#4750).
+    # When >0, this count triggers bounded TUI/CLI preflight and in-turn
+    # compression regardless of ordinary suppression gates, breaking the death
+    # spiral where missing provider usage prevents token-based recovery.
+    compression_hard_msg_limit = int(
+        _compression_cfg.get("hygiene_hard_message_limit", 0) or 0
     )
 
     # Read optional explicit context_length override for the auxiliary
@@ -2379,6 +2392,8 @@ def init_agent(
             proactive_prune_min_result_chars=compression_proactive_prune_min_chars,
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
             min_tail_user_messages=compression_min_tail_users,
+            hygiene_hard_message_limit=compression_hard_msg_limit,
+            max_tail_message_floor=compression_max_tail_message_floor,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):

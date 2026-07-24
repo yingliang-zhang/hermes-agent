@@ -1132,10 +1132,10 @@ def compress_context(
         focus_topic: Optional focus string for guided compression — the
             summariser will prioritise preserving information related to
             this topic.  Inspired by Claude Code's ``/compact <focus>``.
-        force: If True, bypass any active summary-failure cooldown.  Set
-            by the manual ``/compress`` slash command so users can retry
-            immediately after an auto-compress abort.  Auto-compress
-            callers use the default ``False``.
+        force: If True, bypass ordinary automatic cooldown/breaker state and
+            clear any active summary-failure cooldown before compression.
+            Manual ``/compress`` and bounded hard message-count recovery use
+            this; ordinary auto-compress callers use the default ``False``.
         defer_context_engine_notification: Delay the existing context-engine
             hook until a manual host commits its outer history transaction.
         commit_fence: Optional cooperative fence for executor callers that
@@ -1213,9 +1213,10 @@ def compress_context(
             if _codex_fence_entered:
                 commit_fence.finish_commit()
 
-    # Every automatic entrypoint must honor compressor-owned cooldown and
-    # breaker state. Gateway hygiene constructs a fresh AIAgent, so the
-    # persisted fallback streak is loaded by bind_session_state() before this.
+    # Ordinary automatic entrypoints honor compressor-owned cooldown and
+    # breaker state. Gateway hygiene constructs a fresh AIAgent, so persisted
+    # fallback state is loaded by bind_session_state() before this. Manual and
+    # hard message-count recovery pass force=True explicitly.
     if not force:
         _refresh_persisted_compression_guards(agent.context_compressor)
         blocked = getattr(

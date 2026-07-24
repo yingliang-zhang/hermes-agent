@@ -708,29 +708,37 @@ def build_turn_context(
     _preflight_compression_blocked = False
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
-    if agent.compression_enabled and _should_run_preflight_estimate(
-        messages,
-        agent.context_compressor.protect_first_n,
-        agent.context_compressor.protect_last_n,
-        agent.context_compressor.threshold_tokens,
+    _compressor = agent.context_compressor
+    # Hard message-count safety valve: at or above this count, bypass noisy
+    # real-usage deferral and automatic-compression breakers. The per-turn
+    # compression-pass cap still bounds recovery.
+    _hard_limit = getattr(_compressor, "hygiene_hard_message_limit", 0) or 0
+    _hard_limit_breached = (
+        isinstance(_hard_limit, (int, float))
+        and _hard_limit > 0
+        and len(messages) >= _hard_limit
+    )
+    if agent.compression_enabled and (
+        _hard_limit_breached
+        or _should_run_preflight_estimate(
+            messages,
+            _compressor.protect_first_n,
+            _compressor.protect_last_n,
+            _compressor.threshold_tokens,
+        )
     ):
         _preflight_tokens = estimate_request_tokens_rough(
             messages,
             system_prompt=active_system_prompt or "",
             tools=agent.tools or None,
         )
-        _compressor = agent.context_compressor
-        # getattr guard: minimal compressor doubles (SimpleNamespace in the
-        # engine-preflight tests) and plugin context engines lack this
-        # ContextCompressor-only method — absence means no snapshot, and the
-        # finalizer's rollback stays disarmed for the turn (display-only).
+        # getattr guard: minimal compressor doubles and plugin context engines
+        # need not implement this display-only snapshot hook.
         _snapshot_fn = getattr(
             _compressor, "snapshot_preflight_display_tokens", None
         )
         if callable(_snapshot_fn):
             _snapshot_val = _snapshot_fn()
-            # Type pin: MagicMock compressors return truthy Mock objects —
-            # only a real int snapshot may arm the interrupted-turn rollback.
             if isinstance(_snapshot_val, int) and not isinstance(
                 _snapshot_val, bool
             ):
@@ -740,7 +748,11 @@ def build_turn_context(
             "should_defer_preflight_to_real_usage",
             lambda _tokens: False,
         )
-        _preflight_deferred = _defer_preflight(_preflight_tokens)
+        _preflight_deferred = (
+            False
+            if _hard_limit_breached
+            else _defer_preflight(_preflight_tokens)
+        )
         # Codex app-server threads are compacted by the codex agent itself;
         # Hermes only initiates compaction in "hermes" mode (#36801).
         _codex_native_auto = (
@@ -756,13 +768,13 @@ def build_turn_context(
             in {"native", "off"}
         )
 
-        if not _preflight_deferred:
+        if not _preflight_deferred or _hard_limit_breached:
             _last = _compressor.last_prompt_tokens
             # Do NOT overwrite the -1 sentinel (#36718).
             if _last >= 0 and _preflight_tokens > _last:
                 _compressor.last_prompt_tokens = _preflight_tokens
 
-        _compression_cooldown = getattr(
+        _compression_cooldown = None if _hard_limit_breached else getattr(
             _compressor,
             "get_active_compression_failure_cooldown",
             lambda: None,
@@ -770,7 +782,7 @@ def build_turn_context(
 
         _should_compress_now = False
         _compress_block_reason = None
-        if _preflight_deferred:
+        if _preflight_deferred and not _hard_limit_breached:
             logger.info(
                 "Skipping preflight compression: rough estimate ~%s >= %s, "
                 "but last real provider prompt was %s after compression",
@@ -778,7 +790,7 @@ def build_turn_context(
                 f"{_compressor.threshold_tokens:,}",
                 f"{_compressor.last_real_prompt_tokens:,}",
             )
-        elif _compression_cooldown:
+        elif _compression_cooldown and not _hard_limit_breached:
             logger.info(
                 "Skipping preflight compression: same-session cooldown active "
                 "(~%s seconds remaining, session %s)",
@@ -797,7 +809,10 @@ def build_turn_context(
                 getattr(agent, "codex_app_server_auto_compaction", "native"),
             )
         else:
-            _should_compress_now = _compressor.should_compress(_preflight_tokens)
+            if _hard_limit_breached:
+                _should_compress_now = True
+            else:
+                _should_compress_now = _compressor.should_compress(_preflight_tokens)
             if not _should_compress_now:
                 # Context is over threshold but compression is blocked
                 # (summary-LLM cooldown or anti-thrashing). Ask should_compress_info
@@ -821,25 +836,47 @@ def build_turn_context(
             _clear_warn = getattr(agent, "_clear_context_overflow_warn", None)
             if callable(_clear_warn):
                 _clear_warn()
-            logger.info(
-                "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
-                f"{_preflight_tokens:,}",
-                f"{_compressor.threshold_tokens:,}",
-                agent.model,
-                f"{_compressor.context_length:,}",
-            )
-            _preflight_status = automatic_compaction_status_message(
-                _compressor,
-                phase="preflight",
-                default_message=PREFLIGHT_COMPRESSION_STATUS_TEMPLATE.format(
-                    tokens=_preflight_tokens,
-                    threshold=_compressor.threshold_tokens,
-                ),
-                approx_tokens=_preflight_tokens,
-                threshold_tokens=_compressor.threshold_tokens,
-                context_length=_compressor.context_length,
-                model=agent.model,
-            )
+            if _hard_limit_breached:
+                logger.info(
+                    "Preflight compression: hard message limit %d reached "
+                    "(%d messages, ~%s tokens, model %s, ctx %s)",
+                    _hard_limit, len(messages),
+                    f"{_preflight_tokens:,}", agent.model,
+                    f"{_compressor.context_length:,}",
+                )
+                _preflight_status = automatic_compaction_status_message(
+                    _compressor,
+                    phase="preflight",
+                    default_message=(
+                        f"📦 Preflight compression: {len(messages)} messages "
+                        f">= hard limit {_hard_limit}. "
+                        "This may take a moment."
+                    ),
+                    approx_tokens=_preflight_tokens,
+                    threshold_tokens=_compressor.threshold_tokens,
+                    context_length=_compressor.context_length,
+                    model=agent.model,
+                )
+            else:
+                logger.info(
+                    "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
+                    f"{_preflight_tokens:,}",
+                    f"{_compressor.threshold_tokens:,}",
+                    agent.model,
+                    f"{_compressor.context_length:,}",
+                )
+                _preflight_status = automatic_compaction_status_message(
+                    _compressor,
+                    phase="preflight",
+                    default_message=PREFLIGHT_COMPRESSION_STATUS_TEMPLATE.format(
+                        tokens=_preflight_tokens,
+                        threshold=_compressor.threshold_tokens,
+                    ),
+                    approx_tokens=_preflight_tokens,
+                    threshold_tokens=_compressor.threshold_tokens,
+                    context_length=_compressor.context_length,
+                    model=agent.model,
+                )
             if _preflight_status:
                 agent._emit_status(_preflight_status)
             # Preflight passes honor the same configured per-turn cap
@@ -852,10 +889,28 @@ def build_turn_context(
                 _orig_len = len(messages)
                 _orig_tokens = _preflight_tokens
                 _preflight_input = messages
-                messages, active_system_prompt = agent._compress_context(
-                    messages, system_message, approx_tokens=_preflight_tokens,
-                    task_id=effective_task_id,
-                )
+                _compress_kwargs = {
+                    "approx_tokens": _preflight_tokens,
+                    "task_id": effective_task_id,
+                }
+                if _hard_limit_breached:
+                    try:
+                        messages, active_system_prompt = agent._compress_context(
+                            messages,
+                            system_message,
+                            force=True,
+                            **_compress_kwargs,
+                        )
+                    except TypeError as exc:
+                        if "unexpected keyword argument 'force'" not in str(exc):
+                            raise
+                        messages, active_system_prompt = agent._compress_context(
+                            messages, system_message, **_compress_kwargs
+                        )
+                else:
+                    messages, active_system_prompt = agent._compress_context(
+                        messages, system_message, **_compress_kwargs
+                    )
                 if (
                     messages is _preflight_input
                     and compression_skipped_due_to_lock(agent)
@@ -896,7 +951,23 @@ def build_turn_context(
                 agent._last_content_with_tools = None
                 agent._last_content_tools_all_housekeeping = False
                 agent._mute_post_response = False
-                if not _compressor.should_compress(_preflight_tokens):
+                _hard_limit_breached = (
+                    _hard_limit > 0 and len(messages) >= _hard_limit
+                )
+                _compression_check_tokens = (
+                    max(_preflight_tokens, _compressor.threshold_tokens)
+                    if _hard_limit_breached
+                    else _preflight_tokens
+                )
+                _should_continue_compressing = (
+                    _compressor.should_compress(
+                        _compression_check_tokens,
+                        force=True,
+                    )
+                    if _hard_limit_breached
+                    else _compressor.should_compress(_compression_check_tokens)
+                )
+                if not _should_continue_compressing:
                     break
                 if not _compression_warrants_another_preflight_pass(
                     _orig_tokens,
