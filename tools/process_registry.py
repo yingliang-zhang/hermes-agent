@@ -118,6 +118,9 @@ class ProcessSession:
     watcher_message_id: str = ""                # Triggering message id — reply anchor for topic routing
     watcher_interval: int = 0                   # 0 = no watcher configured
     notify_on_complete: bool = False             # Queue agent notification on exit
+    # ``None`` is the legacy/unserialized sentinel. Running sessions project it
+    # as unpublished; already-finished legacy rows project it as published.
+    completion_notification_enqueued: Optional[bool] = None
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
@@ -1107,6 +1110,8 @@ class ProcessRegistry:
         """
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
+            if was_running and session.notify_on_complete:
+                session.completion_notification_enqueued = False
             self._finished[session.id] = session
         session._completion_event.set()
         self._write_checkpoint()
@@ -1131,6 +1136,8 @@ class ProcessRegistry:
                 # based on which watcher notices exit first.
                 "started_at": session.started_at,
             })
+            with self._lock:
+                session.completion_notification_enqueued = True
 
     # ----- Query Methods -----
 
@@ -1742,6 +1749,7 @@ class ProcessRegistry:
         """
         with self._lock:
             all_sessions = list(self._running.values()) + list(self._finished.values())
+            running_ids = set(self._running)
 
         all_sessions = [self._refresh_detached_session(s) for s in all_sessions]
 
@@ -1777,6 +1785,16 @@ class ProcessRegistry:
                 entry["watch_hit"] = s._watch_hits > 0
             if s.notify_on_complete:
                 entry["notify_on_complete"] = True
+                publication = getattr(
+                    s, "completion_notification_enqueued", None
+                )
+                if publication is None:
+                    # Pre-marker finished rows already crossed their only
+                    # publication opportunity; do not wedge them forever.
+                    publication = bool(s.exited and s.id not in running_ids)
+                entry["completion_notification_enqueued"] = (
+                    publication is True
+                )
             if s.exited:
                 entry["exit_code"] = s.exit_code
             if s.detached:
@@ -1935,6 +1953,7 @@ class ProcessRegistry:
                             "watcher_message_id": s.watcher_message_id,
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
+                            "completion_notification_enqueued": s.completion_notification_enqueued is True,
                             "watch_patterns": s.watch_patterns,
                         })
             
@@ -2013,6 +2032,9 @@ class ProcessRegistry:
                 watcher_message_id=entry.get("watcher_message_id", ""),
                 watcher_interval=entry.get("watcher_interval", 0),
                 notify_on_complete=entry.get("notify_on_complete", False),
+                completion_notification_enqueued=(
+                    entry.get("completion_notification_enqueued") is True
+                ),
                 watch_patterns=entry.get("watch_patterns", []),
             )
             with self._lock:

@@ -146,7 +146,12 @@ def test_notification_poller_entry_paths_dispatch_as_notification(monkeypatch, s
 
     calls = []
     emitted = []
-    monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **kw: calls.append((a, kw)))
+
+    def run_prompt(*args, **kwargs):
+        assert server._notification_delivery_handoff_active() is True
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(server, "_run_prompt_submit", run_prompt)
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: emitted.append(a))
 
     if shutdown:
@@ -180,12 +185,16 @@ def test_post_turn_notification_emits_status_and_notification_origin(monkeypatch
     emitted = []
     session = _session()
 
-    monkeypatch.setattr(
-        process_registry,
-        "drain_notifications",
-        lambda **_kwargs: [(event, text)],
-    )
-    monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **kw: calls.append((a, kw)))
+    def drain_notifications(**_kwargs):
+        assert server._notification_delivery_handoff_active() is True
+        return [(event, text)]
+
+    def run_prompt(*args, **kwargs):
+        assert server._notification_delivery_handoff_active() is True
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(process_registry, "drain_notifications", drain_notifications)
+    monkeypatch.setattr(server, "_run_prompt_submit", run_prompt)
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: emitted.append(a))
 
     server._drain_post_turn_notifications("rid", "sid", session)
@@ -805,6 +814,162 @@ def test_notification_poller_retries_after_synchronous_dispatch_failure(monkeypa
 
     assert len(attempts) == 2
     assert isolated_queue.empty()
+
+
+def test_foreign_notification_requeue_stays_latched_for_owner(monkeypatch):
+    from tools import async_delegation
+
+    isolated_queue = queue.Queue()
+    foreign = _completion("proc-foreign")
+    foreign["session_key"] = "foreign-session"
+    isolated_queue.put(foreign)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(
+        async_delegation,
+        "load_deferred_notifications",
+        lambda *_args, **_kwargs: [],
+    )
+
+    ownership_check_entered = threading.Event()
+    release_ownership_check = threading.Event()
+    stop = threading.Event()
+
+    def belongs_elsewhere(*_args):
+        ownership_check_entered.set()
+        assert release_ownership_check.wait(5)
+        stop.set()
+        return True
+
+    monkeypatch.setattr(server, "_notification_event_belongs_elsewhere", belongs_elsewhere)
+    monkeypatch.setattr(server.time, "sleep", lambda _seconds: None)
+    poller = threading.Thread(
+        target=server._notification_poller_loop,
+        args=(stop, "sid", _session()),
+    )
+    poller.start()
+    try:
+        assert ownership_check_entered.wait(5)
+        assert isolated_queue.empty()
+        assert server._notification_delivery_handoff_active() is True
+        owner = _session(session_key="foreign-session")
+        assert server._rollover_notification_blockers("foreign-sid", owner) == (
+            "notification_delivery_inflight",
+        )
+    finally:
+        release_ownership_check.set()
+        poller.join(5)
+
+    assert not poller.is_alive()
+    assert server._notification_delivery_handoff_active() is False
+    assert isolated_queue.get_nowait() == foreign
+    assert isolated_queue.empty()
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["exception", "busy", "consumed", "unowned", "empty-text"],
+)
+def test_notification_poller_releases_handoff_on_all_exit_paths(monkeypatch, path):
+    import tools.process_registry as process_registry_module
+
+    isolated_queue = queue.Queue()
+    isolated_queue.put(_completion(f"proc-{path}"))
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_notification_event_belongs_elsewhere", lambda *_a: False)
+    monkeypatch.setattr(server.time, "sleep", lambda _seconds: None)
+    stop = threading.Event()
+    observations = []
+    dispatch_calls = 0
+
+    def observe_and_stop(value):
+        observations.append(server._notification_delivery_handoff_active())
+        stop.set()
+        return value
+
+    monkeypatch.setattr(process_registry, "is_completion_consumed", lambda _sid: False)
+    monkeypatch.setattr(server, "_notification_event_requires_owner", lambda _event: True)
+    monkeypatch.setattr(server, "_session_owns_notification_event", lambda *_a: True)
+    monkeypatch.setattr(
+        process_registry_module,
+        "format_process_notification",
+        lambda _event: "result",
+    )
+
+    if path == "consumed":
+        monkeypatch.setattr(
+            process_registry,
+            "is_completion_consumed",
+            lambda _sid: observe_and_stop(True),
+        )
+    elif path == "unowned":
+        monkeypatch.setattr(
+            server,
+            "_session_owns_notification_event",
+            lambda *_a: observe_and_stop(False),
+        )
+    elif path == "empty-text":
+        monkeypatch.setattr(
+            process_registry_module,
+            "format_process_notification",
+            lambda _event: observe_and_stop(""),
+        )
+
+    def dispatch(*_args, **_kwargs):
+        nonlocal dispatch_calls
+        dispatch_calls += 1
+        observations.append(server._notification_delivery_handoff_active())
+        if dispatch_calls == 1:
+            stop.set()
+            if path == "exception":
+                raise RuntimeError("dispatch failed")
+            if path == "busy":
+                return "busy"
+        return "deferred"
+
+    monkeypatch.setattr(server, "_dispatch_notification_turn", dispatch)
+
+    server._notification_poller_loop(stop, "sid", _session())
+
+    assert observations and all(observations)
+    assert server._notification_delivery_handoff_active() is False
+
+
+def test_idle_empty_poller_never_holds_notification_handoff(monkeypatch):
+    from tools import async_delegation
+
+    isolated_queue = queue.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(
+        async_delegation,
+        "load_deferred_notifications",
+        lambda *_args, **_kwargs: [],
+    )
+    idle_wait_entered = threading.Event()
+    release_idle_wait = threading.Event()
+    stop = threading.Event()
+
+    def idle_wait(_seconds):
+        idle_wait_entered.set()
+        assert release_idle_wait.wait(5)
+        stop.set()
+
+    monkeypatch.setattr(server.time, "sleep", idle_wait)
+    poller = threading.Thread(
+        target=server._notification_poller_loop,
+        args=(stop, "sid", _session()),
+    )
+    poller.start()
+    try:
+        assert idle_wait_entered.wait(5)
+        assert server._notification_delivery_handoff_active() is False
+        assert server._rollover_notification_blockers("sid", _session()) == ()
+    finally:
+        stop.set()
+        release_idle_wait.set()
+        poller.join(5)
+
+    assert not poller.is_alive()
+    assert server._notification_delivery_handoff_active() is False
 
 
 def test_deferred_durable_ack_failure_retries_without_duplicate(tmp_path, monkeypatch):

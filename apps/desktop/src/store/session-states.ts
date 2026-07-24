@@ -37,6 +37,7 @@ import {
   $unreadFinishedSessionIds,
   setActiveSessionStoredIdRotation
 } from './session'
+import { consumeCompletedSessionRollover } from './session-rollover'
 import { isSecondaryWindow } from './windows'
 
 // ---------------------------------------------------------------------------
@@ -134,8 +135,13 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
   // could let a background session's delayed rotation steal the foreground
   // route.
   if (previous?.storedSessionId && next.storedSessionId && previous.storedSessionId !== next.storedSessionId) {
+    const kind = consumeCompletedSessionRollover(runtimeId, previous.storedSessionId, next.storedSessionId)
+      ? 'rollover'
+      : 'compression'
+
     if (runtimeId === $activeSessionId.get()) {
       setActiveSessionStoredIdRotation({
+        kind,
         nextStoredSessionId: next.storedSessionId,
         previousStoredSessionId: previous.storedSessionId,
         runtimeSessionId: runtimeId

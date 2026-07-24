@@ -47,6 +47,13 @@ import {
   setTurnStartedAt,
   setYoloActive
 } from '@/store/session'
+import {
+  beginSessionRolloverCommit,
+  eligibleCompletedSessionRollover,
+  eligibleSessionRolloverOffer,
+  registerCompletedSessionRollover,
+  releaseSessionRolloverCommit
+} from '@/store/session-rollover'
 import { clearSessionSubagents, pruneDelegateFallbackSubagents, upsertSubagent } from '@/store/subagents'
 import { clearActiveSessionTodos } from '@/store/todos'
 import { recordToolDiff } from '@/store/tool-diffs'
@@ -271,6 +278,34 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
         if (fromActiveProfile) {
           ingestBackendSkin(payload as HermesSkin | undefined, { apply: true })
+        }
+
+        return
+      } else if (event.type === 'session.rollover.offer') {
+        const offer = eligibleSessionRolloverOffer(event, activeSessionIdRef.current)
+        const gateway = $gateway.get()
+
+        if (!offer || !gateway || !beginSessionRolloverCommit(offer.token)) {
+          return
+        }
+
+        try {
+          void gateway
+            .request('session.rollover.commit', { session_id: offer.runtimeId, token: offer.token })
+            .then(
+              () => releaseSessionRolloverCommit(offer.token),
+              () => releaseSessionRolloverCommit(offer.token)
+            )
+        } catch {
+          releaseSessionRolloverCommit(offer.token)
+        }
+
+        return
+      } else if (event.type === 'session.rollover.complete') {
+        const completed = eligibleCompletedSessionRollover(event, activeSessionIdRef.current)
+
+        if (completed) {
+          registerCompletedSessionRollover(completed)
         }
 
         return

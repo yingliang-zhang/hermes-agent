@@ -566,6 +566,18 @@ class TestListSessions:
         assert "pid" in entry
         assert "output_preview" in entry
 
+    def test_legacy_finished_notify_projection_defaults_publication_complete(
+        self, registry
+    ):
+        session = _make_session(exited=True, exit_code=0)
+        session.notify_on_complete = True
+        registry._finished[session.id] = session
+
+        entry = registry.list_sessions()[0]
+
+        assert entry["completion_notification_enqueued"] is True
+
+
 
 # =========================================================================
 # Active process queries

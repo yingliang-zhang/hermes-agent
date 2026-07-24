@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 
 import { getSessionMessages, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
 import { toChatMessages } from '@/lib/chat-messages'
+import { sessionRolloverCapabilityParams } from '@/store/session-rollover'
 import { publishSessionState, setSessionTileDelegate } from '@/store/session-states'
 import type { SessionResumeResponse } from '@/types/hermes'
 
@@ -79,6 +80,8 @@ export function useSessionTileDelegate({
           requestGateway<SessionResumeResponse>('session.resume', {
             session_id: storedSessionId,
             cols: 96,
+            source: 'desktop',
+            ...sessionRolloverCapabilityParams(),
             ...(profile ? { profile } : {})
           })
         ])

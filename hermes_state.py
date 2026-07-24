@@ -128,6 +128,138 @@ def _cwd_prefix_clause(cwd_prefix: str) -> Tuple[str, List[str]]:
     return "(s.cwd = ? OR s.cwd LIKE ? OR s.cwd LIKE ?)", [prefix, f"{prefix}/%", f"{prefix}\\%"]
 
 
+ROLLOVER_HANDOFF_MAX_LINES = 20
+ROLLOVER_HANDOFF_MAX_BYTES = 16 * 1024
+_ROLLOVER_SUMMARY_MAX_LINES = 8
+_ROLLOVER_EXCHANGE_MAX_LINES = 4
+_ROLLOVER_SUMMARY_MAX_BYTES = 7_600
+_ROLLOVER_EXCHANGE_MAX_BYTES = 4_000
+
+
+def _rollover_text(content: Any) -> str:
+    """Return sanitized text without stringifying opaque payloads."""
+    if isinstance(content, str):
+        return sanitize_context(_sanitize_surrogates(content)).strip()
+    if not isinstance(content, list):
+        return ""
+    parts: List[str] = []
+    for part in content:
+        if isinstance(part, str):
+            parts.append(part)
+        elif isinstance(part, dict):
+            text = part.get("text") or part.get("content")
+            if isinstance(text, str):
+                parts.append(text)
+    return sanitize_context(_sanitize_surrogates("\n".join(parts))).strip()
+
+
+def _truncate_rollover_utf8(text: str, max_bytes: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    ellipsis = "…"
+    ellipsis_bytes = ellipsis.encode("utf-8")
+    if max_bytes <= len(ellipsis_bytes):
+        return encoded[:max_bytes].decode("utf-8", errors="ignore")
+    prefix = encoded[: max_bytes - len(ellipsis_bytes)].decode(
+        "utf-8", errors="ignore"
+    ).rstrip()
+    return f"{prefix}{ellipsis}" if prefix else ellipsis
+
+
+def _bounded_rollover_lines(
+    content: Any,
+    *,
+    max_lines: int,
+    max_bytes: int,
+) -> List[str]:
+    lines: List[str] = []
+    remaining = max_bytes
+    for raw_line in _rollover_text(content).splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        bounded = _truncate_rollover_utf8(line, remaining)
+        if not bounded:
+            break
+        lines.append(bounded)
+        remaining -= len(bounded.encode("utf-8"))
+        if len(lines) >= max_lines or remaining <= 0:
+            break
+    return lines
+
+
+def build_session_rollover_handoff(
+    compaction_summary: Any,
+    latest_user_content: Any,
+    latest_assistant_content: Any,
+) -> List[Dict[str, str]]:
+    """Build a deterministic bounded user→assistant rollover handoff pair."""
+    user_lines = _bounded_rollover_lines(
+        latest_user_content,
+        max_lines=_ROLLOVER_EXCHANGE_MAX_LINES,
+        max_bytes=_ROLLOVER_EXCHANGE_MAX_BYTES,
+    )
+    assistant_lines = _bounded_rollover_lines(
+        latest_assistant_content,
+        max_lines=_ROLLOVER_EXCHANGE_MAX_LINES,
+        max_bytes=_ROLLOVER_EXCHANGE_MAX_BYTES,
+    )
+    if not user_lines or not assistant_lines:
+        raise ValueError("rollover requires a completed textual user/assistant exchange")
+
+    summary_text = _rollover_text(compaction_summary)
+    if summary_text:
+        try:
+            from agent.context_compressor import ContextCompressor
+
+            if ContextCompressor._is_context_summary_content(summary_text):
+                summary_text = ContextCompressor._strip_summary_prefix(summary_text)
+        except (ImportError, AttributeError):
+            pass
+    summary_lines = _bounded_rollover_lines(
+        summary_text,
+        max_lines=_ROLLOVER_SUMMARY_MAX_LINES,
+        max_bytes=_ROLLOVER_SUMMARY_MAX_BYTES,
+    )
+
+    handoff_user_lines = ["[SESSION ROLLOVER HANDOFF — REFERENCE ONLY]"]
+    if summary_lines:
+        handoff_user_lines.extend(["Latest compaction summary:", *summary_lines])
+    handoff_user_lines.extend(["Latest completed user message:", *user_lines])
+    handoff_assistant_lines = [
+        "Latest completed assistant response:",
+        *assistant_lines,
+    ]
+    messages = [
+        {"role": "user", "content": "\n".join(handoff_user_lines)},
+        {"role": "assistant", "content": "\n".join(handoff_assistant_lines)},
+    ]
+    nonempty_line_count = sum(
+        1
+        for message in messages
+        for line in message["content"].splitlines()
+        if line.strip()
+    )
+    encoded_bytes = sum(
+        len(message["content"].encode("utf-8")) for message in messages
+    )
+    if nonempty_line_count > ROLLOVER_HANDOFF_MAX_LINES:
+        raise ValueError("rollover handoff exceeded its line bound")
+    if encoded_bytes > ROLLOVER_HANDOFF_MAX_BYTES:
+        raise ValueError("rollover handoff exceeded its byte bound")
+    return messages
+
+
+def _valid_rollover_identity(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value == _sanitize_surrogates(value)
+        and "\x00" not in value
+    )
+
+
 # A child session counts as a /branch (kept visible, never cascade-deleted) if
 # it carries the stable marker OR the legacy end_reason heuristic holds.
 _BRANCH_CHILD_SQL = (
@@ -144,6 +276,14 @@ _COMPRESSION_CHILD_SQL = (
     "        AND p.end_reason = 'compression')"
 )
 
+_ROLLOVER_CHILD_SQL = (
+    "json_extract(COALESCE({a}.model_config, '{{}}'), '$._rollover_from') = "
+    "{a}.parent_session_id"
+    " AND EXISTS (SELECT 1 FROM sessions p"
+    "             WHERE p.id = {a}.parent_session_id"
+    "             AND p.end_reason = 'rollover')"
+)
+
 # A durable compression rotation requires a real continuation child, not merely
 # an ended parent. Explicit branch/delegate/tool children share the same parent
 # column but do not complete the rotation.
@@ -154,19 +294,34 @@ _COMPRESSION_CONTINUATION_CHILD_SQL = (
     " AND COALESCE({child}.source, '') != 'tool'"
 )
 
+_ROLLOVER_CONTINUATION_CHILD_SQL = (
+    "{child}.parent_session_id = {parent}.id"
+    " AND json_extract(COALESCE({child}.model_config, '{{}}'), '$._rollover_from') = {parent}.id"
+)
+
+_DURABLE_CONTINUATION_CHILD_SQL = (
+    "(({parent}.end_reason = 'compression' AND "
+    + _COMPRESSION_CONTINUATION_CHILD_SQL
+    + ") OR ({parent}.end_reason = 'rollover' AND "
+    + _ROLLOVER_CONTINUATION_CHILD_SQL
+    + "))"
+)
+
 # Rows that surface in pickers: roots + branch children (subagent runs and
 # compression continuations stay hidden).
 _LISTABLE_CHILD_SQL = f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')})"
 
 
 def _ephemeral_child_sql(alias: str = "s") -> str:
-    """Subagent runs (cascade-delete targets), not branches or compression tips."""
+    """Subagent runs, not branches or durable continuation tips."""
     branch = _BRANCH_CHILD_SQL.format(a=alias)
     compression = _COMPRESSION_CHILD_SQL.format(a=alias)
+    rollover = _ROLLOVER_CHILD_SQL.format(a=alias)
     return (
         f"({alias}.parent_session_id IS NOT NULL"
         f" AND NOT ({branch})"
-        f" AND NOT ({compression}))"
+        f" AND NOT ({compression})"
+        f" AND NOT ({rollover}))"
     )
 
 
@@ -5061,26 +5216,21 @@ class SessionDB:
 
         return cleaned
 
-    def _is_compression_ancestor(
-        self, conn, *, ancestor_id: str, descendant_id: str
-    ) -> bool:
-        """Return True if *ancestor_id* is a compression predecessor of
-        *descendant_id* (walking parent links up the continuation chain).
+    def _is_compression_ancestor(self, conn, *, ancestor_id: str, descendant_id: str) -> bool:
+        """Return whether one id precedes another in a durable lineage.
 
-        The continuation edge is the canonical one shared with
-        :func:`_ephemeral_child_sql` / :meth:`set_session_archived`
-        (``_COMPRESSION_CHILD_SQL``): a parent → child edge counts only when the
-        parent ended with ``end_reason = 'compression'`` and the child started
-        at or after the parent's ``ended_at``, which distinguishes continuations
-        from delegate subagents / branch children that also carry a
-        ``parent_session_id``. Expressed as a single recursive CTE rather than a
-        per-hop Python walk so the edge definition lives in exactly one place.
+        Walk parent links up from *descendant_id*, following compression or
+        rollover continuation edges only. Compression edges exclude explicit
+        branch, delegate, and tool children; rollover edges require the child's
+        ``_rollover_from`` marker to identify its parent. A single recursive CTE
+        keeps that shared edge definition consistent with archive and tip
+        projection behavior.
         """
         if not ancestor_id or not descendant_id or ancestor_id == descendant_id:
             return False
-        # Walk parent links up from the descendant, following only compression
-        # continuation edges, and check whether ancestor_id is reached.
-        edge = _COMPRESSION_CHILD_SQL.format(a="child")
+        edge = _DURABLE_CONTINUATION_CHILD_SQL.format(
+            child="child", parent="parent"
+        )
         row = conn.execute(
             f"""
             WITH RECURSIVE ancestors(id) AS (
@@ -5186,18 +5336,22 @@ class SessionDB:
         return row["title"] if row else None
 
     def set_session_archived(self, session_id: str, archived: bool) -> bool:
-        """Archive or unarchive a session.
+        """Archive or unarchive a session's complete durable lineage.
 
-        Archived sessions are hidden from the default session list but keep all
-        their messages — this is a soft hide, not a delete. For compression
-        chains, archive the whole logical conversation. Desktop lists compression
-        roots projected forward to their latest continuation; updating only the
-        displayed tip lets the still-unarchived root resurrect it on refresh.
-        Returns True when at least one row was updated.
+        Archived sessions are hidden from the default session list but retain
+        all messages. Compression and rollover continuations form one logical
+        conversation, so this updates both ancestors and descendants. Desktop
+        projects a lineage root forward to its latest continuation; updating
+        only the displayed tip would let an unarchived root resurrect it on
+        refresh. Returns True when at least one row was updated.
         """
+        edge = _DURABLE_CONTINUATION_CHILD_SQL.format(
+            child="child", parent="parent"
+        )
+
         def _do(conn):
             cursor = conn.execute(
-                """
+                f"""
                 WITH RECURSIVE
                   ancestors(id) AS (
                     SELECT ?
@@ -5206,7 +5360,7 @@ class SessionDB:
                     FROM ancestors a
                     JOIN sessions child ON child.id = a.id
                     JOIN sessions parent ON parent.id = child.parent_session_id
-                    WHERE parent.end_reason = 'compression'
+                    WHERE {edge}
                   ),
                   descendants(id) AS (
                     SELECT ?
@@ -5215,7 +5369,7 @@ class SessionDB:
                     FROM descendants d
                     JOIN sessions parent ON parent.id = d.id
                     JOIN sessions child ON child.parent_session_id = parent.id
-                    WHERE parent.end_reason = 'compression'
+                    WHERE {edge}
                   ),
                   lineage(id) AS (
                     SELECT id FROM ancestors
@@ -5232,8 +5386,8 @@ class SessionDB:
             if rowcount is None or rowcount < 0:
                 rowcount = conn.execute("SELECT changes()").fetchone()[0]
             return rowcount
-        rowcount = self._execute_write(_do)
-        return rowcount > 0
+
+        return self._execute_write(_do) > 0
 
     def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
         """Look up a session by exact title. Returns session dict or None."""
@@ -5309,45 +5463,32 @@ class SessionDB:
         return f"{base} #{max_num + 1}"
 
     def get_compression_tip(self, session_id: str) -> Optional[str]:
-        """Walk the compression-continuation chain forward and return the tip.
+        """Walk a durable compression/rollover chain forward to its tip.
 
-        A compression continuation is a child of a session whose
-        ``end_reason = 'compression'``.  Older builds tried to distinguish
-        continuations from branches/subagents by requiring
-        ``child.started_at >= parent.ended_at``.  That ordering is too brittle:
-        gateway + compression races can insert the real continuation row before
-        the parent row's ``ended_at`` is written, while a stale websocket later
-        creates/reuses a sibling that *does* satisfy the timestamp test.  The
-        visible symptom is brutal: desktop resume follows the stale sibling and
-        the user's latest messages look "lost" even though they are persisted in
-        the real continuation chain.
-
-        Instead, only follow children of compression-ended parents, exclude
-        explicit branch/delegate/tool children, and prefer children that are
-        themselves continuing the compression chain (``end_reason='compression'``)
-        or still live over stale closed siblings such as ``ws_orphan_reap``.
-        Returns the latest continuation tip, or the input id when no
-        continuation exists.
+        Compression continuations are children of compression-ended parents;
+        explicit branch, delegate, and tool children are excluded. Rollover
+        continuations additionally require the child's ``_rollover_from``
+        marker to match its rollover-ended parent. When stale compression
+        siblings exist, continuing or live children are preferred over closed
+        siblings before recency breaks ties. Returns the latest continuation
+        tip, or the input id when no continuation exists.
         """
         current = session_id
         seen = {current} if current else set()
-        # Bound the walk defensively — compression chains this deep are
-        # pathological and shouldn't happen in practice. 100 = plenty.
+        edge = _DURABLE_CONTINUATION_CHILD_SQL.format(
+            child="child", parent="parent"
+        )
         for _ in range(100):
             with self._lock:
-                cursor = self._conn.execute(
-                    """
+                row = self._conn.execute(
+                    f"""
                     SELECT child.id
                     FROM sessions parent
                     JOIN sessions child ON child.parent_session_id = parent.id
-                    WHERE parent.id = ?
-                      AND parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
-                      AND COALESCE(child.source, '') != 'tool'
+                    WHERE parent.id = ? AND {edge}
                     ORDER BY
                       CASE
-                        WHEN child.end_reason = 'compression' THEN 0
+                        WHEN child.end_reason IN ('compression', 'rollover') THEN 0
                         WHEN child.ended_at IS NULL THEN 1
                         ELSE 2
                       END,
@@ -5360,8 +5501,7 @@ class SessionDB:
                     LIMIT 1
                     """,
                     (current,),
-                )
-                row = cursor.fetchone()
+                ).fetchone()
             if row is None:
                 return current
             child_id = row["id"]
@@ -5684,7 +5824,7 @@ class SessionDB:
         if project_compression_tips and not include_children:
             projected = []
             for s in sessions:
-                if s.get("end_reason") != "compression":
+                if s.get("end_reason") not in {"compression", "rollover"}:
                     projected.append(s)
                     continue
                 tip_id = self.get_compression_tip(s["id"])
@@ -10191,6 +10331,226 @@ class SessionDB:
                 (error[:500], session_id),
             )
         self._execute_write(_do)
+
+
+    @staticmethod
+    def _next_rollover_title(conn, parent_title: Optional[str]) -> Optional[str]:
+        if not parent_title:
+            return None
+        match = re.match(r"^(.*?) #(\d+)$", parent_title)
+        base = match.group(1) if match else parent_title
+        escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        rows = conn.execute(
+            "SELECT title FROM sessions WHERE title = ? OR title LIKE ? ESCAPE '\\'",
+            (base, f"{escaped} #%"),
+        ).fetchall()
+        max_num = 1
+        for row in rows:
+            title = row["title"] if isinstance(row, sqlite3.Row) else row[0]
+            numbered = re.match(r"^.* #(\d+)$", title or "")
+            if numbered:
+                max_num = max(max_num, int(numbered.group(1)))
+        return f"{base} #{max_num + 1}" if rows else base
+
+    def get_latest_active_message_identity(
+        self, session_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Read the exact latest active durable message used as a commit fence."""
+        if not _valid_rollover_identity(session_id):
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, role, content FROM messages "
+                "WHERE session_id = ? AND active = 1 ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row["id"],
+            "role": row["role"],
+            "content": self._decode_content(row["content"]),
+        }
+
+    def complete_session_rollover(
+        self,
+        *,
+        parent_session_id: str,
+        child_session_id: str,
+        holder: str,
+        expected_final_assistant_message_id: int,
+        expected_final_assistant_content: Any,
+    ) -> Optional[str]:
+        """Atomically end one live parent and persist its bounded successor.
+
+        The expected assistant message id and decoded content fence the exact
+        active parent tail. An exact replay may return the already-persisted
+        successor without reacquiring the parent's released lease.
+        """
+        if not all(
+            _valid_rollover_identity(value)
+            for value in (parent_session_id, child_session_id, holder)
+        ):
+            return None
+        if parent_session_id == child_session_id:
+            return None
+        if (
+            not isinstance(expected_final_assistant_message_id, int)
+            or isinstance(expected_final_assistant_message_id, bool)
+            or expected_final_assistant_message_id <= 0
+        ):
+            return None
+
+        def _do(conn):
+            now = time.time()
+            parent = conn.execute(
+                "SELECT * FROM sessions WHERE id = ?",
+                (parent_session_id,),
+            ).fetchone()
+            if parent is None:
+                return None
+
+            rows = conn.execute(
+                "SELECT id, role, content, internal_system_marker "
+                "FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
+                (parent_session_id,),
+            ).fetchall()
+            if not rows:
+                return None
+            tail = rows[-1]
+            tail_content = self._decode_content(tail["content"])
+            if (
+                tail["id"] != expected_final_assistant_message_id
+                or tail["role"] != "assistant"
+                or type(tail_content) is not type(expected_final_assistant_content)
+                or tail_content != expected_final_assistant_content
+                or not _rollover_text(tail_content)
+            ):
+                return None
+
+            existing = conn.execute(
+                "SELECT id FROM sessions "
+                "WHERE parent_session_id = ? "
+                "AND json_extract(COALESCE(model_config, '{}'), "
+                "'$._rollover_from') = ? "
+                "ORDER BY id LIMIT 2",
+                (parent_session_id, parent_session_id),
+            ).fetchall()
+            if existing:
+                if (
+                    len(existing) != 1
+                    or parent["end_reason"] != "rollover"
+                    or parent["ended_at"] is None
+                ):
+                    return None
+                existing_id = existing[0]["id"]
+                handoff_roles = conn.execute(
+                    "SELECT role FROM messages "
+                    "WHERE session_id = ? AND active = 1 ORDER BY id LIMIT 3",
+                    (existing_id,),
+                ).fetchall()
+                if [row["role"] for row in handoff_roles] != ["user", "assistant"]:
+                    return None
+                return existing_id
+
+            if parent["ended_at"] is not None or parent["end_reason"] is not None:
+                return None
+            owns_lease = conn.execute(
+                "SELECT 1 FROM compression_locks "
+                "WHERE session_id = ? AND holder = ? AND expires_at >= ?",
+                (parent_session_id, holder, now),
+            ).fetchone()
+            if owns_lease is None:
+                return None
+
+            latest_user_content: Any = None
+            latest_summary_content: Any = None
+            try:
+                from agent.context_compressor import ContextCompressor
+            except ImportError:
+                ContextCompressor = None
+            for row in rows[:-1]:
+                content = self._decode_content(row["content"])
+                if row["role"] not in {"user", "assistant"}:
+                    continue
+                if (
+                    ContextCompressor is not None
+                    and ContextCompressor._is_context_summary_content(content)
+                ):
+                    latest_summary_content = content
+                    continue
+                if (
+                    row["role"] == "user"
+                    and not row["internal_system_marker"]
+                    and _rollover_text(content)
+                ):
+                    latest_user_content = content
+            try:
+                handoff = build_session_rollover_handoff(
+                    latest_summary_content,
+                    latest_user_content,
+                    tail_content,
+                )
+            except ValueError:
+                return None
+
+            raw_config = parent["model_config"]
+            if raw_config:
+                try:
+                    model_config = json.loads(raw_config)
+                except (json.JSONDecodeError, TypeError):
+                    return None
+                if not isinstance(model_config, dict):
+                    return None
+            else:
+                model_config = {}
+            model_config["_rollover_from"] = parent_session_id
+            child_title = self._next_rollover_title(conn, parent["title"])
+
+            ended = conn.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = 'rollover' "
+                "WHERE id = ? AND ended_at IS NULL AND end_reason IS NULL",
+                (now, parent_session_id),
+            )
+            if ended.rowcount != 1:
+                return None
+            conn.execute(
+                """INSERT INTO sessions (
+                       id, source, model, model_config, system_prompt,
+                       parent_session_id, started_at, cwd, git_branch,
+                       git_repo_root, title, profile_name
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    child_session_id,
+                    parent["source"],
+                    parent["model"],
+                    json.dumps(model_config),
+                    parent["system_prompt"],
+                    parent_session_id,
+                    now,
+                    parent["cwd"],
+                    parent["git_branch"],
+                    parent["git_repo_root"],
+                    child_title,
+                    parent["profile_name"],
+                ),
+            )
+            inserted, tool_calls = self._insert_message_rows(
+                conn, child_session_id, handoff
+            )
+            if inserted != 2 or tool_calls != 0:
+                raise RuntimeError(
+                    "rollover handoff insertion must produce exactly two messages "
+                    "and zero tool calls"
+                )
+            conn.execute(
+                "UPDATE sessions SET message_count = ?, tool_call_count = ? "
+                "WHERE id = ?",
+                (inserted, tool_calls, child_session_id),
+            )
+            return child_session_id
+
+        return self._execute_write(_do)
 
 
 class AsyncSessionDB:

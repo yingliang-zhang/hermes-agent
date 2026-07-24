@@ -21,6 +21,7 @@ import {
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
 import { setAwaitingResponse, setBusy, setMessages } from '@/store/session'
+import { sessionRolloverCapabilityParams } from '@/store/session-rollover'
 
 import type { ClientSessionState } from '../../../types'
 import { sessionContextDrift } from '../session-context-drift'
@@ -393,6 +394,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           const resumed = await requestGateway<{ session_id: string }>('session.resume', {
             session_id: targetStoredSessionId,
             source: 'desktop',
+            ...sessionRolloverCapabilityParams(),
             ...(resumeProfile ? { profile: resumeProfile } : {})
           })
 
@@ -545,6 +547,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             const resumed = await requestGateway<{ session_id: string }>('session.resume', {
               session_id: recoverStoredSessionId,
               source: 'desktop',
+              ...sessionRolloverCapabilityParams(),
               ...(resumeProfile ? { profile: resumeProfile } : {})
             })
 

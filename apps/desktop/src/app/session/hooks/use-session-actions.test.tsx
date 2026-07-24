@@ -7,11 +7,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { getSession, getSessionMessages, type SessionInfo } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
+import { clearQueuedPrompts, enqueueQueuedPrompt, getQueuedPrompts } from '@/store/composer-queue'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile } from '@/store/profile'
 import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
 import {
   $activeSessionId,
   $activeSessionStoredIdRotation,
+  $connection,
   $currentCwd,
   $currentFastMode,
   $currentModel,
@@ -38,14 +40,14 @@ import {
   setSessions,
   setTurnStartedAt
 } from '@/store/session'
-import { $sessionTiles } from '@/store/session-states'
+import { $sessionTiles, closeSessionTile } from '@/store/session-states'
 
+import sessionResumeActiveTurn from '../../../../../../tests/fixtures/session-resume-active-turn.json'
 import { sessionRoute } from '../../routes'
 import type { ClientSessionState } from '../../types'
 
 import { useSessionActions } from './use-session-actions'
 import { useSessionStateCache } from './use-session-state-cache'
-import sessionResumeActiveTurn from '../../../../../../tests/fixtures/session-resume-active-turn.json'
 
 vi.mock('@/hermes', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -74,10 +76,13 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
-type HarnessHandle = Pick<
-  ReturnType<typeof useSessionActions>,
-  'createBackendSessionForSend' | 'startFreshSessionDraft'
->
+interface HarnessHandle {
+  createBackendSessionForSend(preview?: string | null): Promise<string | null>
+  openNewSessionTile(dir?: 'bottom' | 'center' | 'left' | 'right' | 'top'): Promise<void>
+  startFreshSessionDraft(
+    options?: boolean | { preserveRoute?: boolean; replaceRoute?: boolean; workspaceTarget?: null | string }
+  ): void
+}
 
 function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
   return {
@@ -196,6 +201,7 @@ describe('active stored-session id rotation routing', () => {
 
     act(() => {
       setActiveSessionStoredIdRotation({
+        kind: 'compression',
         nextStoredSessionId: 'stored-A-next',
         previousStoredSessionId: 'stored-A',
         runtimeSessionId: 'runtime-A'
@@ -232,6 +238,7 @@ describe('active stored-session id rotation routing', () => {
 
     act(() => {
       setActiveSessionStoredIdRotation({
+        kind: 'compression',
         nextStoredSessionId: tipAfter,
         previousStoredSessionId: tipBefore,
         runtimeSessionId
@@ -274,6 +281,7 @@ describe('active stored-session id rotation routing', () => {
 
     act(() => {
       setActiveSessionStoredIdRotation({
+        kind: 'compression',
         nextStoredSessionId: tipAfter,
         previousStoredSessionId: tipBefore,
         runtimeSessionId
@@ -308,6 +316,7 @@ describe('active stored-session id rotation routing', () => {
 
     act(() => {
       setActiveSessionStoredIdRotation({
+        kind: 'compression',
         nextStoredSessionId: 'stored-A-next',
         previousStoredSessionId: 'stored-A',
         runtimeSessionId: 'runtime-A'
@@ -337,6 +346,7 @@ describe('active stored-session id rotation routing', () => {
 
     act(() => {
       setActiveSessionStoredIdRotation({
+        kind: 'compression',
         nextStoredSessionId: 'stored-A-next',
         previousStoredSessionId: 'stored-A',
         runtimeSessionId: 'runtime-A'
@@ -366,6 +376,7 @@ describe('active stored-session id rotation routing', () => {
 
     act(() => {
       setActiveSessionStoredIdRotation({
+        kind: 'compression',
         nextStoredSessionId: 'stored-A-next',
         previousStoredSessionId: 'stored-A',
         runtimeSessionId: 'runtime-A'
@@ -375,6 +386,97 @@ describe('active stored-session id rotation routing', () => {
     await waitFor(() => expect(selectedStoredSessionIdRef.current).toBe('stored-A-next'))
     expect($selectedStoredSessionId.get()).toBe('stored-A-next')
     expect(navigate).not.toHaveBeenCalled()
+  })
+
+  it('follows rollover without migrating draft or queue state', async () => {
+    const previousStoredSessionId = 'rollover-before'
+    const nextStoredSessionId = 'rollover-after'
+    const runtimeSessionId = 'runtime-rollover'
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: runtimeSessionId }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: previousStoredSessionId }
+    const navigate = vi.fn()
+
+    setSessions([])
+    stashSessionDraft(previousStoredSessionId, 'draft migration trap', [])
+    enqueueQueuedPrompt(previousStoredSessionId, { attachments: [], text: 'queue migration trap' })
+    setSelectedStoredSessionId(previousStoredSessionId)
+    setActiveSessionId(runtimeSessionId)
+
+    render(
+      <StoredIdRotationHarness
+        activeSessionIdRef={activeSessionIdRef}
+        getRoutedStoredSessionId={() => previousStoredSessionId}
+        navigate={navigate}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+      />
+    )
+
+    act(() => {
+      setActiveSessionStoredIdRotation({
+        kind: 'rollover',
+        nextStoredSessionId,
+        previousStoredSessionId,
+        runtimeSessionId
+      })
+    })
+
+    await waitFor(() => expect($selectedStoredSessionId.get()).toBe(nextStoredSessionId))
+    expect(navigate).toHaveBeenCalledWith(sessionRoute(nextStoredSessionId), { replace: true })
+    expect(takeSessionDraft(previousStoredSessionId).text).toBe('draft migration trap')
+    expect(takeSessionDraft(nextStoredSessionId).text).toBe('')
+    expect(getQueuedPrompts(previousStoredSessionId)).toHaveLength(1)
+    expect(getQueuedPrompts(nextStoredSessionId)).toEqual([])
+
+    clearSessionDraft(previousStoredSessionId)
+    clearSessionDraft(nextStoredSessionId)
+    clearQueuedPrompts(previousStoredSessionId)
+    clearQueuedPrompts(nextStoredSessionId)
+  })
+
+  it('keeps compression draft and queue migration behavior', async () => {
+    const previousStoredSessionId = 'compression-before'
+    const nextStoredSessionId = 'compression-after'
+    const rootStoredSessionId = 'compression-root'
+    const runtimeSessionId = 'runtime-compression'
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: runtimeSessionId }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: previousStoredSessionId }
+
+    setSessions([
+      storedSession({ id: nextStoredSessionId, message_count: 2, _lineage_root_id: rootStoredSessionId })
+    ])
+    stashSessionDraft(previousStoredSessionId, 'draft to migrate', [])
+    enqueueQueuedPrompt(previousStoredSessionId, { attachments: [], text: 'queue to migrate' })
+    setSelectedStoredSessionId(previousStoredSessionId)
+    setActiveSessionId(runtimeSessionId)
+
+    render(
+      <StoredIdRotationHarness
+        activeSessionIdRef={activeSessionIdRef}
+        getRoutedStoredSessionId={() => previousStoredSessionId}
+        navigate={vi.fn()}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+      />
+    )
+
+    act(() => {
+      setActiveSessionStoredIdRotation({
+        kind: 'compression',
+        nextStoredSessionId,
+        previousStoredSessionId,
+        runtimeSessionId
+      })
+    })
+
+    await waitFor(() => expect($selectedStoredSessionId.get()).toBe(nextStoredSessionId))
+    expect(takeSessionDraft(previousStoredSessionId).text).toBe('')
+    expect(takeSessionDraft(rootStoredSessionId).text).toBe('draft to migrate')
+    expect(getQueuedPrompts(previousStoredSessionId)).toEqual([])
+    expect(getQueuedPrompts(rootStoredSessionId)).toHaveLength(1)
+
+    clearSessionDraft(previousStoredSessionId)
+    clearSessionDraft(rootStoredSessionId)
+    clearQueuedPrompts(previousStoredSessionId)
+    clearQueuedPrompts(rootStoredSessionId)
   })
 })
 
@@ -447,6 +549,7 @@ describe('createBackendSessionForSend profile routing', () => {
     $currentProvider.set('')
     $currentReasoningEffort.set('')
     setNewChatWorkspaceTarget(undefined)
+    $connection.set(null)
     vi.restoreAllMocks()
   })
 
@@ -481,10 +584,11 @@ describe('createBackendSessionForSend profile routing', () => {
     expect(params).toMatchObject({ profile: 'default' })
   })
 
-  it('tags new desktop chats as desktop sessions', async () => {
+  it('tags local desktop chats and advertises rollover capability', async () => {
+    $connection.set({ mode: 'local' } as never)
     const params = await createWith(() => {})
 
-    expect(params).toMatchObject({ source: 'desktop' })
+    expect(params).toMatchObject({ local_rollover_capable: true, source: 'desktop' })
   })
 
   it('passes the current workspace cwd into session.create', async () => {
@@ -562,6 +666,28 @@ describe('createBackendSessionForSend profile routing', () => {
     })
 
     expect(params).toMatchObject({ cwd: '/repo/app' })
+  })
+
+  it('advertises rollover capability for tile creation through the shared params helper', async () => {
+    $connection.set({ mode: 'local' } as never)
+    let createParams: Record<string, unknown> | undefined
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.create') {
+        createParams = params
+
+        return { session_id: 'tile-runtime', stored_session_id: 'tile-stored' } as never
+      }
+
+      return {} as never
+    })
+    let handle: HarnessHandle | null = null
+
+    render(<Harness onReady={next => (handle = next)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+    await act(async () => handle!.openNewSessionTile())
+
+    expect(createParams).toMatchObject({ local_rollover_capable: true, source: 'desktop' })
+    closeSessionTile('tile-stored')
   })
 })
 
@@ -926,6 +1052,7 @@ describe('resumeSession failure recovery', () => {
     // gateway's default DEFERRED build (transcript returns immediately, agent
     // pre-warms in the background). The client must NOT force the synchronous
     // path (eager_build) and is only `lazy` for subagent watch windows.
+    $connection.set({ mode: 'local' } as never)
     let resumeParams: Record<string, unknown> | undefined
 
     const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
@@ -944,7 +1071,7 @@ describe('resumeSession failure recovery', () => {
 
     expect(resumeParams).not.toHaveProperty('lazy')
     expect(resumeParams).not.toHaveProperty('eager_build')
-    expect(resumeParams).toMatchObject({ source: 'desktop' })
+    expect(resumeParams).toMatchObject({ local_rollover_capable: true, source: 'desktop' })
   })
 
   it('arms the failure latch when resume succeeds with an empty transcript for a non-empty stored session', async () => {
@@ -1156,6 +1283,7 @@ describe('branchStoredSession desktop source tagging', () => {
     $sessionTiles.set([])
     setSelectedStoredSessionId(null)
     vi.restoreAllMocks()
+    $connection.set(null)
   })
 
   it('opens the branch as a new tab and leaves the parent chat selected', async () => {
@@ -1196,6 +1324,7 @@ describe('branchStoredSession desktop source tagging', () => {
   })
 
   it('tags desktop branch sessions as desktop sessions', async () => {
+    $connection.set({ mode: 'local' } as never)
     let createParams: Record<string, unknown> | undefined
 
     const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
@@ -1221,6 +1350,7 @@ describe('branchStoredSession desktop source tagging', () => {
     await expect(branchStoredSession!('stored-parent')).resolves.toBe(true)
 
     expect(createParams).toMatchObject({
+      local_rollover_capable: true,
       parent_session_id: 'stored-parent',
       source: 'desktop'
     })

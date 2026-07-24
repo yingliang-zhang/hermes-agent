@@ -75,8 +75,10 @@ describe('useSessionTileDelegate resumeTile', () => {
     expect(runtimeId).toBe('runtime-1')
     expect(getSessionMessages).toHaveBeenCalledWith('stored-x', 'ai-engineer')
     expect(requestGateway).toHaveBeenCalledWith('session.resume', {
+      local_rollover_capable: false,
       session_id: 'stored-x',
       cols: 96,
+      source: 'desktop',
       profile: 'ai-engineer'
     })
   })
@@ -92,8 +94,10 @@ describe('useSessionTileDelegate resumeTile', () => {
     await sessionTileDelegate()!.resumeTile('stored-y')
 
     expect(requestGateway).toHaveBeenCalledWith('session.resume', {
+      local_rollover_capable: false,
       session_id: 'stored-y',
       cols: 96,
+      source: 'desktop',
       profile: 'default'
     })
   })

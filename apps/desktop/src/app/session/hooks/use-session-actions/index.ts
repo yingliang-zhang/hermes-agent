@@ -62,6 +62,7 @@ import {
   setTurnStartedAt,
   setYoloActive
 } from '@/store/session'
+import { sessionRolloverCapabilityParams } from '@/store/session-rollover'
 import {
   closeSessionTile,
   dropSessionState,
@@ -179,6 +180,7 @@ async function desktopSessionCreateParams(cwd: string): Promise<Record<string, u
   return {
     cols: 96,
     source: 'desktop',
+    ...sessionRolloverCapabilityParams(),
     ...(cwd && { cwd }),
     ...(profile ? { profile } : {}),
     ...(selection.model
@@ -246,6 +248,17 @@ export function useSessionActions({
       selectedStoredSessionId !== storedIdRotation.previousStoredSessionId ||
       (routedStoredSessionId !== null && routedStoredSessionId !== storedIdRotation.previousStoredSessionId)
     ) {
+      return
+    }
+
+    if (storedIdRotation.kind === 'rollover') {
+      setSelectedStoredSessionId(storedIdRotation.nextStoredSessionId)
+      selectedStoredSessionIdRef.current = storedIdRotation.nextStoredSessionId
+
+      if (routedStoredSessionId === storedIdRotation.previousStoredSessionId) {
+        navigate(sessionRoute(storedIdRotation.nextStoredSessionId), { replace: true })
+      }
+
       return
     }
 
@@ -854,6 +867,7 @@ export function useSessionActions({
           session_id: storedSessionId,
           cols: 96,
           source: 'desktop',
+          ...sessionRolloverCapabilityParams(),
           // Watch windows attach lazily (live mirror). Every other cold resume
           // gets the gateway's default deferred build: the RPC returns the
           // transcript immediately instead of blocking the switch on _make_agent
@@ -1111,6 +1125,7 @@ export function useSessionActions({
         const branched = await requestGateway<SessionCreateResponse>('session.create', {
           cols: 96,
           source: 'desktop',
+          ...sessionRolloverCapabilityParams(),
           ...(cwd && { cwd }),
           messages: branchMessages.map(({ content, role }) => ({ content, role })),
           ...(parentStoredId && { parent_session_id: parentStoredId })

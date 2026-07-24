@@ -946,6 +946,11 @@ DEFAULT_CONFIG = {
     "max_live_sessions": 16,
     "agent": {
         "max_turns": 90,
+        # Local Desktop session rollover remains opt-in. The client must also
+        # explicitly advertise local rollover capability for each session.
+        "session_rollover": {
+            "enabled": False,
+        },
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has

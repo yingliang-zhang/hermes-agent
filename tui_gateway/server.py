@@ -40,6 +40,16 @@ from tui_gateway.transport import (
     current_transport,
     reset_transport,
 )
+from tui_gateway.session_rollover import (
+    EligibilitySnapshot,
+    QuiescenceResult,
+    QuiescenceSnapshot,
+    RolloverFence,
+    evaluate_eligibility,
+    evaluate_quiescence,
+    new_offer,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +154,8 @@ _stdout_lock = threading.Lock()
 _cfg_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
 _prompt_lock = threading.Lock()
+_notification_delivery_handoff_lock = threading.Lock()
+_notification_delivery_handoffs = 0
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
@@ -265,6 +277,7 @@ _LONG_HANDLERS = frozenset(
         "session.active_list",
         "session.branch",
         "session.compress",
+        "session.rollover.commit",
         "session.list",
         "session.resume",
         "shell.exec",
@@ -1798,6 +1811,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
             current["agent"] = agent
+            _initialize_rollover_state(current, agent=agent)
+
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
@@ -2266,6 +2281,935 @@ def _session_db(session: dict):
         if close_db and db is not None:
             with contextlib.suppress(Exception):
                 db.close()
+
+
+def _parse_rollover_local_capability(params: dict, source: str) -> bool:
+    """Accept only the explicit local-Desktop capability bit."""
+    return (
+        source == "desktop"
+        and isinstance(params, dict)
+        and type(params.get("local_rollover_capable")) is bool
+        and params.get("local_rollover_capable") is True
+    )
+
+
+def _session_rollover_enabled() -> bool:
+    agent = _load_cfg().get("agent")
+    if not isinstance(agent, dict):
+        return False
+    session_rollover = agent.get("session_rollover")
+    return isinstance(session_rollover, dict) and session_rollover.get("enabled") is True
+
+
+def _compression_count(agent: Any) -> int | None:
+    compressor = getattr(agent, "context_compressor", None)
+    count = getattr(compressor, "compression_count", None)
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+        return None
+    return count
+
+
+def _initialize_rollover_state(
+    session: dict,
+    *,
+    params: dict | None = None,
+    source: str | None = None,
+    agent: Any = None,
+) -> None:
+    """Initialize one live runtime without trusting config as capability."""
+    if params is not None:
+        session["rollover_local_capable"] = _parse_rollover_local_capability(
+            params, source or ""
+        )
+    else:
+        session.setdefault("rollover_local_capable", False)
+    session.setdefault("rollover_consumed_compression_count", 0)
+    session.setdefault("_rollover_offer", None)
+    session.setdefault("_rollover_commit_result", None)
+    session.setdefault("_rollover_commit_lock", threading.Lock())
+    session.setdefault("_background_prompt_task_ids", set())
+    session.setdefault("_background_prompt_owned_task_ids", set())
+    if agent is not None and not session.get("_rollover_runtime_initialized"):
+        count = _compression_count(agent)
+        if count is not None:
+            session["rollover_consumed_compression_count"] = count
+        session["_rollover_runtime_initialized"] = True
+
+
+def _track_session_background_task(session: dict, task_id: str) -> None:
+    with session["history_lock"]:
+        for key in (
+            "_background_prompt_task_ids",
+            "_background_prompt_owned_task_ids",
+        ):
+            task_ids = session.get(key)
+            if not isinstance(task_ids, set):
+                task_ids = set()
+                session[key] = task_ids
+            task_ids.add(task_id)
+
+
+def _untrack_session_background_task(session: dict, task_id: str) -> None:
+    with session["history_lock"]:
+        task_ids = session.get("_background_prompt_task_ids")
+        if isinstance(task_ids, set):
+            task_ids.discard(task_id)
+
+
+def _forget_session_background_task(session: dict, task_id: str) -> None:
+    with session["history_lock"]:
+        for key in (
+            "_background_prompt_task_ids",
+            "_background_prompt_owned_task_ids",
+        ):
+            task_ids = session.get(key)
+            if isinstance(task_ids, set):
+                task_ids.discard(task_id)
+
+
+def _session_background_owned_task_ids(session: dict) -> tuple[str, ...]:
+    with session["history_lock"]:
+        task_ids = session.get("_background_prompt_owned_task_ids", set())
+        if not isinstance(task_ids, set) or any(
+            not isinstance(task_id, str) or not task_id for task_id in task_ids
+        ):
+            raise TypeError("background task ownership state is malformed")
+        return tuple(sorted(task_ids))
+
+
+
+def _durable_final_assistant_identity(
+    session: dict, final_content: Any
+) -> dict | None:
+    """Return the exact durable assistant tail delivered by this turn."""
+    try:
+        with _session_db(session) as db:
+            if db is None:
+                return None
+            identity = db.get_latest_active_message_identity(
+                str(session.get("session_key") or "")
+            )
+    except Exception:
+        return None
+    if not isinstance(identity, dict):
+        return None
+    if (
+        identity.get("role") != "assistant"
+        or type(identity.get("content")) is not type(final_content)
+        or identity.get("content") != final_content
+    ):
+        return None
+    message_id = identity.get("id")
+    if not isinstance(message_id, int) or isinstance(message_id, bool) or message_id <= 0:
+        return None
+    return identity
+
+
+def _rollover_bridge_blockers(sid: str, session: dict) -> tuple[str, ...]:
+    blockers: list[str] = []
+    with _prompt_lock:
+        if any(owner_sid == sid for owner_sid, _event in _pending.values()):
+            blockers.append("blocking_input")
+    from tools.approval import has_blocking_approval
+
+    if has_blocking_approval(str(session.get("session_key") or "")):
+        blockers.append("approval_pending")
+    return tuple(blockers)
+
+
+def _rollover_process_blockers(session: dict) -> tuple[str, ...]:
+    from tools.process_registry import process_registry
+
+    ownership_filters = [
+        {"session_key": str(session.get("session_key") or "")},
+        *(
+            {"task_id": task_id}
+            for task_id in _session_background_owned_task_ids(session)
+        ),
+    ]
+    for filters in ownership_filters:
+        rows = process_registry.list_sessions(**filters)
+        if not isinstance(rows, list):
+            raise TypeError("process registry returned a non-list snapshot")
+        for row in rows:
+            if not isinstance(row, dict) or row.get("status") not in {
+                "running",
+                "exited",
+            }:
+                raise TypeError("process registry returned a malformed record")
+            if row["status"] == "running":
+                return ("background_process_running",)
+            if (
+                row["status"] == "exited"
+                and row.get("notify_on_complete") is True
+                and row.get("completion_notification_enqueued") is not True
+            ):
+                return ("background_completion_publication_pending",)
+    return ()
+
+
+def _rollover_delegation_blockers(
+    sid: str, session: dict
+) -> tuple[str, ...]:
+    from tools.async_delegation import list_async_delegations
+
+    rows = list_async_delegations()
+    if not isinstance(rows, list):
+        raise TypeError("delegation registry returned a non-list snapshot")
+    session_key = str(session.get("session_key") or "")
+    agent_id = str(getattr(session.get("agent"), "session_id", "") or "")
+    owned_task_ids = set(_session_background_owned_task_ids(session))
+    for row in rows:
+        if not isinstance(row, dict):
+            raise TypeError("delegation registry returned a malformed record")
+        owned_by_background_task = any(
+            str(row.get(field) or "") in owned_task_ids
+            for field in ("origin_session", "session_key", "parent_session_id")
+        )
+        owned = (
+            str(row.get("origin_ui_session_id") or "") == sid
+            or str(row.get("session_key") or row.get("origin_session") or "")
+            == session_key
+            or str(row.get("parent_session_id") or "") in {session_key, agent_id}
+            or owned_by_background_task
+        )
+        if not owned:
+            continue
+        raw_state = row.get("status") or row.get("state")
+        if not isinstance(raw_state, str) or not raw_state.strip():
+            raise TypeError("delegation registry returned a malformed record")
+        state = raw_state.strip()
+        if state in {"running", "finalizing"}:
+            return ("async_delegation_running",)
+    return ()
+
+
+def _rollover_goal_blockers(session: dict) -> tuple[str, ...]:
+    with _session_db(session) as db:
+        if db is None:
+            raise RuntimeError("session database unavailable for goal query")
+        raw = db.get_meta(f"goal:{str(session.get('session_key') or '')}")
+    if raw in {None, ""}:
+        return ()
+    state = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(state, dict):
+        raise TypeError("goal query returned malformed state")
+    blockers: list[str] = []
+    if state.get("status") == "active":
+        blockers.append("goal_active")
+    if (
+        state.get("waiting_on_pid") is not None
+        or bool(state.get("waiting_on_session"))
+        or bool(state.get("waiting_until"))
+    ):
+        blockers.append("goal_waiting")
+    return tuple(blockers)
+
+@contextlib.contextmanager
+def _notification_delivery_handoff():
+    """Mark a queue dequeue-to-delivery handoff as rollover-visible."""
+    global _notification_delivery_handoffs
+    with _notification_delivery_handoff_lock:
+        _notification_delivery_handoffs += 1
+    try:
+        yield
+    finally:
+        with _notification_delivery_handoff_lock:
+            _notification_delivery_handoffs -= 1
+
+
+def _notification_delivery_handoff_active() -> bool:
+    with _notification_delivery_handoff_lock:
+        return _notification_delivery_handoffs > 0
+
+
+
+def _rollover_notification_blockers(
+    sid: str, session: dict
+) -> tuple[str, ...]:
+    from tools.async_delegation import load_deferred_notifications
+    from tools.process_registry import process_registry
+
+    rows = load_deferred_notifications(
+        str(session.get("session_key") or ""),
+        db_path=_deferred_notification_db_path(session),
+    )
+    if not isinstance(rows, list):
+        raise TypeError("deferred notification query returned a non-list snapshot")
+    if any(not isinstance(row, dict) for row in rows):
+        raise TypeError("deferred notification query returned a malformed record")
+    blockers: list[str] = []
+    if rows:
+        blockers.append("deferred_notification_adoption")
+    with _notification_delivery_handoff_lock:
+        if _notification_delivery_handoffs > 0:
+            blockers.append("notification_delivery_inflight")
+
+        completion_queue = process_registry.completion_queue
+        mutex = completion_queue.mutex
+        with mutex:
+            pending = list(completion_queue.queue)
+
+    session_key = str(session.get("session_key") or "")
+    for event in pending:
+        if not isinstance(event, dict):
+            raise TypeError("completion queue contained a malformed event")
+        addressed = bool(
+            str(event.get("origin_ui_session_id") or "")
+            or str(event.get("session_key") or "")
+            or str(event.get("parent_session_id") or "")
+        )
+        owned = (
+            str(event.get("origin_ui_session_id") or "") == sid
+            or str(event.get("session_key") or "") == session_key
+            or str(event.get("parent_session_id") or "") == session_key
+        )
+        if addressed and owned:
+            blockers.append("addressed_completion_pending")
+            break
+    return tuple(blockers)
+
+
+def _pending_steer_clear(agent: Any) -> bool:
+    lock = getattr(agent, "_pending_steer_lock", None)
+    if lock is None:
+        return not bool(getattr(agent, "_pending_steer", None))
+    with lock:
+        return not bool(getattr(agent, "_pending_steer", None))
+
+
+def _maybe_emit_session_rollover_offer(
+    sid: str,
+    session: dict,
+    *,
+    status: str,
+    final_content: Any,
+    final_message_id: Any,
+    history_adopted: bool,
+    settled_history_version: Any,
+    settled_turn_generation: Any,
+    persistence_error: bool,
+    goal_followup: Any,
+    claimed_notification_ids: Any,
+    turn_clean: bool | None = None,
+    _expected_offer: Any = None,
+    _commit_locked: Any = None,
+) -> QuiescenceResult:
+    """Build and emit one offer after strict, read-only revalidation."""
+    actual_turn_clean = (
+        status == "complete"
+        and isinstance(final_content, str)
+        and bool(final_content.strip())
+    )
+    clean = actual_turn_clean and (turn_clean is None or turn_clean is True)
+    try:
+        compute_host_clear = not _session_uses_compute_host(session)
+    except Exception:
+        compute_host_clear = False
+    eligibility = evaluate_eligibility(
+        EligibilitySnapshot(
+            config_enabled=_session_rollover_enabled(),
+            source_desktop=session.get("source") == "desktop",
+            local_capable=session.get("rollover_local_capable") is True,
+            compute_host_clear=compute_host_clear,
+            turn_clean=clean,
+            history_adopted=history_adopted is True,
+            persistence_clean=not persistence_error,
+        )
+    )
+    if not eligibility.allowed:
+        return eligibility
+
+    blockers: set[str] = set()
+    query_known = {
+        "bridge": True,
+        "process": True,
+        "delegation": True,
+        "goal": True,
+        "notification": True,
+    }
+    dependency_queries = (
+        (_rollover_bridge_blockers, (sid, session), "bridge"),
+        (_rollover_process_blockers, (session,), "process"),
+        (_rollover_delegation_blockers, (sid, session), "delegation"),
+        (_rollover_goal_blockers, (session,), "goal"),
+        (_rollover_notification_blockers, (sid, session), "notification"),
+    )
+    dependency_blockers = {name: () for _query, _args, name in dependency_queries}
+    for query, args, query_name in dependency_queries:
+        try:
+            current_blockers = tuple(query(*args))
+            dependency_blockers[query_name] = current_blockers
+            blockers.update(current_blockers)
+        except Exception:
+            query_known[query_name] = False
+
+    agent = session.get("agent")
+    try:
+        steer_clear = _pending_steer_clear(agent)
+    except Exception:
+        steer_clear = False
+
+    db_query_known = True
+    db_tail_exact = False
+    try:
+        with _session_db(session) as db:
+            if db is None:
+                raise RuntimeError("session database unavailable")
+            identity = db.get_latest_active_message_identity(
+                str(session.get("session_key") or "")
+            )
+        db_tail_exact = bool(
+            isinstance(identity, dict)
+            and identity.get("id") == final_message_id
+            and identity.get("role") == "assistant"
+            and type(identity.get("content")) is type(final_content)
+            and identity.get("content") == final_content
+        )
+    except Exception:
+        db_query_known = False
+
+    compression_count = _compression_count(agent)
+    consumed_count = session.get("rollover_consumed_compression_count")
+    compression_boundary_new = bool(
+        compression_count is not None
+        and isinstance(consumed_count, int)
+        and not isinstance(consumed_count, bool)
+        and compression_count > consumed_count
+    )
+    session_key = str(session.get("session_key") or "")
+    process_blockers = dependency_blockers["process"]
+    with session["history_lock"]:
+        history = session.get("history")
+        history_tail = history[-1] if isinstance(history, list) and history else None
+        history_stable = bool(
+            session.get("history_version") == settled_history_version
+            and session.get("turn_generation") == settled_turn_generation
+        )
+        history_tail_exact = bool(
+            isinstance(history_tail, dict)
+            and history_tail.get("role") == "assistant"
+            and type(history_tail.get("content")) is type(final_content)
+            and history_tail.get("content") == final_content
+        )
+        snapshot = QuiescenceSnapshot(
+            running_clear=not bool(session.get("running")),
+            inflight_clear=session.get("inflight_turn") is None,
+            reservation_clear=session.get("turn_reservation_token") is None,
+            steer_clear=steer_clear,
+            queued_prompt_clear=not bool(session.get("queued_prompt")),
+            queued_prompts_clear=not bool(session.get("queued_prompts")),
+            tools_clear=not bool(session.get("tool_started_at")),
+            background_tasks_clear=not bool(
+                session.get("_background_prompt_task_ids")
+            ),
+            bridge_clear="blocking_input" not in blockers,
+            approval_clear="approval_pending" not in blockers,
+            bridge_query_known=query_known["bridge"],
+            processes_clear=not process_blockers,
+            process_query_known=query_known["process"],
+            delegations_clear="async_delegation_running" not in blockers,
+            delegation_query_known=query_known["delegation"],
+            goal_active_clear="goal_active" not in blockers,
+            goal_waiting_clear="goal_waiting" not in blockers,
+            goal_followup_clear=not bool(goal_followup),
+            goal_query_known=query_known["goal"],
+            notification_texts_clear=not bool(
+                session.get("deferred_notification_texts")
+            ),
+            notification_ids_clear=not bool(
+                session.get("deferred_notification_event_ids")
+            ),
+            notification_adoption_clear=(
+                not bool(claimed_notification_ids)
+                and "deferred_notification_adoption" not in blockers
+            ),
+            notification_latch_clear=not bool(
+                session.get("defer_notifications_until_user")
+            ),
+            addressed_completion_clear=(
+                "addressed_completion_pending" not in blockers
+            ),
+            notification_delivery_clear=(
+                "notification_delivery_inflight" not in blockers
+            ),
+            notification_query_known=query_known["notification"],
+            history_stable=history_stable,
+            history_tail_exact=history_tail_exact,
+            agent_identity_current=(
+                agent is not None
+                and str(getattr(agent, "session_id", "") or "") == session_key
+            ),
+            db_tail_exact=db_tail_exact,
+            db_query_known=db_query_known,
+            compression_boundary_new=compression_boundary_new,
+        )
+        result = evaluate_quiescence(snapshot)
+        if process_blockers and "background_process_running" in result.reasons:
+            exact_reasons: list[str] = []
+            for reason in result.reasons:
+                if reason == "background_process_running":
+                    exact_reasons.extend(process_blockers)
+                else:
+                    exact_reasons.append(reason)
+            result = QuiescenceResult(
+                allowed=False,
+                reasons=tuple(dict.fromkeys(exact_reasons)),
+            )
+        if not result.allowed:
+            logger.debug(
+                "session rollover offer blocked: sid=%s reasons=%s",
+                sid,
+                result.reasons,
+            )
+            return result
+
+        fence = RolloverFence(
+            runtime_id=sid,
+            predecessor_stored_id=session_key,
+            settled_turn_generation=int(settled_turn_generation),
+            history_version=int(settled_history_version),
+            compression_count=int(compression_count),
+            final_message_id=int(final_message_id),
+            final_content=final_content,
+        )
+        existing = session.get("_rollover_offer")
+        if _expected_offer is not None:
+            expected_fence = getattr(_expected_offer, "fence", None)
+            if (
+                existing is not _expected_offer
+                or expected_fence != fence
+                or compression_count != expected_fence.compression_count
+            ):
+                return QuiescenceResult(
+                    allowed=False, reasons=("offer_superseded",)
+                )
+            if not callable(_commit_locked):
+                return QuiescenceResult(
+                    allowed=False, reasons=("commit_boundary_missing",)
+                )
+            _commit_locked()
+            return result
+        if getattr(existing, "fence", None) == fence:
+            return result
+        offer = new_offer(fence)
+        session["_rollover_offer"] = offer
+
+    _emit("session.rollover.offer", sid, offer.event_payload())
+    return result
+
+
+def _rollover_handoff_from_history(history: list, fence: RolloverFence) -> list[dict]:
+    """Build the exact bounded successor pair without a provider call."""
+    from agent.context_compressor import ContextCompressor
+    from hermes_state import build_session_rollover_handoff
+
+    if not isinstance(history, list) or not history:
+        raise ValueError("rollover predecessor history is empty")
+    tail = history[-1]
+    if (
+        not isinstance(tail, dict)
+        or tail.get("role") != "assistant"
+        or type(tail.get("content")) is not type(fence.final_content)
+        or tail.get("content") != fence.final_content
+    ):
+        raise ValueError("rollover final assistant history fence changed")
+    latest_summary = None
+    latest_user = None
+    for message in history[:-1]:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        if role not in {"user", "assistant"}:
+            continue
+        if ContextCompressor._is_context_summary_content(content):
+            latest_summary = content
+        elif (
+            role == "user"
+            and not message.get(HERMES_INTERNAL_SYSTEM_MARKER_KEY)
+            and isinstance(content, str)
+            and bool(content.strip())
+        ):
+            latest_user = content
+    if latest_summary is None:
+        raise ValueError("rollover requires a current compaction summary")
+    return build_session_rollover_handoff(
+        latest_summary, latest_user, fence.final_content
+    )
+
+
+def _rollover_runtime_snapshot(agent: Any) -> dict:
+    """Capture the live route needed to build an equivalent fresh agent."""
+    snapshot = {
+        "model": str(getattr(agent, "model", "") or ""),
+        "provider": str(getattr(agent, "provider", "") or ""),
+        "base_url": str(getattr(agent, "base_url", "") or ""),
+        "api_key": str(getattr(agent, "api_key", "") or ""),
+        "api_mode": str(getattr(agent, "api_mode", "") or ""),
+        "acp_command": getattr(agent, "acp_command", None),
+        "acp_args": list(getattr(agent, "acp_args", None) or []),
+        "credential_pool": getattr(agent, "_credential_pool", None),
+        "reasoning_config": copy.deepcopy(
+            getattr(agent, "reasoning_config", None)
+        ),
+        "service_tier": getattr(agent, "service_tier", None),
+        "request_overrides": copy.deepcopy(
+            getattr(agent, "request_overrides", None) or {}
+        ),
+        "providers_allowed": copy.deepcopy(
+            getattr(agent, "providers_allowed", None)
+        ),
+        "providers_ignored": copy.deepcopy(
+            getattr(agent, "providers_ignored", None)
+        ),
+        "providers_order": copy.deepcopy(
+            getattr(agent, "providers_order", None)
+        ),
+        "provider_sort": getattr(agent, "provider_sort", None),
+        "provider_require_parameters": bool(
+            getattr(agent, "provider_require_parameters", False)
+        ),
+        "provider_data_collection": getattr(
+            agent, "provider_data_collection", None
+        ),
+        "enabled_toolsets": copy.deepcopy(
+            getattr(agent, "enabled_toolsets", None)
+        ),
+        "disabled_toolsets": copy.deepcopy(
+            getattr(agent, "disabled_toolsets", None)
+        ),
+    }
+    if not snapshot["model"] or not snapshot["provider"]:
+        raise ValueError("rollover requires a resolved live model route")
+    return snapshot
+
+
+def _close_rollover_candidate(agent: Any, worker: Any, owned_db: Any = None) -> None:
+    if worker is not None:
+        with contextlib.suppress(Exception):
+            worker.close()
+    if agent is not None:
+        with contextlib.suppress(Exception):
+            agent._end_session_on_close = False
+        with contextlib.suppress(Exception):
+            agent.shutdown_memory_provider()
+        with contextlib.suppress(Exception):
+            agent.close()
+    if owned_db is not None:
+        with contextlib.suppress(Exception):
+            owned_db.close()
+
+
+def _clear_rollover_candidate_registration(session_key: str) -> None:
+    try:
+        from tools.approval import unregister_gateway_notify
+
+        unregister_gateway_notify(session_key)
+    except Exception:
+        pass
+    try:
+        from tools.terminal_tool import clear_task_env_overrides
+
+        clear_task_env_overrides(session_key)
+    except Exception:
+        pass
+
+
+@method("session.rollover.commit")
+def _(rid, params: dict) -> dict:
+    """Commit one exact local-Desktop rollover offer and swap its live agent."""
+    sid = params.get("session_id")
+    token = params.get("token")
+    if not isinstance(sid, str) or not sid:
+        return _err(rid, 4000, "session_id required")
+    if not isinstance(token, str) or not token:
+        return _err(rid, 4000, "rollover token must be a non-empty string")
+    with _sessions_lock:
+        session = _sessions.get(sid)
+    if session is None:
+        return _err(rid, 4001, "session not found")
+
+    commit_lock = session.setdefault("_rollover_commit_lock", threading.Lock())
+    with commit_lock:
+        with session["history_lock"]:
+            replay = session.get("_rollover_commit_result")
+            if isinstance(replay, dict) and replay.get("token") == token:
+                return _ok(rid, dict(replay))
+            offer = session.get("_rollover_offer")
+            fence = getattr(offer, "fence", None)
+            if (
+                not _session_rollover_enabled()
+                or session.get("source") != "desktop"
+                or session.get("rollover_local_capable") is not True
+                or getattr(offer, "token", None) != token
+                or not isinstance(fence, RolloverFence)
+                or fence.runtime_id != sid
+                or fence.predecessor_stored_id != session.get("session_key")
+            ):
+                return _err(rid, 4091, "rollover offer is stale or invalid")
+            predecessor_id = fence.predecessor_stored_id
+            old_agent = session.get("agent")
+            old_worker = session.get("slash_worker")
+            old_history = copy.deepcopy(session.get("history", []))
+            predecessor_turn_generation = int(session.get("turn_generation", 0))
+            predecessor_turn_state_revision = int(
+                session.get("turn_state_revision", 0)
+            )
+
+        candidate_agent = None
+        candidate_worker = None
+        candidate_db = None
+        owned_candidate_db = None
+        successor_id = _new_session_key()
+        lease_transferred = False
+        registered = False
+        committed: dict[str, Any] = {}
+        try:
+            with _session_db(session) as db:
+                if db is None:
+                    raise RuntimeError("session database unavailable")
+                durable_history = db.get_messages(predecessor_id)
+            handoff = _rollover_handoff_from_history(durable_history, fence)
+            runtime_snapshot = _rollover_runtime_snapshot(old_agent)
+
+            profile_home = str(session.get("profile_home") or "").strip()
+            home_token = None
+            context_tokens = None
+            candidate_db = getattr(old_agent, "_session_db", None)
+            if profile_home:
+                home_token = set_hermes_home_override(profile_home)
+            if candidate_db is None and profile_home:
+                from hermes_state import SessionDB
+                owned_candidate_db = SessionDB(db_path=Path(profile_home) / "state.db")
+                candidate_db = owned_candidate_db
+            elif candidate_db is None:
+                candidate_db = _get_db()
+            if candidate_db is None:
+                raise RuntimeError("session database unavailable for fresh agent")
+            try:
+                context_tokens = _set_session_context(
+                    successor_id,
+                    cwd=_session_cwd(session),
+                    ui_session_id=sid,
+                )
+                candidate_agent = _make_agent(
+                    sid,
+                    successor_id,
+                    session_id=successor_id,
+                    session_db=candidate_db,
+                    reasoning_config_override=runtime_snapshot["reasoning_config"],
+                    service_tier_override=runtime_snapshot["service_tier"],
+                    platform_override=_session_source(session),
+                    runtime_snapshot=runtime_snapshot,
+                )
+            finally:
+                if context_tokens is not None:
+                    _clear_session_context(context_tokens)
+                if home_token is not None:
+                    reset_hermes_home_override(home_token)
+
+            candidate_agent.background_review_callback = (
+                lambda message, _sid=sid: _emit(
+                    "review.summary", _sid, {"text": str(message)}
+                )
+            )
+            candidate_agent.memory_notifications = _load_memory_notifications()
+            candidate_worker = _SlashWorker(
+                successor_id,
+                getattr(candidate_agent, "model", _resolve_model()),
+                profile_home=session.get("profile_home"),
+            )
+            _wire_callbacks(sid)
+            try:
+                from tools.approval import (
+                    load_permanent_allowlist,
+                    register_gateway_notify,
+                )
+
+                register_gateway_notify(
+                    successor_id,
+                    lambda data: _emit_approval_request(sid, data),
+                )
+                registered = True
+                load_permanent_allowlist()
+            except Exception as exc:
+                raise RuntimeError("fresh approval callback registration failed") from exc
+            candidate_session = dict(session)
+            candidate_session["session_key"] = successor_id
+            candidate_session["agent"] = candidate_agent
+            _register_session_cwd(candidate_session)
+            ready = threading.Event()
+            ready.set()
+            result = {
+                "runtime_id": sid,
+                "predecessor_stored_id": predecessor_id,
+                "successor_stored_id": successor_id,
+                "token": token,
+            }
+            candidate_compression_count = _compression_count(candidate_agent) or 0
+            prebuilt_state = {
+                "agent": candidate_agent,
+                "agent_error": None,
+                "agent_ready": ready,
+                "attached_images": [],
+                "edit_snapshots": {},
+                "history": copy.deepcopy(handoff),
+                "history_version": 0,
+                "image_counter": 0,
+                "inflight_turn": None,
+                "last_active": time.time(),
+                "model_override": {
+                    key: runtime_snapshot.get(key)
+                    for key in (
+                        "model",
+                        "provider",
+                        "base_url",
+                        "api_mode",
+                    )
+                    if runtime_snapshot.get(key)
+                },
+                "create_reasoning_override": copy.deepcopy(
+                    runtime_snapshot["reasoning_config"]
+                ),
+                "create_service_tier_override": runtime_snapshot["service_tier"] or "",
+                "parent_session_id": None,
+                "pending_title": None,
+                "queued_prompt": None,
+                "queued_prompts": [],
+                "running": False,
+                "session_key": successor_id,
+                "slash_worker": candidate_worker,
+                "tool_started_at": {},
+                "turn_generation": predecessor_turn_generation,
+                "turn_origin": None,
+                "turn_reservation_token": None,
+                "turn_state_revision": predecessor_turn_state_revision + 1,
+                "turn_state_running": False,
+                "turn_token": None,
+                "deferred_notification_texts": [],
+                "deferred_notification_event_ids": set(),
+                "defer_notifications_until_user": False,
+                "_background_prompt_task_ids": set(),
+                "_background_prompt_owned_task_ids": set(),
+                "rollover_consumed_compression_count": candidate_compression_count,
+                "_rollover_offer": None,
+                "_rollover_commit_result": dict(result),
+                "_rollover_runtime_initialized": True,
+            }
+
+            holder = (
+                f"rollover:{os.getpid()}:{threading.get_ident()}:{uuid.uuid4().hex}"
+            )
+
+            def commit_locked() -> None:
+                nonlocal lease_transferred
+                with _sessions_lock:
+                    if _sessions.get(sid) is not session:
+                        raise RuntimeError("live rollover runtime was detached")
+                    if not _transfer_active_session_slot(
+                        sid, session, new_session_id=successor_id
+                    ):
+                        raise RuntimeError("active session lease transfer failed")
+                    lease_transferred = True
+                    with _session_db(session) as commit_db:
+                        if commit_db is None:
+                            raise RuntimeError("session database unavailable at commit")
+                        if not commit_db.try_acquire_compression_lock(
+                            predecessor_id, holder
+                        ):
+                            raise RuntimeError("rollover session lease unavailable")
+                        try:
+                            durable_successor = commit_db.complete_session_rollover(
+                                parent_session_id=predecessor_id,
+                                child_session_id=successor_id,
+                                holder=holder,
+                                expected_final_assistant_message_id=fence.final_message_id,
+                                expected_final_assistant_content=fence.final_content,
+                            )
+                            if durable_successor != successor_id:
+                                raise RuntimeError(
+                                    "durable rollover commit was rejected"
+                                )
+                            session.update(prebuilt_state)
+                            committed.update(result)
+                        finally:
+                            try:
+                                commit_db.release_compression_lock(
+                                    predecessor_id, holder
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "Failed to release compression lock after rollover commit: session=%s",
+                                    predecessor_id,
+                                    exc_info=True,
+                                )
+
+            revalidation = _maybe_emit_session_rollover_offer(
+                sid,
+                session,
+                status="complete",
+                final_content=fence.final_content,
+                final_message_id=fence.final_message_id,
+                history_adopted=True,
+                settled_history_version=fence.history_version,
+                settled_turn_generation=fence.settled_turn_generation,
+                persistence_error=False,
+                goal_followup=None,
+                claimed_notification_ids=set(),
+                _expected_offer=offer,
+                _commit_locked=commit_locked,
+            )
+            if not revalidation.allowed or not committed:
+                raise RuntimeError(
+                    "rollover revalidation failed: "
+                    + ", ".join(revalidation.reasons)
+                )
+        except Exception as exc:
+            if lease_transferred:
+                if not _transfer_active_session_slot(
+                    sid, session, new_session_id=predecessor_id
+                ):
+                    logger.error(
+                        "Failed to compensate active rollover lease: sid=%s predecessor=%s",
+                        sid,
+                        predecessor_id,
+                    )
+            if registered:
+                _clear_rollover_candidate_registration(successor_id)
+            _close_rollover_candidate(
+                candidate_agent, candidate_worker, owned_candidate_db
+            )
+            return _err(rid, 4091, f"session rollover commit failed: {exc}")
+
+        try:
+            from tools.approval import unregister_gateway_notify
+
+            unregister_gateway_notify(predecessor_id)
+        except Exception:
+            pass
+        with contextlib.suppress(Exception):
+            old_agent.background_review_callback = None
+        with contextlib.suppress(Exception):
+            old_agent._end_session_on_close = False
+        with contextlib.suppress(Exception):
+            old_agent.shutdown_memory_provider(old_history)
+        if old_worker is not None:
+            with contextlib.suppress(Exception):
+                old_worker.close()
+        if old_agent is not None:
+            with contextlib.suppress(Exception):
+                old_agent.close()
+        try:
+            from tools.terminal_tool import clear_task_env_overrides
+
+            clear_task_env_overrides(predecessor_id)
+        except Exception:
+            pass
+        _emit("session.rollover.complete", sid, dict(committed))
+        _emit("session.info", sid, _session_info(candidate_agent, session))
+        _schedule_mcp_late_refresh(sid, candidate_agent)
+        return _ok(rid, dict(committed))
 
 
 def _persist_session_git_meta(session: dict, cwd: str) -> None:
@@ -5445,6 +6389,7 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    runtime_snapshot: dict | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -5509,9 +6454,24 @@ def _make_agent(
     # Prefer a per-session model override (set by a prior in-session /model
     # switch) over global config/env resolution. Resume-time stored sessions may
     # also pass scalar model/provider/runtime knobs from the persisted DB row.
-    if isinstance(model_override, dict) and model_override.get("model"):
+    if runtime_snapshot is not None:
+        model = str(runtime_snapshot.get("model") or "")
+        runtime = {
+            "provider": runtime_snapshot.get("provider"),
+            "base_url": runtime_snapshot.get("base_url"),
+            "api_key": runtime_snapshot.get("api_key"),
+            "api_mode": runtime_snapshot.get("api_mode"),
+            "command": runtime_snapshot.get("acp_command"),
+            "args": list(runtime_snapshot.get("acp_args") or []),
+            "credential_pool": runtime_snapshot.get("credential_pool"),
+        }
+        if not model or not runtime["provider"]:
+            raise RuntimeError("rollover runtime snapshot is incomplete")
+    elif isinstance(model_override, dict) and model_override.get("model"):
         model = str(model_override.get("model") or "")
-        requested_provider = model_override.get("provider") or provider_override or None
+        requested_provider = (
+            model_override.get("provider") or provider_override or None
+        )
         override_base_url = model_override.get("base_url")
         override_api_key = model_override.get("api_key")
         override_api_mode = model_override.get("api_mode")
@@ -5561,10 +6521,12 @@ def _make_agent(
             model = model_override
         if provider_override:
             requested_provider = provider_override
-        resolution = _resolve_runtime_with_fallback({
-            "requested": requested_provider,
-            "target_model": model or None,
-        })
+        resolution = _resolve_runtime_with_fallback(
+            {
+                "requested": requested_provider,
+                "target_model": model or None,
+            }
+        )
         runtime = resolution.runtime
         if resolution.used_fallback:
             if not resolution.selected_model:
@@ -5597,16 +6559,54 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
-        enabled_toolsets=_load_enabled_toolsets(),
+        enabled_toolsets=(
+            runtime_snapshot.get("enabled_toolsets")
+            if runtime_snapshot is not None
+            else _load_enabled_toolsets()
+        ),
+        disabled_toolsets=(
+            runtime_snapshot.get("disabled_toolsets")
+            if runtime_snapshot is not None
+            else None
+        ),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
-        providers_allowed=_pr.get("only"),
-        providers_ignored=_pr.get("ignore"),
-        providers_order=_pr.get("order"),
-        provider_sort=_pr.get("sort"),
-        provider_require_parameters=_pr.get("require_parameters", False),
-        provider_data_collection=_pr.get("data_collection"),
+        providers_allowed=(
+            runtime_snapshot.get("providers_allowed")
+            if runtime_snapshot is not None
+            else _pr.get("only")
+        ),
+        providers_ignored=(
+            runtime_snapshot.get("providers_ignored")
+            if runtime_snapshot is not None
+            else _pr.get("ignore")
+        ),
+        providers_order=(
+            runtime_snapshot.get("providers_order")
+            if runtime_snapshot is not None
+            else _pr.get("order")
+        ),
+        provider_sort=(
+            runtime_snapshot.get("provider_sort")
+            if runtime_snapshot is not None
+            else _pr.get("sort")
+        ),
+        provider_require_parameters=(
+            runtime_snapshot.get("provider_require_parameters", False)
+            if runtime_snapshot is not None
+            else _pr.get("require_parameters", False)
+        ),
+        provider_data_collection=(
+            runtime_snapshot.get("provider_data_collection")
+            if runtime_snapshot is not None
+            else _pr.get("data_collection")
+        ),
+        request_overrides=(
+            runtime_snapshot.get("request_overrides", {})
+            if runtime_snapshot is not None
+            else None
+        ),
         platform=_resolve_agent_platform(platform_override),
         session_id=session_id or key,
         session_db=session_db if session_db is not None else _get_db(),
@@ -5666,6 +6666,7 @@ def _init_session(
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
         }
+        _initialize_rollover_state(_sessions[sid], agent=agent)
     _restore_activated_profile_completions(_sessions[sid])
     _hydrate_deferred_notification_state(_sessions[sid])
     db = session_db if session_db is not None else _get_db()
@@ -6655,6 +7656,11 @@ def _(rid, params: dict) -> dict:
             "tool_started_at": {},
             "transport": current_transport() or _stdio_transport,
         }
+        _initialize_rollover_state(
+            _sessions[sid],
+            params=params,
+            source=source,
+        )
         _register_session_cwd(_sessions[sid])
 
     _restore_activated_profile_completions(_sessions[sid])
@@ -7030,6 +8036,9 @@ def _(rid, params: dict) -> dict:
     )
 
     def _reuse_live_payload(sid: str, session: dict) -> dict:
+        _initialize_rollover_state(
+            session, params=params, source=_session_source(session)
+        )
         payload = _live_session_payload(
             sid,
             session,
@@ -7091,6 +8100,11 @@ def _(rid, params: dict) -> dict:
             close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
             profile_home=profile_home,
             lazy=True,
+        )
+        _initialize_rollover_state(
+            record,
+            params=params,
+            source=source,
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
             return _ok(rid, _reuse_live_payload(*live))
@@ -7186,6 +8200,11 @@ def _(rid, params: dict) -> dict:
             profile_home=profile_home,
             model_override=overrides.get("model_override"),
             resume_runtime_overrides=overrides or None,
+        )
+        _initialize_rollover_state(
+            record,
+            params=params,
+            source=source,
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
             return _ok(rid, _reuse_live_payload(*live))
@@ -7332,6 +8351,12 @@ def _(rid, params: dict) -> dict:
                 lease.release()
             return _err(rid, 5000, f"resume failed: {e}")
         session = _sessions.get(sid) or {}
+        _initialize_rollover_state(
+            session,
+            params=params,
+            source=source,
+            agent=agent,
+        )
     return _ok(
         rid,
         {
@@ -11149,33 +12174,34 @@ def _dispatch_goal_followup(rid, sid: str, session: dict, text: str) -> bool:
 def _drain_post_turn_notifications(rid, sid: str, session: dict) -> None:
     from tools.process_registry import process_registry
 
-    pending = process_registry.drain_notifications(
-        session_key=session.get("session_key", ""),
-        owns_event=lambda event: _session_owns_notification_event(sid, session, event),
-        skip_poll_observed=False,
-    )
-    for index, (event, text) in enumerate(pending):
-        try:
-            outcome = _dispatch_notification_turn(
-                rid,
-                sid,
-                session,
-                text,
-                event=event,
-                consumer="tui-post-turn",
-            )
-        except Exception:
-            for queued_event, _queued_text in pending[index:]:
-                process_registry.completion_queue.put(queued_event)
-            logger.exception(
-                "post-turn notification dispatch failed; requeued %d event(s)",
-                len(pending) - index,
-            )
-            break
-        if outcome == "busy":
-            for queued_event, _queued_text in pending[index:]:
-                process_registry.completion_queue.put(queued_event)
-            break
+    with _notification_delivery_handoff():
+        pending = process_registry.drain_notifications(
+            session_key=session.get("session_key", ""),
+            owns_event=lambda event: _session_owns_notification_event(sid, session, event),
+            skip_poll_observed=False,
+        )
+        for index, (event, text) in enumerate(pending):
+            try:
+                outcome = _dispatch_notification_turn(
+                    rid,
+                    sid,
+                    session,
+                    text,
+                    event=event,
+                    consumer="tui-post-turn",
+                )
+            except Exception:
+                for queued_event, _queued_text in pending[index:]:
+                    process_registry.completion_queue.put(queued_event)
+                logger.exception(
+                    "post-turn notification dispatch failed; requeued %d event(s)",
+                    len(pending) - index,
+                )
+                break
+            if outcome == "busy":
+                for queued_event, _queued_text in pending[index:]:
+                    process_registry.completion_queue.put(queued_event)
+                break
 
 
 def _notification_poller_loop(
@@ -11196,144 +12222,153 @@ def _notification_poller_loop(
     emitted = set()
     dispatch_failures_logged = set()
     while not stop_event.is_set() and not session.get("_finalized"):
-        try:
-            event = process_registry.completion_queue.get(timeout=0.5)
-        except Exception:
-            continue
-
-        if _notification_event_belongs_elsewhere(sid, session, event):
-            process_registry.completion_queue.put(event)
+        if process_registry.completion_queue.empty():
             time.sleep(0.1)
             continue
 
-        # What reaches here is not owned by another LIVE session. Addressed
-        # events still require positive proof before injection: exact UI origin,
-        # direct durable key, or compression lineage. If none proves ownership,
-        # the event is orphaned and must not be adopted by this chat. Truly
-        # ownerless ordinary notifications retain legacy global delivery.
-        requires_owner = _notification_event_requires_owner(event)
-        if requires_owner and not _session_owns_notification_event(sid, session, event):
-            log = (
-                logger.warning
-                if event.get("type") == "async_delegation"
-                else logger.debug
-            )
-            log(
-                "Dropping unowned %s notification (origin=%r key=%r) instead "
-                "of delivering to session %s",
-                event.get("type", "completion"),
-                str(event.get("origin_ui_session_id") or ""),
-                str(event.get("session_key") or ""),
-                sid,
-            )
-            continue
+        retry_delay = 0.0
+        with _notification_delivery_handoff():
+            try:
+                event = process_registry.completion_queue.get_nowait()
+            except queue.Empty:
+                continue
 
-        event_session_id = event.get("session_id", "")
-        if event.get("type") == "completion" and process_registry.is_completion_consumed(
-            event_session_id
-        ):
-            continue
-        text = format_process_notification(event)
-        if not text:
-            continue
+            if _notification_event_belongs_elsewhere(sid, session, event):
+                process_registry.completion_queue.put(event)
+                retry_delay = 0.1
+            else:
+                # What reaches here is not owned by another LIVE session.
+                # Addressed events still require positive proof before injection.
+                requires_owner = _notification_event_requires_owner(event)
+                if requires_owner and not _session_owns_notification_event(
+                    sid, session, event
+                ):
+                    log = (
+                        logger.warning
+                        if event.get("type") == "async_delegation"
+                        else logger.debug
+                    )
+                    log(
+                        "Dropping unowned %s notification (origin=%r key=%r) instead "
+                        "of delivering to session %s",
+                        event.get("type", "completion"),
+                        str(event.get("origin_ui_session_id") or ""),
+                        str(event.get("session_key") or ""),
+                        sid,
+                    )
+                    continue
 
-        dedup_key = _notification_event_dedup_key(event)
-        emit_status = dedup_key not in emitted
-        try:
-            outcome = _dispatch_notification_turn(
-                f"__notif__{int(time.time() * 1000)}",
-                sid,
-                session,
-                text,
-                emit_status=emit_status,
-                event=event,
-                consumer="tui-poller",
-            )
-        except Exception:
-            # Status is emitted before the agent turn starts. Remember the
-            # identity so retries retain the event without spamming that line.
-            if emit_status:
-                emitted.add(dedup_key)
-            process_registry.completion_queue.put(event)
-            if dedup_key not in dispatch_failures_logged:
-                dispatch_failures_logged.add(dedup_key)
-                logger.exception(
-                    "notification poller dispatch failed; requeued event %r",
-                    dedup_key,
-                )
-            time.sleep(0.25)
-            continue
-        if emit_status:
-            emitted.add(dedup_key)
-        if outcome == "busy":
-            process_registry.completion_queue.put(event)
-            time.sleep(0.25)
+                event_session_id = event.get("session_id", "")
+                if event.get("type") == "completion" and process_registry.is_completion_consumed(
+                    event_session_id
+                ):
+                    continue
+                text = format_process_notification(event)
+                if not text:
+                    continue
+
+                dedup_key = _notification_event_dedup_key(event)
+                emit_status = dedup_key not in emitted
+                try:
+                    outcome = _dispatch_notification_turn(
+                        f"__notif__{int(time.time() * 1000)}",
+                        sid,
+                        session,
+                        text,
+                        emit_status=emit_status,
+                        event=event,
+                        consumer="tui-poller",
+                    )
+                except Exception:
+                    # Status is emitted before the agent turn starts. Remember the
+                    # identity so retries retain the event without spamming that line.
+                    if emit_status:
+                        emitted.add(dedup_key)
+                    process_registry.completion_queue.put(event)
+                    if dedup_key not in dispatch_failures_logged:
+                        dispatch_failures_logged.add(dedup_key)
+                        logger.exception(
+                            "notification poller dispatch failed; requeued event %r",
+                            dedup_key,
+                        )
+                    retry_delay = 0.25
+                else:
+                    if emit_status:
+                        emitted.add(dedup_key)
+                    if outcome == "busy":
+                        process_registry.completion_queue.put(event)
+                        retry_delay = 0.25
+
+        if retry_delay:
+            time.sleep(retry_delay)
 
     deferred: list = []
-    while not process_registry.completion_queue.empty():
-        try:
-            event = process_registry.completion_queue.get_nowait()
-        except Exception:
-            break
-        if _notification_event_belongs_elsewhere(sid, session, event):
-            deferred.append(event)
-            continue
-        # Same positive-proof rule as the live loop. Preserve the existing
-        # shutdown behavior for orphaned delegation payloads by deferring them
-        # for a later resume; ordinary addressed orphans are dropped.
-        requires_owner = _notification_event_requires_owner(event)
-        if requires_owner and not _session_owns_notification_event(sid, session, event):
-            if event.get("type") == "async_delegation":
+    with _notification_delivery_handoff():
+        while not process_registry.completion_queue.empty():
+            try:
+                event = process_registry.completion_queue.get_nowait()
+            except queue.Empty:
+                break
+            if _notification_event_belongs_elsewhere(sid, session, event):
                 deferred.append(event)
-            else:
-                logger.debug(
-                    "Dropping unowned %s notification during shutdown drain "
-                    "(origin=%r key=%r)",
-                    event.get("type", "completion"),
-                    str(event.get("origin_ui_session_id") or ""),
-                    str(event.get("session_key") or ""),
-                )
-            continue
-        event_session_id = event.get("session_id", "")
-        if event.get("type") == "completion" and process_registry.is_completion_consumed(
-            event_session_id
-        ):
-            continue
-        text = format_process_notification(event)
-        if not text:
-            continue
+                continue
+            # Same positive-proof rule as the live loop. Preserve the existing
+            # shutdown behavior for orphaned delegation payloads by deferring them
+            # for a later resume; ordinary addressed orphans are dropped.
+            requires_owner = _notification_event_requires_owner(event)
+            if requires_owner and not _session_owns_notification_event(sid, session, event):
+                if event.get("type") == "async_delegation":
+                    deferred.append(event)
+                else:
+                    logger.debug(
+                        "Dropping unowned %s notification during shutdown drain "
+                        "(origin=%r key=%r)",
+                        event.get("type", "completion"),
+                        str(event.get("origin_ui_session_id") or ""),
+                        str(event.get("session_key") or ""),
+                    )
+                continue
+            event_session_id = event.get("session_id", "")
+            if event.get("type") == "completion" and process_registry.is_completion_consumed(
+                event_session_id
+            ):
+                continue
+            text = format_process_notification(event)
+            if not text:
+                continue
 
-        dedup_key = _notification_event_dedup_key(event)
-        emit_status = dedup_key not in emitted
-        try:
-            outcome = _dispatch_notification_turn(
-                f"__notif__{int(time.time() * 1000)}",
-                sid,
-                session,
-                text,
-                emit_status=emit_status,
-                event=event,
-                consumer="tui-poller",
-            )
-        except Exception:
+            dedup_key = _notification_event_dedup_key(event)
+            emit_status = dedup_key not in emitted
+            try:
+                outcome = _dispatch_notification_turn(
+                    f"__notif__{int(time.time() * 1000)}",
+                    sid,
+                    session,
+                    text,
+                    emit_status=emit_status,
+                    event=event,
+                    consumer="tui-poller",
+                )
+            except Exception:
+                if emit_status:
+                    emitted.add(dedup_key)
+                deferred.append(event)
+                if dedup_key not in dispatch_failures_logged:
+                    dispatch_failures_logged.add(dedup_key)
+                    logger.exception(
+                        "shutdown notification dispatch failed; requeued event %r",
+                        dedup_key,
+                    )
+                break
             if emit_status:
                 emitted.add(dedup_key)
-            deferred.append(event)
-            if dedup_key not in dispatch_failures_logged:
-                dispatch_failures_logged.add(dedup_key)
-                logger.exception(
-                    "shutdown notification dispatch failed; requeued event %r",
-                    dedup_key,
-                )
-            break
-        if emit_status:
-            emitted.add(dedup_key)
-        if outcome == "busy":
-            process_registry.completion_queue.put(event)
-            break
+            if outcome == "busy":
+                process_registry.completion_queue.put(event)
+                break
 
-    for event in deferred:
-        process_registry.completion_queue.put(event)
+        for event in deferred:
+            process_registry.completion_queue.put(event)
+
 
 
 def _async_delegation_display_metadata(evt: dict) -> dict:
@@ -12145,6 +13180,29 @@ def _run_prompt_submit(
                 f"{type(_drain_exc).__name__}: {_drain_exc}",
                 file=sys.stderr,
             )
+        if (
+            "result" in locals()
+            and isinstance(result, dict)
+            and result.get("completed") is True
+            and status == "complete"
+            and history_adopted
+            and not result.get("cleanup_errors")
+        ):
+            final_identity = _durable_final_assistant_identity(session, raw)
+            if final_identity is not None:
+                _maybe_emit_session_rollover_offer(
+                    sid,
+                    session,
+                    status=status,
+                    final_content=raw,
+                    final_message_id=final_identity["id"],
+                    history_adopted=history_adopted,
+                    settled_history_version=history_version + 1,
+                    settled_turn_generation=turn_token,
+                    persistence_error=False,
+                    goal_followup=goal_followup,
+                    claimed_notification_ids=claimed_notification_ids,
+                )
 
     run_thread = threading.Thread(target=run, daemon=True)
     session["_run_thread"] = run_thread
@@ -12774,10 +13832,12 @@ def _(rid, params: dict) -> dict:
     if not text:
         return _err(rid, 4012, "text required")
     task_id = f"bg_{uuid.uuid4().hex[:6]}"
+    _track_session_background_task(session, task_id)
 
     def run():
-        session_tokens = _set_session_context(task_id, cwd=_session_cwd(session))
+        session_tokens = None
         try:
+            session_tokens = _set_session_context(task_id, cwd=_session_cwd(session))
             from run_agent import AIAgent
 
             result = AIAgent(
@@ -12805,9 +13865,18 @@ def _(rid, params: dict) -> dict:
                 {"task_id": task_id, "text": f"error: {e}"},
             )
         finally:
-            _clear_session_context(session_tokens)
+            try:
+                if session_tokens is not None:
+                    _clear_session_context(session_tokens)
+            finally:
+                _untrack_session_background_task(session, task_id)
 
-    threading.Thread(target=run, daemon=True).start()
+    try:
+        background_thread = threading.Thread(target=run, daemon=True)
+        background_thread.start()
+    except Exception as e:
+        _forget_session_background_task(session, task_id)
+        return _err(rid, 5027, f"background prompt failed to start: {e}")
     return _ok(rid, {"task_id": task_id})
 
 
@@ -12873,8 +13942,11 @@ def _(rid, params: dict) -> dict:
     def run():
         # Pin the validated preview cwd, else the parent workspace — never an
         # invalid client path, which would silently fall back to the launch dir.
-        session_tokens = _set_session_context(task_id, cwd=(preview_cwd or _session_cwd(session)))
+        session_tokens = None
         try:
+            session_tokens = _set_session_context(
+                task_id, cwd=(preview_cwd or _session_cwd(session))
+            )
             from run_agent import AIAgent
             from tools.terminal_tool import register_task_env_overrides
 
@@ -12913,14 +13985,24 @@ def _(rid, params: dict) -> dict:
             )
         finally:
             try:
-                from tools.terminal_tool import clear_task_env_overrides
+                try:
+                    from tools.terminal_tool import clear_task_env_overrides
 
-                clear_task_env_overrides(task_id)
-            except Exception:
-                pass
-            _clear_session_context(session_tokens)
+                    clear_task_env_overrides(task_id)
+                except Exception:
+                    pass
+                if session_tokens is not None:
+                    _clear_session_context(session_tokens)
+            finally:
+                _untrack_session_background_task(session, task_id)
 
-    threading.Thread(target=run, daemon=True).start()
+    _track_session_background_task(session, task_id)
+    try:
+        restart_thread = threading.Thread(target=run, daemon=True)
+        restart_thread.start()
+    except Exception as e:
+        _forget_session_background_task(session, task_id)
+        return _err(rid, 5027, f"preview restart failed to start: {e}")
     return _ok(rid, {"task_id": task_id})
 
 

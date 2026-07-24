@@ -31,6 +31,7 @@ import {
   setMessages,
   setTurnStartedAt
 } from '@/store/session'
+import { sessionRolloverCapabilityParams } from '@/store/session-rollover'
 import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
 
@@ -615,6 +616,7 @@ export function usePromptActions({
           const resumed = await requestGateway<{ session_id: string }>('session.resume', {
             session_id: selectedStoredSessionIdRef.current,
             source: 'desktop',
+            ...sessionRolloverCapabilityParams(),
             ...(resumeProfile ? { profile: resumeProfile } : {})
           })
 
@@ -719,6 +721,7 @@ export function usePromptActions({
             const resumed = await requestGateway<{ session_id: string }>('session.resume', {
               session_id: selectedStoredSessionIdRef.current,
               source: 'desktop',
+              ...sessionRolloverCapabilityParams(),
               ...(resumeProfile ? { profile: resumeProfile } : {})
             })
 

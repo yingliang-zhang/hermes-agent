@@ -52,11 +52,7 @@ describe('useSessionStateCache — stored-id rotation provenance', () => {
       cache.updateSessionState('runtime-A', state => state, 'stored-A-next')
     })
 
-    expect($activeSessionStoredIdRotation.get()).toEqual({
-      nextStoredSessionId: 'stored-A-next',
-      previousStoredSessionId: 'stored-A',
-      runtimeSessionId: 'runtime-A'
-    })
+    expect($activeSessionStoredIdRotation.get()).toEqual({ kind: 'compression', nextStoredSessionId: 'stored-A-next', previousStoredSessionId: 'stored-A', runtimeSessionId: 'runtime-A' })
     expect(cache.runtimeIdByStoredSessionIdRef.current.has('stored-A')).toBe(false)
     expect(cache.runtimeIdByStoredSessionIdRef.current.get('stored-A-next')).toBe('runtime-A')
   })

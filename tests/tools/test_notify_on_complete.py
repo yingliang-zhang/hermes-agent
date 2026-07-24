@@ -60,6 +60,7 @@ class TestProcessSessionField:
     def test_set_true(self):
         s = ProcessSession(id="proc_1", command="echo hi", notify_on_complete=True)
         assert s.notify_on_complete is True
+        assert s.completion_notification_enqueued is None
 
 
 # =========================================================================
@@ -102,6 +103,7 @@ class TestCompletionQueue:
         assert completion["completion_reason"] == "exited"
         assert completion["termination_source"] == ""
         assert "build succeeded" in completion["output"]
+        assert s.completion_notification_enqueued is True
 
     def test_move_to_finished_nonzero_exit(self, registry):
         """Nonzero exit codes are captured correctly."""
@@ -139,6 +141,7 @@ class TestCompletionQueue:
         assert registry.completion_queue.qsize() == 1
         completion = registry.completion_queue.get_nowait()
         assert completion["exit_code"] == -15  # from the first (kill) call
+        assert s.completion_notification_enqueued is True
 
     def test_kill_process_sets_completion_reason_and_source(self, registry):
         s = _make_session(notify_on_complete=True, output="stopping")
@@ -221,6 +224,7 @@ class TestCheckpointNotify:
             data = json.loads((tmp_path / "procs.json").read_text())
             assert len(data) == 1
             assert data[0]["notify_on_complete"] is True
+            assert data[0]["completion_notification_enqueued"] is False
 
     def test_checkpoint_without_notify(self, registry, tmp_path):
         with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"):
@@ -245,6 +249,7 @@ class TestCheckpointNotify:
             assert recovered == 1
             s = registry.get("proc_live")
             assert s.notify_on_complete is True
+            assert s.completion_notification_enqueued is False
 
     def test_recover_requeues_notify_watchers(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"

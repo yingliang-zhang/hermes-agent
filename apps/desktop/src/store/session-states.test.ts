@@ -1,8 +1,24 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 
 import { group, split } from '@/components/pane-shell/tree/model'
+import { createClientSessionState } from '@/lib/chat-runtime'
+import {
+  $activeSessionStoredIdRotation,
+  setActiveSessionId,
+  setActiveSessionStoredIdRotation
+} from '@/store/session'
+import {
+  beginSessionRolloverCommit,
+  registerCompletedSessionRollover,
+  releaseSessionRolloverCommit
+} from '@/store/session-rollover'
 import type { SessionTile } from '@/store/session-states'
-import { orderTilesByTree, selectionHomesToWorkspace } from '@/store/session-states'
+import {
+  clearAllSessionStates,
+  orderTilesByTree,
+  publishSessionState,
+  selectionHomesToWorkspace
+} from '@/store/session-states'
 
 const tile = (storedSessionId: string): SessionTile => ({ storedSessionId })
 const tilePane = (id: string) => `session-tile:${id}`
@@ -42,5 +58,49 @@ describe('selectionHomesToWorkspace', () => {
 
   it('skips homing when the selected id is already an open tile', () => {
     expect(selectionHomesToWorkspace('a', tiles)).toBe(false)
+  })
+})
+
+describe('active stored-session rotation kind', () => {
+  const runtimeId = 'runtime-rollover'
+  const predecessorStoredId = 'stored-before'
+  const successorStoredId = 'stored-after'
+  const token = 'rollover-token'
+
+  afterEach(() => {
+    clearAllSessionStates()
+    setActiveSessionId(null)
+    setActiveSessionStoredIdRotation(null)
+    releaseSessionRolloverCommit(token)
+  })
+
+  it('consumes an exact completed rollover once and leaves later rotations as compression', () => {
+    setActiveSessionId(runtimeId)
+    publishSessionState(runtimeId, createClientSessionState(predecessorStoredId))
+
+    expect(beginSessionRolloverCommit(token)).toBe(true)
+    expect(
+      registerCompletedSessionRollover({ predecessorStoredId, runtimeId, successorStoredId, token })
+    ).toBe(true)
+
+    publishSessionState(runtimeId, createClientSessionState(successorStoredId))
+    expect($activeSessionStoredIdRotation.get()).toEqual({
+      kind: 'rollover',
+      nextStoredSessionId: successorStoredId,
+      previousStoredSessionId: predecessorStoredId,
+      runtimeSessionId: runtimeId
+    })
+
+    setActiveSessionStoredIdRotation(null)
+    publishSessionState(runtimeId, createClientSessionState(predecessorStoredId))
+    setActiveSessionStoredIdRotation(null)
+    publishSessionState(runtimeId, createClientSessionState(successorStoredId))
+
+    expect($activeSessionStoredIdRotation.get()).toEqual({
+      kind: 'compression',
+      nextStoredSessionId: successorStoredId,
+      previousStoredSessionId: predecessorStoredId,
+      runtimeSessionId: runtimeId
+    })
   })
 })
