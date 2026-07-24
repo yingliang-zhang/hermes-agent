@@ -244,6 +244,12 @@ def finalize_turn(
     # killing the turn.
     _cleanup_errors = []
 
+    # Verification nudges are protocol-valid user turns only for the immediate
+    # retry request. Candidate assistant rows have already been flushed, so the
+    # nudges can now be removed without losing any user-visible content. This
+    # also exposes the actual assistant tail for exact-content dedup below.
+    _drop_verification_continuation_scaffolding(messages)
+
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
     try:
@@ -310,10 +316,18 @@ def finalize_turn(
                 _tail = messages[-1] if messages else None
             except Exception:
                 _tail = None
-            _tail_role = _tail.get("role") if isinstance(_tail, dict) else None
-            if _tail_role != "assistant":
-                # Tail is not an assistant row — append the final response
-                # so the durable turn closes with the answer (#43849/#44100).
+            _tail_is_assistant = (
+                isinstance(_tail, dict) and _tail.get("role") == "assistant"
+            )
+            _tail_matches_final = (
+                _tail_is_assistant and _tail.get("content") == final_response
+            )
+            _tail_has_tool_calls = (
+                _tail_is_assistant and bool(_tail.get("tool_calls"))
+            )
+            if not _tail_is_assistant or (
+                not _tail_matches_final and not _tail_has_tool_calls
+            ):
                 messages.append({"role": "assistant", "content": final_response})
             elif isinstance(_tail, dict) and _tail.get("content") != final_response and _is_pure_tool_call_tail(_tail):
                 # The tail IS an assistant row, but a *pure tool-call turn*:

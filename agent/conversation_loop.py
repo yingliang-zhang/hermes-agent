@@ -49,6 +49,7 @@ from agent.turn_context import (
 )
 from agent.turn_retry_state import TurnRetryState
 from agent.message_sanitization import (
+    make_internal_system_marker,
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
     _sanitize_messages_non_ascii,
@@ -2655,10 +2656,9 @@ def run_conversation(
                                 _continue_content = _get_continuation_prompt(
                                     _is_partial_stream_stub, _dropped_tools
                                 )
-                                continue_msg = {
-                                    "role": "user",
-                                    "content": _continue_content,
-                                }
+                                continue_msg = make_internal_system_marker(
+                                    _continue_content
+                                )
                                 messages.append(continue_msg)
                                 agent._session_messages = messages
                                 _retry.restart_with_length_continuation = True
@@ -6237,13 +6237,10 @@ def run_conversation(
                     messages.append(interim_msg)
                     agent._emit_interim_assistant_message(interim_msg)
 
-                    continue_msg = {
-                        "role": "user",
-                        "content": (
-                            "[System: Continue now. Execute the required tool calls and only "
-                            "send your final answer after completing the task.]"
-                        ),
-                    }
+                    continue_msg = make_internal_system_marker(
+                        "[System: Continue now. Execute the required tool calls and only "
+                        "send your final answer after completing the task.]"
+                    )
                     messages.append(continue_msg)
                     agent._session_messages = messages
                     # An acknowledgment is explicitly non-final. Do not let its
@@ -6302,28 +6299,39 @@ def run_conversation(
                         getattr(agent, "_verification_stop_nudges", 0) + 1
                     )
                     final_msg["finish_reason"] = "verification_required"
-                    # The assistant response is real content — persist it and
-                    # emit to the UI as an interim message so the user sees the
-                    # attempted final answer before the verification loop runs.
-                    # Only the nudge is flagged synthetic so it gets stripped
-                    # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg)
+                    # Persist and surface the attempted answer so the user can
+                    # see it while the verification loop runs. Previously both
+                    # the answer and the nudge were flagged
+                    # ``_verification_stop_synthetic`` and suppressed from the
+                    # durable transcript — the user only saw the brief
+                    # post-verification response, never the full answer.
+                    #
+                    # The nudge stays synthetic (internal instruction, not for
+                    # display) but remains a protocol-valid user continuation
+                    # for the one request that consumes it. The finalizer drops
+                    # it from live history after the turn, while persistence
+                    # skips it at every flush. Superseded candidate rows remain
+                    # durable/displayable and replay repair discards them from
+                    # model context once a later assistant response exists.
                     messages.append(final_msg)
+                    agent._emit_interim_assistant_message(
+                        final_msg, force_display=True
+                    )
                     try:
-                        agent._flush_messages_to_session_db(messages, conversation_history)
+                        agent._flush_messages_to_session_db(
+                            messages, conversation_history
+                        )
                     except Exception:
                         logger.debug("verify-on-stop interim flush failed", exc_info=True)
-                    messages.append({
-                        "role": "user",
-                        "content": _verify_nudge,
-                        "_verification_stop_synthetic": True,
-                    })
+                    messages.append(make_internal_system_marker(
+                        _verify_nudge,
+                        _verification_stop_synthetic=True,
+                    ))
                     agent._session_messages = messages
-                    # Run the verification-stop loop silently — the nudge is an
-                    # internal turn that should not add noise to the user's
-                    # terminal. Keep a debug breadcrumb in agent.log for tracing.
-                    logger.debug("verification stop-loop nudge issued (attempt %d)",
-                                 agent._verification_stop_nudges)
+                    logger.debug(
+                        "verification stop-loop nudge issued (attempt %d)",
+                        agent._verification_stop_nudges,
+                    )
                     # Keep the attempted answer only as an explicit fallback for
                     # continuation-budget exhaustion.  ``final_response`` itself
                     # must be cleared so the finalizer can distinguish this gate
@@ -6373,25 +6381,27 @@ def run_conversation(
                 if _verify_nudge2:
                     agent._pre_verify_nudges = _attempt + 1
                     final_msg["finish_reason"] = "verify_hook_continue"
-                    # The assistant response is real content — persist it and
-                    # emit to the UI as an interim message so the user sees the
-                    # attempted final answer before the pre_verify loop runs.
-                    # Only the nudge is flagged synthetic so it gets stripped
-                    # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg)
+                    # Same one-request continuation contract as verify-on-stop:
+                    # publish the candidate, then use an ephemeral user nudge.
                     messages.append(final_msg)
+                    agent._emit_interim_assistant_message(
+                        final_msg, force_display=True
+                    )
                     try:
-                        agent._flush_messages_to_session_db(messages, conversation_history)
+                        agent._flush_messages_to_session_db(
+                            messages, conversation_history
+                        )
                     except Exception:
                         logger.debug("pre_verify interim flush failed", exc_info=True)
-                    messages.append({
-                        "role": "user",
-                        "content": _verify_nudge2,
-                        "_pre_verify_synthetic": True,
-                    })
+                    messages.append(make_internal_system_marker(
+                        _verify_nudge2,
+                        _pre_verify_synthetic=True,
+                    ))
                     agent._session_messages = messages
-                    logger.debug("pre_verify nudge issued (attempt %d)",
-                                 agent._pre_verify_nudges)
+                    logger.debug(
+                        "pre_verify nudge issued (attempt %d)",
+                        agent._pre_verify_nudges,
+                    )
                     _pending_verification_response = final_response
                     _pending_verification_response_previewed = (
                         agent._interim_content_was_streamed(final_response or "")

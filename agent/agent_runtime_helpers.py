@@ -38,6 +38,7 @@ from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_res
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED
 from agent.error_classifier import FailoverReason
+from agent.message_sanitization import HERMES_INTERNAL_SYSTEM_MARKER_KEY
 from agent.turn_context import drop_stale_api_content
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
@@ -479,17 +480,15 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
 
     Repairs applied:
       0. Consecutive ``assistant`` messages with no intervening
-         ``tool``/``user`` turn — merged into a single assistant turn
-         (union of ``tool_calls``, concatenated ``content``). Strict
-         OpenAI-compatible providers (DeepSeek v4, Moonshot/Kimi) reject
-         a history where an ``assistant`` message carrying ``tool_calls``
-         is immediately followed by another ``assistant`` message instead
-         of its ``tool`` results — HTTP 400 "An assistant message with
-         'tool_calls' must be followed by tool messages…". The split
-         shape is produced by recovery/continuation paths that append an
-         interim assistant turn (thinking-prefill, codex
-         incomplete-continuation) or by host-fed / legacy-persisted /
-         resumed histories. Refs #29148, #49147.
+         ``tool``/``user`` turn — provisional verification candidates are
+         replaced by the later assistant row for model replay; all other pairs
+         are merged into a single assistant turn (union of ``tool_calls``,
+         concatenated ``content``). Strict OpenAI-compatible providers
+         (DeepSeek v4, Moonshot/Kimi) reject a history where an ``assistant``
+         message carrying ``tool_calls`` is immediately followed by another
+         ``assistant`` message instead of its ``tool`` results — HTTP 400.
+         Recovery/continuation paths and resumed histories can produce this
+         split shape. Refs #29148, #49147, #62676.
       1. Stray ``tool`` messages whose ``tool_call_id`` doesn't match
          any preceding assistant tool_call — dropped.
       2. Consecutive ``user`` messages — merged with newline separator
@@ -2767,6 +2766,33 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             continue
         filtered.append(msg)
     messages = filtered
+
+    # --- Demote tagged Hermes system markers for strict providers (#48338) ---
+    # Hermes pivot/nudge records remain role="system" in memory and persistence
+    # so transcript consumers render them correctly. Strict OpenAI-compatible
+    # providers (vLLM, Qwen) reject those records mid-conversation, so demote
+    # only explicitly tagged Hermes markers on this per-call copy. Ordinary
+    # system-role prefills are provider input and must retain their configured
+    # role. Strip the private tag from every outbound message either way.
+    _demoted = 0
+    for _idx, _msg in enumerate(messages):
+        if not isinstance(_msg, dict) or HERMES_INTERNAL_SYSTEM_MARKER_KEY not in _msg:
+            continue
+        _is_internal_marker = _msg.get(HERMES_INTERNAL_SYSTEM_MARKER_KEY) is True
+        _wire_msg = {
+            _key: _value
+            for _key, _value in _msg.items()
+            if _key != HERMES_INTERNAL_SYSTEM_MARKER_KEY
+        }
+        if _idx > 0 and _is_internal_marker and _msg.get("role") == "system":
+            _wire_msg["role"] = "user"
+            _demoted += 1
+        messages[_idx] = _wire_msg
+    if _demoted:
+        _ra().logger.debug(
+            "Pre-call sanitizer: demoted %d tagged Hermes system marker(s) to user role",
+            _demoted,
+        )
 
     # --- Drop empty / malformed tool_calls arrays on assistant messages ---
     # An assistant message carrying ``tool_calls: []`` (an empty array) — or a

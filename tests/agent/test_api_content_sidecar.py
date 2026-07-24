@@ -942,6 +942,9 @@ class TestSessionRowExistsBeforePreflightCompaction:
             return compacted
 
         compressor = MagicMock()
+        # Match the real ContextCompressor's disabled default. MagicMock would
+        # otherwise synthesize this optional integer attribute dynamically.
+        compressor.hygiene_hard_message_limit = 0
         compressor.protect_first_n = 0
         compressor.protect_last_n = 0
         compressor.threshold_tokens = 1

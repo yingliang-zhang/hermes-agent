@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from hermes_state import SessionDB
 from run_agent import AIAgent
 
 
@@ -46,6 +47,22 @@ def agent(tmp_path, monkeypatch):
     return instance
 
 
+def _attach_real_db(agent, tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(agent.session_id, source="test", model=agent.model)
+    agent._session_db = db
+    agent._session_db_created = True
+    return db
+
+
+def _assistant_contents(db, session_id):
+    return [
+        row["content"]
+        for row in db.get_messages(session_id)
+        if row["role"] == "assistant"
+    ]
+
+
 def _assert_pending_response_survives(agent, result):
     assert result["final_response"] == "composed report"
     assert result["turn_exit_reason"] == "max_iterations_reached(1/1)"
@@ -76,8 +93,11 @@ def test_verify_on_stop_preserves_composed_report_at_budget_limit(agent, monkeyp
         result = agent.run_conversation("edit changed.py")
 
     _assert_pending_response_survives(agent, result)
-    # The assistant response persists (it is real, unflagged content).
-    assert not result["messages"][1].get("_verification_stop_synthetic")
+    # The published candidate is durable and becomes the budget fallback.
+    # Its one-request continuation nudge is removed before finalization, so the
+    # same assistant content is not appended a second time.
+    assert "_verification_stop_synthetic" not in result["messages"][1]
+    assert result["messages"][1]["content"] == "composed report"
 
 
 def test_pre_verify_preserves_composed_report_at_budget_limit(agent, monkeypatch):
@@ -101,8 +121,9 @@ def test_pre_verify_preserves_composed_report_at_budget_limit(agent, monkeypatch
         result = agent.run_conversation("edit changed.py")
 
     _assert_pending_response_survives(agent, result)
-    # The assistant response persists (it is real, unflagged content).
-    assert not result["messages"][1].get("_pre_verify_synthetic")
+    # The pre-verify path has the same exact-once finalizer contract.
+    assert "_pre_verify_synthetic" not in result["messages"][1]
+    assert result["messages"][1]["content"] == "composed report"
 
 
 def test_intermediate_ack_uses_summary_instead_of_premature_text(agent, monkeypatch):
@@ -147,87 +168,151 @@ def test_later_verified_response_supersedes_pending_report(agent, monkeypatch):
     agent._handle_max_iterations.assert_not_called()
 
 
-def test_multiple_verification_retries_publish_each_candidate_once(agent, monkeypatch):
-    """Multiple verification retries should publish each candidate once, in order."""
+def test_multiple_verification_retries_publish_each_candidate_once_in_order(
+    agent, monkeypatch, tmp_path
+):
+    """Every retry candidate is one durable row and one commentary event.
+
+    The terminal answer remains the normal final response; it is persisted once
+    by the finalizer and is not re-emitted as interim commentary.
+    """
+    db = _attach_real_db(agent, tmp_path)
     agent.max_iterations = 3
     agent.iteration_budget.max_total = 3
-    answers = iter([
-        _response("candidate one"),
-        _response("candidate two"),
-        _response("candidate three"),
-    ])
-    agent._interruptible_api_call = lambda _kwargs: next(answers)
-    agent._handle_max_iterations = MagicMock(return_value="replacement summary")
-    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+    answers = iter(
+        [
+            _response("candidate one"),
+            _response("candidate two"),
+            _response("verified final report"),
+        ]
+    )
+    request_roles = []
 
-    # Three nudges, then None (so the third candidate is the final response).
-    nudge_side_effects = ["verify it", "verify it", None]
+    def model_call(api_kwargs):
+        agent._turn_file_mutation_paths = {"changed.py"}
+        request_roles.append([message["role"] for message in api_kwargs["messages"]])
+        return next(answers)
 
     emitted = []
-    agent.interim_assistant_callback = lambda text, **kw: emitted.append(text)
+    agent._interruptible_api_call = model_call
+    agent.interim_assistant_callback = (
+        lambda text, **_kwargs: emitted.append(text)
+    )
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
 
     with (
         patch(
             "agent.verification_stop.build_verify_on_stop_nudge",
-            side_effect=nudge_side_effects,
+            side_effect=["verify once", "verify again", None],
         ),
         patch("hermes_cli.plugins.invoke_hook", return_value=[]),
     ):
         result = agent.run_conversation("edit changed.py")
 
-    # Each candidate was emitted as an interim message, in order.
+    assert result["final_response"] == "verified final report"
+    assert result["completed"] is True
     assert emitted == ["candidate one", "candidate two"]
-    # The final response is the last candidate.
-    assert result["final_response"] == "candidate three"
-    assert result["turn_exit_reason"] == "text_response(finish_reason=stop)"
-    assert result["completed"] is True
-    agent._handle_max_iterations.assert_not_called()
+    assert _assistant_contents(db, agent.session_id) == [
+        "candidate one",
+        "candidate two",
+        "verified final report",
+    ]
+    assert request_roles == [
+        ["system", "user"],
+        ["system", "user", "assistant", "user"],
+        ["system", "user", "assistant", "user", "assistant", "user"],
+    ]
+    assert not any(
+        message.get("_verification_stop_synthetic")
+        or message.get("_pre_verify_synthetic")
+        for message in result["messages"]
+    )
+
+    # Resume/replay keeps all three durable rows distinct, while protocol
+    # repair removes superseded provisional candidates from the model history.
+    replay = db.get_messages_as_conversation(agent.session_id)
+    agent._repair_message_sequence(replay)
+    assert [
+        message["content"]
+        for message in replay
+        if message["role"] == "assistant"
+    ] == ["verified final report"]
+    assert _assistant_contents(db, agent.session_id) == [
+        "candidate one",
+        "candidate two",
+        "verified final report",
+    ]
+    db.close()
 
 
-def test_verification_false_finalizes_candidate_once(agent, monkeypatch):
-    """When verification returns false/exception, the candidate is finalized once."""
-    agent._interruptible_api_call = lambda _kwargs: _response("the answer")
-    agent._handle_max_iterations = MagicMock(return_value="replacement summary")
-    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+@pytest.mark.parametrize("verification_outcome", [False, RuntimeError("verifier crashed")])
+def test_verification_false_or_exception_finalizes_candidate_once(
+    agent, monkeypatch, tmp_path, verification_outcome
+):
+    """A failed verifier decision happens before interim publication.
 
+    False and exceptions both fail open: the candidate becomes the one terminal
+    response, so the return value and durable transcript cannot disagree.
+    """
+    db = _attach_real_db(agent, tmp_path)
     emitted = []
-    agent.interim_assistant_callback = lambda text, **kw: emitted.append(text)
 
-    with (
-        # build_verify_on_stop_nudge raises — simulates verification check failure
+    def model_call(_api_kwargs):
+        agent._turn_file_mutation_paths = {"changed.py"}
+        return _response("candidate after verifier failure")
+
+    agent._interruptible_api_call = model_call
+    agent.interim_assistant_callback = (
+        lambda text, **_kwargs: emitted.append(text)
+    )
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+    verifier = (
         patch(
             "agent.verification_stop.build_verify_on_stop_nudge",
-            side_effect=RuntimeError("verify check crashed"),
-        ),
-        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
-    ):
+            side_effect=verification_outcome,
+        )
+        if isinstance(verification_outcome, Exception)
+        else patch(
+            "agent.verification_stop.build_verify_on_stop_nudge",
+            return_value=verification_outcome,
+        )
+    )
+
+    with verifier, patch("hermes_cli.plugins.invoke_hook", return_value=[]):
         result = agent.run_conversation("edit changed.py")
 
-    # No interim emission because verification did not run (exception path
-    # sets _verify_nudge = None, so the candidate becomes the final response
-    # without an interim emission).
-    assert result["final_response"] == "the answer"
+    assert result["final_response"] == "candidate after verifier failure"
     assert result["completed"] is True
-    agent._handle_max_iterations.assert_not_called()
+    assert emitted == []
+    assert _assistant_contents(db, agent.session_id) == [
+        "candidate after verifier failure"
+    ]
+    db.close()
 
 
 def test_verify_on_stop_emits_interim_response_to_ui(agent, monkeypatch):
-    """The verify-on-stop path must emit the full response to the UI callback.
+    """The full assistant response must reach the UI when verification stop
+    triggers — not just the terse post-verification reply. (#62657)
 
-    With no streaming set up in this test, _interim_content_was_streamed
-    returns False, so already_streamed is False — the callback reports
-    content the UI has not seen yet.
+    When the response was already streamed (Desktop gateway), the callback
+    must still send it as a standalone commentary bubble (force_display=True)
+    so it survives the subsequent verification messages.
     """
-    agent._interruptible_api_call = lambda _kwargs: _response("composed report")
+    emitted = []
+    call_kwargs = []
+    def _capture(text, **kw):
+        emitted.append(text)
+        call_kwargs.append(kw)
+
+    agent.interim_assistant_callback = _capture
+
+    def model_call(_api_kwargs):
+        agent._turn_file_mutation_paths = {"changed.py"}
+        return _response("full detailed report with tables and analysis")
+
+    agent._interruptible_api_call = model_call
     agent._handle_max_iterations = MagicMock(return_value="replacement summary")
     monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
-
-    callback_calls = []
-
-    def capture_callback(text, *, already_streamed=None):
-        callback_calls.append({"text": text, "already_streamed": already_streamed})
-
-    agent.interim_assistant_callback = capture_callback
 
     with (
         patch("agent.verification_stop.build_verify_on_stop_nudge", return_value="verify it"),
@@ -235,13 +320,24 @@ def test_verify_on_stop_emits_interim_response_to_ui(agent, monkeypatch):
     ):
         result = agent.run_conversation("edit changed.py")
 
-    # The callback was called with the full response text and already_streamed=False
-    assert len(callback_calls) == 1
-    assert callback_calls[0]["text"] == "composed report"
-    assert callback_calls[0]["already_streamed"] is False
-
-    # The candidate persists as the final response.
-    assert result["final_response"] == "composed report"
+    # The full response was emitted to the UI callback.
+    assert any("full detailed report" in e for e in emitted), (
+        f"expected full response in emitted messages, got: {emitted}"
+    )
+    # force_display=True → already_streamed=False so the gateway calls
+    # on_commentary() (standalone bubble), not on_segment_break() (which
+    # just finalizes the streaming buffer and gets overwritten).
+    assert any(kw.get("already_streamed") is False for kw in call_kwargs), (
+        f"expected already_streamed=False in at least one call, got: {call_kwargs}"
+    )
+    # The response was also persisted to the in-memory message list without
+    # the synthetic flag.
+    assistant_msgs = [m for m in result["messages"] if m["role"] == "assistant"]
+    assert any(
+        "full detailed report" in (m.get("content") or "")
+        and "_verification_stop_synthetic" not in m
+        for m in assistant_msgs
+    )
 
 
 def test_streamed_interim_then_different_summary_not_marked_previewed(agent, monkeypatch):
@@ -311,9 +407,6 @@ def test_streamed_verification_candidate_reused_marked_previewed(agent, monkeypa
     ):
         result = agent.run_conversation("edit changed.py")
 
-    # The candidate was already streamed, so the callback reports already_streamed=True.
-    assert len(callback_calls) == 1
-    assert callback_calls[0]["already_streamed"] is True
     # The candidate is reused as the final response.
     assert result["final_response"] == "composed report"
     # CRITICAL: response_previewed must be True — the reused candidate was

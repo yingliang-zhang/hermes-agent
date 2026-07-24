@@ -171,6 +171,7 @@ from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock
 from agent.process_bootstrap import _get_proxy_from_env  # noqa: F401
 from agent.message_sanitization import (  # noqa: F401
     _SURROGATE_RE,
+    HERMES_INTERNAL_SYSTEM_MARKER_KEY,
     _sanitize_surrogates,
     _sanitize_structure_surrogates,
     _sanitize_messages_surrogates,
@@ -2083,6 +2084,9 @@ class AIAgent:
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                    internal_system_marker=bool(
+                        msg.get(HERMES_INTERNAL_SYSTEM_MARKER_KEY)
+                    ),
                     timestamp=_row_timestamp,
                     api_content=_row_api_content,
                     display_kind=(
@@ -5271,17 +5275,15 @@ class AIAgent:
             logger.debug("interim_assistant_callback error", exc_info=True)
 
     def _emit_interim_assistant_message(
-        self, assistant_msg: Dict[str, Any]
+        self, assistant_msg: Dict[str, Any], *, force_display: bool = False
     ) -> None:
         """Surface a real mid-turn assistant commentary message to the UI layer.
 
-        Does NOT set ``_response_was_previewed`` — that flag means "the final
-        response was already shown to the user," but this helper is called for
-        ordinary tool-call narration, intermediate acknowledgements, and
-        verification candidates alike. Setting it here would cause the CLI to
-        suppress a *different* final summary (e.g. from ``_handle_max_iterations``)
-        when the only streamed text was unrelated mid-turn commentary. (#65919
-        review: response-loss blocker)
+        Ordinary commentary does not set ``_response_was_previewed``: it may
+        differ from a later terminal summary. When ``force_display`` is True,
+        emit a standalone commentary bubble even if the text was streamed via
+        ``stream_delta_callback``. Verification candidates need that boundary:
+        later verification output can otherwise overwrite the stream buffer.
         """
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None or not isinstance(assistant_msg, dict):
@@ -5310,7 +5312,10 @@ class AIAgent:
             or self._interim_text_was_delivered(visible)
         ):
             return
-        already_streamed = self._interim_content_was_streamed(visible)
+        already_streamed = (
+            False if force_display
+            else self._interim_content_was_streamed(visible)
+        )
         try:
             cb(visible, already_streamed=already_streamed)
             if undelivered_parts:
