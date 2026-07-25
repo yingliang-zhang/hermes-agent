@@ -38,7 +38,9 @@ import {
   $sessions,
   $yoloActive,
   type NewChatWorkspaceTarget,
+  resetDraftCodingWorkflowOverride,
   resolveComposerSessionKey,
+  resolveDraftCodingWorkflow,
   sessionPinId,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
@@ -48,6 +50,7 @@ import {
   setCurrentCwd,
   setCurrentCwdTransient,
   setCurrentServiceTier,
+  setCurrentSessionCodingWorkflow,
   setCurrentUsage,
   setFreshDraftReady,
   setIntroSeed,
@@ -73,7 +76,7 @@ import {
 } from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { isWatchWindow } from '@/store/windows'
-import type { SessionCreateResponse, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
+import type { CodingWorkflow, SessionCreateResponse, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
 
 import { NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../../types'
@@ -162,16 +165,21 @@ function reconcileAuthoritativeMessages(
 // A no-op for single-profile/local-pooled users (a backend resolves its own launch
 // profile to None). The sticky UI model/effort/fast ride as per-session overrides,
 // never the profile default (that lives in Settings → Model).
-async function desktopSessionCreateParams(cwd: string): Promise<Record<string, unknown>> {
+interface DesktopSessionCreateParams extends Record<string, unknown> {
+  coding_workflow: CodingWorkflow
+}
+
+async function desktopSessionCreateParams(cwd: string): Promise<DesktopSessionCreateParams> {
   // Treat Send as the linearization point for the visible selector state. The
   // profile handshake below can yield long enough for background config/model
   // refreshes to finish; reading atoms afterward would silently create the
   // session with a different selection than the one the user submitted.
+  const codingWorkflow = resolveDraftCodingWorkflow()
   const selection = {
     effort: $currentReasoningEffort.get().trim(),
     fast: $currentFastMode.get(),
-    model: $currentModel.get().trim(),
-    provider: $currentProvider.get().trim()
+    model: codingWorkflow === 'hybrid-v1' ? 'gpt-5.6-sol' : $currentModel.get().trim(),
+    provider: codingWorkflow === 'hybrid-v1' ? 'custom:sudo' : $currentProvider.get().trim()
   }
 
   const profile = $newChatProfile.get() ?? normalizeProfileKey($activeGatewayProfile.get())
@@ -187,7 +195,10 @@ async function desktopSessionCreateParams(cwd: string): Promise<Record<string, u
       ? { model: selection.model, ...(selection.provider ? { provider: selection.provider } : {}) }
       : {}),
     ...(selection.effort ? { reasoning_effort: selection.effort } : {}),
-    fast: selection.fast
+    fast: selection.fast,
+    // A draft choice wins over the backend-owned profile default. Hybrid is
+    // canonicalized to the fixed Sol controller before session.create.
+    coding_workflow: codingWorkflow
   }
 }
 
@@ -325,6 +336,7 @@ export function useSessionActions({
 
       setActiveSessionId(null)
       activeSessionIdRef.current = null
+      resetDraftCodingWorkflowOverride()
       setSelectedStoredSessionId(null)
       selectedStoredSessionIdRef.current = null
       setMessages([])
@@ -430,6 +442,8 @@ export function useSessionActions({
 
         setFreshDraftReady(false)
         setNewChatWorkspaceTarget(undefined)
+        setCurrentSessionCodingWorkflow(params.coding_workflow)
+        resetDraftCodingWorkflowOverride()
         setActiveSessionId(created.session_id)
         setSelectedStoredSessionId(stored)
         setSessionStartedAt(Date.now())

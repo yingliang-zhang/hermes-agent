@@ -256,7 +256,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   const { refreshHermesConfig, sttEnabled, voiceMaxRecordingSeconds } = useHermesConfig({ activeSessionIdRef })
 
-  const { refreshCurrentModel, selectModel, updateModelOptionsCache } = useModelControls({
+  const { refreshCurrentModel, selectHybrid, selectModel, updateModelOptionsCache } = useModelControls({
     queryClient,
     requestGateway
   })
@@ -821,6 +821,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     openAgents,
     openCommandCenterSection,
     requestGateway,
+    selectHybrid,
     selectModel,
     toggleCommandCenter
   }

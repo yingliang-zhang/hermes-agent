@@ -1,7 +1,7 @@
 import type * as React from 'react'
 
 import type { ChatMessage } from '@/lib/chat-messages'
-import type { SessionMessage, TurnOrigin, UsageStats } from '@/types/hermes'
+import type { CodingWorkflow, SessionMessage, TurnOrigin, UsageStats } from '@/types/hermes'
 
 export interface CancelRunOptions {
   preserveBusyUntilSettled?: boolean
@@ -177,6 +177,9 @@ export interface ClientSessionState {
   cwd: string
   model: string
   provider: string
+  /** Coding workflow this session runs under (orthogonal to model/provider).
+   *  Degrades to `coupled-v1` when absent — see {@link CodingWorkflow}. */
+  codingWorkflow: CodingWorkflow
   reasoningEffort: string
   serviceTier: string
   fast: boolean

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { SegmentedControl } from '@/components/ui/segmented-control'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
@@ -28,6 +29,7 @@ import { AlertTriangle, Cpu, Loader2 } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { notifyError } from '@/store/notifications'
 import { startManualLocalEndpoint, startManualOnboarding, startManualProviderOAuth } from '@/store/onboarding'
+import type { CodingWorkflow } from '@/types/hermes'
 
 import { invalidateHermesConfig, setHermesConfigCache, useHermesConfigRecord } from '../hooks/use-config-record'
 import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
@@ -197,6 +199,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   const [providers, setProviders] = useState<ModelOptionProvider[]>([])
   const [selectedProvider, setSelectedProvider] = useState('')
   const [selectedModel, setSelectedModel] = useState('')
+  const [selectedCodingWorkflow, setSelectedCodingWorkflow] = useState<CodingWorkflow>('coupled-v1')
   const [auxiliary, setAuxiliary] = useState<AuxiliaryModelsResponse | null>(null)
   const [moa, setMoa] = useState<MoaConfigResponse | null>(null)
   const [selectedMoaPreset, setSelectedMoaPreset] = useState('')
@@ -248,6 +251,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
 
       setMainModel({ model: modelInfo.model, provider: modelInfo.provider })
       setProviders(modelOptions.providers || [])
+      setSelectedCodingWorkflow(modelInfo.coding_workflow ?? modelOptions.coding_workflow ?? 'coupled-v1')
 
       if (replaceSelection) {
         setSelectedProvider(modelInfo.provider)
@@ -615,23 +619,32 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   }, [selectedProvider, selectedProviderRow])
 
   const applyMainModel = useCallback(async () => {
-    if (!selectedProvider || !selectedModel) {
+    const hybrid = selectedCodingWorkflow === 'hybrid-v1'
+
+    if (!hybrid && (!selectedProvider || !selectedModel)) {
       return
     }
 
+    const requestedProvider = hybrid ? 'custom:sudo' : selectedProvider
+    const requestedModel = hybrid ? 'gpt-5.6-sol' : selectedModel
     const epoch = profileEpoch.current
     setApplying(true)
     setError('')
 
     try {
-      const result = await setModelAssignment({ model: selectedModel, provider: selectedProvider, scope: 'main' })
+      const result = await setModelAssignment({
+        coding_workflow: selectedCodingWorkflow,
+        model: requestedModel,
+        provider: requestedProvider,
+        scope: 'main'
+      })
 
       if (profileEpoch.current !== epoch) {
         return
       }
 
-      const provider = result.provider || selectedProvider
-      const model = result.model || selectedModel
+      const provider = result.provider || requestedProvider
+      const model = result.model || requestedModel
       setMainModel({ provider, model })
       setSwitchStaleAux(result.stale_aux ?? [])
       onMainModelChanged?.(provider, model)
@@ -641,7 +654,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     } finally {
       setApplying(false)
     }
-  }, [onMainModelChanged, refresh, selectedModel, selectedProvider])
+  }, [onMainModelChanged, refresh, selectedCodingWorkflow, selectedModel, selectedProvider])
 
   const setAuxiliaryToMain = useCallback(
     async (task: string) => {
@@ -732,6 +745,17 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     <div className="grid gap-6">
       <section>
         <p className="mb-3 text-xs text-muted-foreground">{m.appliesDesc}</p>
+        <div className="mb-3 flex flex-wrap items-center gap-2">
+          <span className="text-xs text-muted-foreground">{m.workflow}</span>
+          <SegmentedControl
+            onChange={setSelectedCodingWorkflow}
+            options={[
+              { id: 'coupled-v1', label: m.coupled },
+              { id: 'hybrid-v1', label: m.hybrid }
+            ]}
+            value={selectedCodingWorkflow}
+          />
+        </div>
         <div className="flex flex-wrap items-center gap-2">
           <Select onValueChange={setSelectedProvider} value={selectedProvider}>
             <SelectTrigger className={cn('min-w-40', CONTROL_TEXT)}>
@@ -745,7 +769,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
               ))}
             </SelectContent>
           </Select>
-          {needsSetup ? (
+          {needsSetup && selectedCodingWorkflow !== 'hybrid-v1' ? (
             setupIsApiKey ? (
               <>
                 <Input
@@ -790,7 +814,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
                 </SelectContent>
               </Select>
               <Button
-                disabled={!selectedProvider || !selectedModel || applying}
+                disabled={(selectedCodingWorkflow !== 'hybrid-v1' && (!selectedProvider || !selectedModel)) || applying}
                 onClick={() => void applyMainModel()}
                 size="sm"
               >
@@ -800,7 +824,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
             </>
           )}
         </div>
-        {needsSetup && !setupIsApiKey && selectedProviderRow && (
+        {needsSetup && selectedCodingWorkflow !== 'hybrid-v1' && !setupIsApiKey && selectedProviderRow && (
           <p className="mt-2 text-xs text-muted-foreground">
             {selectedProviderRow?.auth_type === 'api_key'
               ? `${selectedProviderRow?.name} needs an API key — set it up to choose a model.`

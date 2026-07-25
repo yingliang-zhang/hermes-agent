@@ -17156,6 +17156,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return delivered
 
+    def _resolve_session_coding_workflow(self, context: SessionContext) -> str:
+        """Resolve and snapshot one non-TUI conversation's coding workflow."""
+        from hermes_cli import coding_workflow
+
+        session_store = getattr(self, "session_store", None)
+        stored = None
+        if session_store is not None and context.session_key:
+            stored = session_store.get_session_metadata(
+                context.session_key,
+                "coding_workflow",
+                None,
+            )
+        if stored is not None and str(stored).strip():
+            return coding_workflow.validate_coding_workflow(stored)
+
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            profile_home = self._resolve_profile_home_for_source(context.source)
+            with _profile_runtime_scope(profile_home):
+                resolved = coding_workflow.resolve_profile_default(
+                    _load_gateway_config()
+                )
+        else:
+            resolved = coding_workflow.resolve_profile_default(_load_gateway_config())
+
+        if session_store is not None and context.session_key:
+            session_store.set_session_metadata(
+                context.session_key,
+                "coding_workflow",
+                resolved,
+            )
+        return resolved
+
+
     def _set_session_env(self, context: SessionContext) -> list:
         """Set session context variables for the current async task.
 
@@ -17176,6 +17209,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        coding_workflow = self._resolve_session_coding_workflow(context)
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -17187,6 +17221,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
+            coding_workflow=coding_workflow,
         )
 
     def _clear_session_env(self, tokens: list) -> None:

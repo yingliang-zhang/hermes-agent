@@ -185,6 +185,7 @@ def test_on_demand_model_options_does_not_block_inline_requests(server):
 
 def test_model_options_pool_uses_request_time_runtime_snapshot(server, monkeypatch):
     """A queued model-options read must report one coherent pre-dispatch runtime."""
+    from hermes_cli.coding_workflow import workflow_presets
     from hermes_cli.inventory import ConfigContext
 
     agent = SimpleNamespace(
@@ -192,7 +193,7 @@ def test_model_options_pool_uses_request_time_runtime_snapshot(server, monkeypat
         provider="request-provider",
         base_url="https://request.invalid/v1",
     )
-    server._sessions["session-1"] = {"agent": agent}
+    server._sessions["session-1"] = {"agent": agent, "coding_workflow": "hybrid-v1"}
 
     monkeypatch.setattr(
         "hermes_cli.inventory.load_picker_context",
@@ -255,6 +256,7 @@ def test_model_options_pool_uses_request_time_runtime_snapshot(server, monkeypat
         agent.model = "half-switched-model"
         agent.provider = "half-switched-provider"
         agent.base_url = "https://half-switched.invalid/v1"
+        server._sessions["session-1"]["coding_workflow"] = "coupled-v1"
         release_worker.set()
 
         assert response_written.wait(timeout=2)
@@ -275,6 +277,8 @@ def test_model_options_pool_uses_request_time_runtime_snapshot(server, monkeypat
                 "model": "request-model",
                 "provider": "request-provider",
                 "base_url": "https://request.invalid/v1",
+                "coding_workflow": "hybrid-v1",
+                "workflow_presets": workflow_presets(),
             },
         }
     ]
@@ -292,7 +296,7 @@ def test_model_options_pool_snapshots_active_fallback_runtime(server, monkeypatc
             "base_url": "https://primary.invalid/v1",
         },
     )
-    server._sessions["session-1"] = {"agent": agent}
+    server._sessions["session-1"] = {"agent": agent, "coding_workflow": "hybrid-v1"}
 
     def echo_runtime_snapshot(rid, params):
         return server._ok(rid, params[server._MODEL_OPTIONS_RUNTIME_SNAPSHOT])
@@ -339,6 +343,7 @@ def test_model_options_pool_snapshots_active_fallback_runtime(server, monkeypatc
         agent.model = "later-model"
         agent.provider = "later-provider"
         agent.base_url = "https://later.invalid/v1"
+        server._sessions["session-1"]["coding_workflow"] = "coupled-v1"
         release_worker.set()
 
         assert response_written.wait(timeout=2)
@@ -358,11 +363,13 @@ def test_model_options_pool_snapshots_active_fallback_runtime(server, monkeypatc
                 "model": "fallback-model",
                 "provider": "fallback-provider",
                 "base_url": "https://fallback.invalid/v1",
+                "coding_workflow": "hybrid-v1",
             },
         }
     ]
 def test_model_options_pool_snapshot_preserves_custom_provider_identity(server, monkeypatch):
     """The worker's frozen runtime keeps the picker on its canonical custom row."""
+    from hermes_cli.coding_workflow import workflow_presets
     from hermes_cli.inventory import ConfigContext
 
     monkeypatch.setattr(
@@ -397,6 +404,7 @@ def test_model_options_pool_snapshot_preserves_custom_provider_identity(server, 
                 "model": "request-model",
                 "provider": "custom",
                 "base_url": "https://request.invalid/v1",
+                "coding_workflow": "hybrid-v1",
             },
         },
     )
@@ -406,6 +414,8 @@ def test_model_options_pool_snapshot_preserves_custom_provider_identity(server, 
         "model": "request-model",
         "provider": "custom:request-provider",
         "base_url": "https://request.invalid/v1",
+        "coding_workflow": "hybrid-v1",
+        "workflow_presets": workflow_presets(),
     }
     canonical.assert_called_once_with(
         base_url="https://request.invalid/v1",

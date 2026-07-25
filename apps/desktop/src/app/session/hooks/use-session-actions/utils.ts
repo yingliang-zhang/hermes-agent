@@ -8,6 +8,8 @@ import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/p
 import {
   $currentCwd,
   $sessions,
+  DEFAULT_CODING_WORKFLOW,
+  parseCodingWorkflow,
   sessionMatchesStoredId,
   setCurrentBranch,
   setCurrentCwd,
@@ -17,6 +19,7 @@ import {
   setCurrentProvider,
   setCurrentReasoningEffort,
   setCurrentServiceTier,
+  setCurrentSessionCodingWorkflow,
   setCurrentUsage,
   setSessions,
   setYoloActive
@@ -541,6 +544,7 @@ type SessionRuntimeStatePatch = Partial<
   Pick<
     ClientSessionState,
     | 'branch'
+    | 'codingWorkflow'
     | 'cwd'
     | 'fast'
     | 'model'
@@ -558,6 +562,14 @@ export function applyRuntimeInfo(info: SessionRuntimeInfo | undefined): SessionR
   if (!info) {
     return null
   }
+
+  // Fail-closed read boundary for coding workflow: an explicit-but-unknown
+  // value aborts BEFORE any state mutation (no clobber of the draft atom or
+  // the returned patch), while an absent (legacy) or valid value proceeds.
+  // Heartbeats use the non-throwing isKnownCodingWorkflow; this strict path is
+  // the session.create / resume boundary where a contract violation should
+  // surface, not silently degrade to coupled-v1. See store/session.ts.
+  const parsedCodingWorkflow = parseCodingWorkflow(info.coding_workflow)
 
   const sessionState: SessionRuntimeStatePatch = {}
 
@@ -628,6 +640,15 @@ export function applyRuntimeInfo(info: SessionRuntimeInfo | undefined): SessionR
   if (info.turn_origin !== undefined) {
     sessionState.turnOrigin = info.turn_origin
   }
+
+  // Session create/resume updates only the focused live projection. An absent
+  // legacy value degrades to coupled-v1; profile and draft authorities remain
+  // untouched.
+  const workflow = parsedCodingWorkflow ?? DEFAULT_CODING_WORKFLOW
+
+  setCurrentSessionCodingWorkflow(workflow)
+  sessionState.codingWorkflow = workflow
+
 
   return sessionState
 }

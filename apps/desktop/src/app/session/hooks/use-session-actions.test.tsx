@@ -14,16 +14,20 @@ import {
   $activeSessionId,
   $activeSessionStoredIdRotation,
   $connection,
+  $currentCodingWorkflow,
   $currentCwd,
   $currentFastMode,
   $currentModel,
   $currentProvider,
   $currentReasoningEffort,
+  $draftCodingWorkflowOverride,
   $messages,
   $newChatWorkspaceTarget,
+  $profileCodingWorkflowDefault,
   $resumeFailedSessionId,
   $selectedStoredSessionId,
   $turnStartedAt,
+  resetDraftCodingWorkflowOverride,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
   setAwaitingResponse,
@@ -33,8 +37,11 @@ import {
   setCurrentModel,
   setCurrentProvider,
   setCurrentReasoningEffort,
+  setCurrentSessionCodingWorkflow,
+  setDraftCodingWorkflowOverride,
   setMessages,
   setNewChatWorkspaceTarget,
+  setProfileCodingWorkflowDefault,
   setResumeFailedSessionId,
   setSelectedStoredSessionId,
   setSessions,
@@ -1107,6 +1114,7 @@ describe('resumeSession failure recovery', () => {
             awaitingResponse: false,
             branch: '',
             busy: false,
+            codingWorkflow: 'coupled-v1',
             cwd: '',
             fast: false,
             interimBoundaryPending: false,
@@ -1721,5 +1729,92 @@ describe('createBackendSessionForSend workspace target', () => {
     )
 
     expect(params).toMatchObject({ cwd: '/clicked-workspace' })
+  })
+})
+
+describe('createBackendSessionForSend coding_workflow', () => {
+  afterEach(() => {
+    cleanup()
+    setProfileCodingWorkflowDefault('coupled-v1')
+    setCurrentSessionCodingWorkflow('coupled-v1')
+    resetDraftCodingWorkflowOverride()
+    $currentModel.set('')
+    $currentProvider.set('')
+    $currentReasoningEffort.set('')
+    $currentFastMode.set(false)
+    $newChatProfile.set(null)
+    $activeGatewayProfile.set('default')
+    setNewChatWorkspaceTarget(undefined)
+    $currentCwd.set('')
+    vi.restoreAllMocks()
+  })
+
+  it('starts a coupled draft after focusing a Hybrid session under a Coupled profile', async () => {
+    const params = await createWith(
+      () => {
+        $activeGatewayProfile.set('default')
+        setProfileCodingWorkflowDefault('coupled-v1')
+        setActiveSessionId('session-a')
+        setCurrentSessionCodingWorkflow('hybrid-v1')
+      },
+      handle => handle.startFreshSessionDraft()
+    )
+
+    expect(params).toMatchObject({ coding_workflow: 'coupled-v1' })
+  })
+
+  it('creates a fresh Hybrid-default session on the fixed Sol route', async () => {
+    const params = await createWith(
+      () => {
+        $activeGatewayProfile.set('default')
+        setProfileCodingWorkflowDefault('hybrid-v1')
+        setActiveSessionId('session-a')
+        setCurrentSessionCodingWorkflow('coupled-v1')
+      },
+      handle => handle.startFreshSessionDraft()
+    )
+
+    expect(params).toMatchObject({
+      coding_workflow: 'hybrid-v1',
+      model: 'gpt-5.6-sol',
+      provider: 'custom:sudo'
+    })
+    expect($currentCodingWorkflow.get()).toBe('hybrid-v1')
+  })
+
+  it('ships the draft coding_workflow (hybrid-v1) into session.create', async () => {
+    const params = await createWith(() => {
+      $activeGatewayProfile.set('default')
+      setDraftCodingWorkflowOverride('hybrid-v1')
+    })
+
+    expect(params).toMatchObject({ coding_workflow: 'hybrid-v1' })
+  })
+
+  it('consumes an explicit Hybrid draft override without changing the profile default', async () => {
+    const params = await createWith(() => {
+      $activeGatewayProfile.set('default')
+      setProfileCodingWorkflowDefault('coupled-v1')
+      setDraftCodingWorkflowOverride('hybrid-v1')
+    })
+
+    expect(params).toMatchObject({
+      coding_workflow: 'hybrid-v1',
+      model: 'gpt-5.6-sol',
+      provider: 'custom:sudo'
+    })
+    expect($draftCodingWorkflowOverride.get()).toBeNull()
+    expect($profileCodingWorkflowDefault.get()).toBe('coupled-v1')
+    expect($currentCodingWorkflow.get()).toBe('hybrid-v1')
+  })
+
+  it('ships coupled-v1 by default when no draft workflow is set', async () => {
+    resetDraftCodingWorkflowOverride()
+    setProfileCodingWorkflowDefault('coupled-v1')
+    const params = await createWith(() => {
+      $activeGatewayProfile.set('default')
+    })
+
+    expect(params).toMatchObject({ coding_workflow: 'coupled-v1' })
   })
 })

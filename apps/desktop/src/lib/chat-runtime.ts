@@ -6,7 +6,7 @@ import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { type ChatMessage, type ChatMessagePart, chatMessageText, textPart } from '@/lib/chat-messages'
 import { normalize } from '@/lib/text'
 import type { ComposerAttachment } from '@/store/composer'
-import type { ModelOptionsResponse, SessionInfo } from '@/types/hermes'
+import type { CodingWorkflow, ModelOptionsResponse, SessionInfo } from '@/types/hermes'
 
 export const SLASH_COMMAND_RE = /^\/[^\s/]*(?:\s|$)/
 export const BUILTIN_PERSONALITIES = [
@@ -43,6 +43,7 @@ export function createClientSessionState(
     cwd: '',
     model: '',
     provider: '',
+    codingWorkflow: 'coupled-v1' satisfies CodingWorkflow,
     reasoningEffort: '',
     serviceTier: '',
     fast: false,

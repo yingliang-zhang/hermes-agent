@@ -666,6 +666,9 @@ export interface Translations {
     model: {
       loading: string
       appliesDesc: string
+      workflow: string
+      coupled: string
+      hybrid: string
       provider: string
       model: string
       applying: string

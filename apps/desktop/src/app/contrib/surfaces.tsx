@@ -129,6 +129,7 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
       gatewayState === 'open' ? (
         <ModelMenuPanel
           gateway={gateway || undefined}
+          onSelectHybrid={actions.selectHybrid}
           onSelectModel={actions.selectModel}
           profile={activeGatewayProfile}
           requestGateway={actions.requestGateway}

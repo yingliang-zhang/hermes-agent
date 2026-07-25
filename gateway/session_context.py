@@ -119,6 +119,16 @@ _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_P
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
 
+# Coding workflow for the current session (Hybrid v1). An internal task-local
+# bridge to terminal subprocesses — NOT user-facing environment configuration.
+# The authoritative value lives on the session record/DB row; this ContextVar
+# mirrors it so a child process (OMP wrapper) inherits the session's workflow
+# without a process-global os.environ leak. Concurrent sessions cannot inherit
+# one another's workflow because ContextVars are task-local. Set via
+# set_session_vars(coding_workflow=...); the env bridge (tools/environments/
+# local.py) injects it into child envs automatically through _VAR_MAP.
+_CODING_WORKFLOW: ContextVar = ContextVar("HERMES_CODING_WORKFLOW", default=_UNSET)
+
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
     "HERMES_SESSION_SOURCE": _SESSION_SOURCE,
@@ -135,6 +145,7 @@ _VAR_MAP = {
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
+    "HERMES_CODING_WORKFLOW": _CODING_WORKFLOW,
 }
 
 
@@ -168,6 +179,7 @@ def set_session_vars(
     cwd: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
+    coding_workflow: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -203,6 +215,7 @@ def set_session_vars(
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        _CODING_WORKFLOW.set(str(coding_workflow or "")),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -237,6 +250,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _CODING_WORKFLOW,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a

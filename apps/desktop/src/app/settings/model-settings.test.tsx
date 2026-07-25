@@ -212,6 +212,45 @@ describe('ModelSettings', () => {
     expect(screen.queryByRole('button', { name: 'Set up provider' })).toBeNull()
   })
 
+  it('atomically couples ordinary main-model selection', async () => {
+    await renderModelSettings()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Apply' }))
+
+    await waitFor(() =>
+      expect(setModelAssignment).toHaveBeenCalledWith({
+        coding_workflow: 'coupled-v1',
+        model: 'hermes-4',
+        provider: 'nous',
+        scope: 'main'
+      })
+    )
+  })
+
+  it('applies Hybrid as the fixed Sol future-session route', async () => {
+    setModelAssignment.mockResolvedValueOnce({
+      coding_workflow: 'hybrid-v1',
+      gateway_tools: [],
+      model: 'gpt-5.6-sol',
+      provider: 'custom:sudo'
+    })
+    await renderModelSettings()
+
+    const hybrid = await screen.findByRole('button', { name: 'Hybrid' })
+    fireEvent.click(hybrid)
+    expect(hybrid.getAttribute('aria-pressed')).toBe('true')
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    await waitFor(() =>
+      expect(setModelAssignment).toHaveBeenCalledWith({
+        coding_workflow: 'hybrid-v1',
+        model: 'gpt-5.6-sol',
+        provider: 'custom:sudo',
+        scope: 'main'
+      })
+    )
+  })
+
   it('writes the profile default speed (service_tier) when the fast switch is toggled', async () => {
     await renderModelSettings()
     await waitFor(() => expect(getHermesConfigRecord).toHaveBeenCalled())

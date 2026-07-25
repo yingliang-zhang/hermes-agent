@@ -6,7 +6,7 @@ import type { ContextSuggestion } from '@/app/types'
 import type { HermesConnection } from '@/global'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { persistBoolean, persistString, storedBoolean, storedString } from '@/lib/storage'
-import type { SessionInfo, TurnOrigin, UsageStats } from '@/types/hermes'
+import type { CodingWorkflow, SessionInfo, TurnOrigin, UsageStats } from '@/types/hermes'
 
 type Updater<T> = T | ((current: T) => T)
 export type ComposerModelSource = '' | 'default' | 'manual'
@@ -23,6 +23,54 @@ const COMPOSER_PROVIDER_KEY = 'hermes.desktop.composer.provider'
 const COMPOSER_MODEL_SOURCE_KEY = 'hermes.desktop.composer.model-source'
 const COMPOSER_EFFORT_KEY = 'hermes.desktop.composer.reasoning-effort'
 const COMPOSER_FAST_KEY = 'hermes.desktop.composer.fast'
+
+/** Allowed coding-workflow values. Keep in sync with {@link CodingWorkflow}. */
+const CODING_WORKFLOW_VALUES: readonly CodingWorkflow[] = ['coupled-v1', 'hybrid-v1']
+
+/** Fallback when neither a draft choice nor profile default is available. */
+export const DEFAULT_CODING_WORKFLOW: CodingWorkflow = 'coupled-v1'
+
+/** True when `value` is one of the known {@link CodingWorkflow} values. Use as a
+ *  non-throwing read boundary for periodic heartbeats (session.info) where a
+ *  malformed value must be skipped — never crash the stream — rather than
+ *  coerced. */
+export function isKnownCodingWorkflow(value: unknown): value is CodingWorkflow {
+  return CODING_WORKFLOW_VALUES.includes(value as CodingWorkflow)
+}
+
+/** Strict read boundary for coding workflow. Returns the value when it is a
+ *  known workflow, `null` when absent (legacy callers degrade to
+ *  {@link DEFAULT_CODING_WORKFLOW}), or THROWS on an explicit-but-unknown
+ *  value — an unknown workflow must never silently coerce to `coupled-v1`, or a
+ *  backend contract violation would be masked. Callers that must never crash
+ *  (the boot-time localStorage seed) use {@link normalizeCodingWorkflow}.
+ *
+ *  See the observable-ladder rule in apps/desktop/AGENTS.md. */
+export function parseCodingWorkflow(value: unknown): CodingWorkflow | null {
+  if (value === undefined || value === null || value === '') {
+    return null
+  }
+
+  if (isKnownCodingWorkflow(value)) {
+    return value
+  }
+
+  throw new Error(`Unknown coding workflow value: ${String(value)}`)
+}
+
+/** Lenient read boundary for coding workflow: an unknown OR absent value
+ *  degrades to {@link DEFAULT_CODING_WORKFLOW} (`coupled-v1`). Used for the
+ *  boot-time localStorage seed, which must never throw (a stale value from an
+ *  older app version degrades rather than crashing the launch). Strict
+ *  read boundaries (session.info, session.create, resume) use
+ *  {@link parseCodingWorkflow}. */
+export function normalizeCodingWorkflow(value: unknown): CodingWorkflow {
+  try {
+    return parseCodingWorkflow(value) ?? DEFAULT_CODING_WORKFLOW
+  } catch {
+    return DEFAULT_CODING_WORKFLOW
+  }
+}
 
 // The last chat the user had open, so a relaunch lands back on it instead of an
 // empty new-chat. Stored (not runtime) id — the route is keyed by stored id.
@@ -350,6 +398,18 @@ export const $currentProvider = atom(storedString(COMPOSER_PROVIDER_KEY) ?? '')
 export const $currentReasoningEffort = atom(storedString(COMPOSER_EFFORT_KEY) ?? '')
 export const $currentServiceTier = atom('')
 export const $currentFastMode = atom(storedBoolean(COMPOSER_FAST_KEY, false))
+// Three authorities, deliberately separate:
+// - profile default: backend-owned seed for future drafts;
+// - live projection: focused session metadata only;
+// - draft override: one explicit choice, cleared by New Session.
+export const $profileCodingWorkflowDefault = atom<CodingWorkflow>(DEFAULT_CODING_WORKFLOW)
+export const $currentSessionCodingWorkflow = atom<CodingWorkflow>(DEFAULT_CODING_WORKFLOW)
+export const $draftCodingWorkflowOverride = atom<CodingWorkflow | null>(null)
+export const $currentCodingWorkflow = computed(
+  [$activeSessionId, $currentSessionCodingWorkflow, $draftCodingWorkflowOverride, $profileCodingWorkflowDefault],
+  (activeSessionId, sessionWorkflow, draftOverride, profileDefault) =>
+    activeSessionId ? sessionWorkflow : (draftOverride ?? profileDefault)
+)
 // Effective approval-bypass state mirrored from the gateway (session.info).
 // Persistence lives in the backend config (approvals.mode), so this is a plain
 // reflection of the truth the gateway reports rather than its own store.
@@ -462,6 +522,20 @@ export const setCurrentFastMode = (next: Updater<boolean>) => {
   updateAtom($currentFastMode, next)
   persistBoolean(COMPOSER_FAST_KEY, $currentFastMode.get())
 }
+
+export const setProfileCodingWorkflowDefault = (next: Updater<CodingWorkflow>) =>
+  updateAtom($profileCodingWorkflowDefault, next)
+
+export const setCurrentSessionCodingWorkflow = (next: Updater<CodingWorkflow>) =>
+  updateAtom($currentSessionCodingWorkflow, next)
+
+export const setDraftCodingWorkflowOverride = (next: Updater<CodingWorkflow | null>) =>
+  updateAtom($draftCodingWorkflowOverride, next)
+
+export const resetDraftCodingWorkflowOverride = (): void => $draftCodingWorkflowOverride.set(null)
+
+export const resolveDraftCodingWorkflow = (): CodingWorkflow =>
+  $draftCodingWorkflowOverride.get() ?? $profileCodingWorkflowDefault.get() ?? DEFAULT_CODING_WORKFLOW
 
 export const setYoloActive = (next: Updater<boolean>) => updateAtom($yoloActive, next)
 

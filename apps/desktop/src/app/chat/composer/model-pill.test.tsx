@@ -4,7 +4,14 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import type { ChatBarState } from '@/app/chat/composer/types'
 import { type SessionView, SessionViewProvider } from '@/app/chat/session-view'
-import { $activeSessionId, $currentModel, setCurrentModel, setCurrentModelSource } from '@/store/session'
+import {
+  $activeSessionId,
+  $currentModel,
+  setCurrentModel,
+  setCurrentModelSource,
+  setCurrentSessionCodingWorkflow
+} from '@/store/session'
+import type { CodingWorkflow } from '@/types/hermes'
 
 import { ModelPill } from './model-pill'
 
@@ -20,6 +27,7 @@ afterEach(() => {
   $activeSessionId.set(null)
   setCurrentModel('')
   setCurrentModelSource('')
+  setCurrentSessionCodingWorkflow('coupled-v1')
 })
 
 // #62055: a manual composer pick is sticky and silently overrides the
@@ -81,6 +89,15 @@ describe('ModelPill pinned-override badge', () => {
 })
 
 describe('ModelPill per-surface model label', () => {
+  it('shows Hybrid in the primary pill when the session workflow is hybrid-v1', () => {
+    $activeSessionId.set('live-1')
+    setCurrentSessionCodingWorkflow('hybrid-v1')
+
+    render(<ModelPill disabled={false} model={modelState({ model: 'gpt-5.6-sol', provider: 'custom:sudo' })} />)
+
+    expect(screen.getByText(/Hybrid/)).toBeTruthy()
+  })
+
   it('shows the chat-bar model even when the primary global differs', () => {
     setCurrentModel('primary/model')
     $activeSessionId.set('primary-runtime')
@@ -89,6 +106,7 @@ describe('ModelPill per-surface model label', () => {
       kind: 'tile',
       $awaitingResponse: atom(false),
       $busy: atom(false),
+      $codingWorkflow: atom<CodingWorkflow>('hybrid-v1'),
       $cwd: atom(''),
       $fast: atom(false),
       $lastVisibleIsUser: atom(false),
@@ -110,7 +128,7 @@ describe('ModelPill per-surface model label', () => {
       </SessionViewProvider>
     )
 
-    expect(screen.getByText('Sonnet · High')).toBeTruthy()
+    expect(screen.getByText('Hybrid · Sonnet · High')).toBeTruthy()
     expect(screen.queryByText(/primary/i)).toBeNull()
   })
 })

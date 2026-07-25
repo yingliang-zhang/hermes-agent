@@ -50,6 +50,13 @@ from tui_gateway.session_rollover import (
     new_offer,
 )
 
+# Canonical coding-workflow contract (Hybrid v1). Pure helpers — allowlist,
+# fail-closed validation, profile-default resolution, and the workflow-preset
+# inventory — safe to import at module load (no I/O, no heavy deps). Used by
+# session create/persist/resume/rebuild/branch/rollover, session.info, and
+# model.options. See hermes_cli/coding_workflow.py and the frozen plan.
+from hermes_cli import coding_workflow as _coding_workflow
+
 
 logger = logging.getLogger(__name__)
 
@@ -1226,6 +1233,20 @@ def _profile_configured_cwd(profile_home: Path | None) -> str | None:
         return None
 
 
+def _profile_coding_workflow(profile_home: Path | None) -> str:
+    """Resolve the effective workflow from the session's owning profile."""
+    if profile_home is None:
+        return _coding_workflow.resolve_profile_default(_load_cfg())
+
+    import yaml
+
+    path = Path(profile_home) / "config.yaml"
+    if not path.exists():
+        return _coding_workflow.DEFAULT_WORKFLOW
+    with open(path, encoding="utf-8") as handle:
+        return _coding_workflow.resolve_profile_default(yaml.safe_load(handle) or {})
+
+
 def _launch_configured_cwd() -> str | None:
     """Resolve the launch profile's ``terminal.cwd`` from config.yaml.
 
@@ -1652,13 +1673,21 @@ def _freeze_model_options_request(req: dict, params: dict) -> dict:
     with _sessions_lock:
         session = _sessions.get(params.get("session_id", ""))
         agent = session.get("agent") if session else None
-        if agent is None:
+        if session is None:
             runtime_snapshot = None
         else:
-            runtime_snapshot = {
-                key: getattr(agent, key, "") or ""
-                for key in ("model", "provider", "base_url")
-            }
+            runtime_snapshot = (
+                {
+                    key: getattr(agent, key, "") or ""
+                    for key in ("model", "provider", "base_url")
+                }
+                if agent is not None
+                else {"model": "", "provider": "", "base_url": ""}
+            )
+            runtime_snapshot["coding_workflow"] = _coding_workflow.normalize_coding_workflow(
+                session.get("coding_workflow")
+                or getattr(agent, "coding_workflow", "")
+            )
 
     worker_params = dict(params)
     worker_params[_MODEL_OPTIONS_RUNTIME_SNAPSHOT] = runtime_snapshot
@@ -1743,27 +1772,53 @@ def _start_agent_build(sid: str, session: dict) -> None:
     # prompt/RPC builds the agent normally so the user can talk to the session.
     if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
         return
-    lock = session.setdefault("agent_build_lock", threading.Lock())
-    with lock:
+    transition_lock = _session_transition_lock(session)
+    with transition_lock:
         if ready.is_set() or session.get("agent_build_started"):
             return
         session["agent_build_started"] = True
+        # Snapshot every route-dependent input under the same lock used by
+        # prompt admission and route mutation. Whichever transition wins is
+        # complete before another can observe an idle/unbuilt session.
+        resume_overrides = session.get("resume_runtime_overrides")
+        model_override = session.get("model_override")
+        reasoning_override = session.get("create_reasoning_override")
+        build_snapshot = {
+            "coding_workflow": session.get("coding_workflow"),
+            "model_override": (
+                dict(model_override) if isinstance(model_override, dict) else model_override
+            ),
+            "platform_override": _session_source(session),
+            "profile_home": session.get("profile_home"),
+            "reasoning_config_override": (
+                copy.deepcopy(reasoning_override)
+                if isinstance(reasoning_override, dict)
+                else reasoning_override
+            ),
+            "resume_runtime_overrides": (
+                dict(resume_overrides) if isinstance(resume_overrides, dict) else resume_overrides
+            ),
+            "resume_session_id": session.get("resume_session_id"),
+            "service_tier_override": session.get("create_service_tier_override"),
+            "session_key": session["session_key"],
+        }
         # An upgrading lazy session is now genuinely mid-construction — restore
         # its "still starting" eviction exemption.
         session.pop("lazy", None)
-    key = session["session_key"]
+    key = build_snapshot["session_key"]
 
     def _build() -> None:
         with _sessions_lock:
             current = _sessions.get(sid)
         if current is None:
-            ready.set()
+            with transition_lock:
+                ready.set()
             return
 
         worker = None
         notify_registered = False
         home_token = None
-        profile_home = current.get("profile_home")
+        profile_home = build_snapshot["profile_home"]
         try:
             tokens = _set_session_context(key)
             # Build against the session's profile (global-remote): bind its
@@ -1783,10 +1838,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 # id — pass it through so the upgrade continues that session
                 # instead of starting a fresh one under the same key.
                 kw = {"session_db": session_db}
-                if resume_sid := current.get("resume_session_id"):
+                if resume_sid := build_snapshot["resume_session_id"]:
                     kw["session_id"] = resume_sid
-                kw["platform_override"] = _session_source(current)
-                resume_overrides = current.get("resume_runtime_overrides")
+                kw["platform_override"] = build_snapshot["platform_override"]
+                resume_overrides = build_snapshot["resume_runtime_overrides"]
                 if isinstance(resume_overrides, dict) and resume_overrides:
                     # Cold deferred resume: restore the full persisted runtime
                     # identity (model/provider/base_url/api_mode/reasoning/tier)
@@ -1798,24 +1853,28 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     # Model/effort/fast the desktop picked for a brand-new chat
                     # ride in as per-session overrides so the first build uses
                     # them directly (no global config, no build-then-switch).
-                    if override := current.get("model_override"):
+                    if override := build_snapshot["model_override"]:
                         kw["model_override"] = override
-                    if (reasoning := current.get("create_reasoning_override")) is not None:
+                    reasoning = build_snapshot["reasoning_config_override"]
+                    if reasoning is not None:
                         kw["reasoning_config_override"] = reasoning
-                    if (tier := current.get("create_service_tier_override")) is not None:
+                    tier = build_snapshot["service_tier_override"]
+                    if tier is not None:
                         kw["service_tier_override"] = tier
+                    kw["coding_workflow"] = build_snapshot["coding_workflow"]
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
 
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
-            current["agent"] = agent
-            _initialize_rollover_state(current, agent=agent)
+            with transition_lock:
+                current["agent"] = agent
+                _initialize_rollover_state(current, agent=agent)
 
-            # Baseline for the per-turn config sync; the profile home
-            # override is still active here.
-            current["config_model_seen"] = _config_model_target()
+                # Baseline for the per-turn config sync; the profile home
+                # override is still active here.
+                current["config_model_seen"] = _config_model_target()
 
             try:
                 worker = _SlashWorker(
@@ -1881,7 +1940,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # _schedule_mcp_late_refresh. Cache-safe (pre-first-turn only).
             _schedule_mcp_late_refresh(sid, agent)
         except Exception as e:
-            current["agent_error"] = str(e)
+            with transition_lock:
+                current["agent_error"] = str(e)
             _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
             if home_token is not None:
@@ -1898,7 +1958,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     unregister_gateway_notify(key)
                 except Exception:
                     pass
-            ready.set()
+            with transition_lock:
+                ready.set()
 
     threading.Thread(target=_build, daemon=True).start()
 
@@ -2839,7 +2900,7 @@ def _rollover_handoff_from_history(history: list, fence: RolloverFence) -> list[
     )
 
 
-def _rollover_runtime_snapshot(agent: Any) -> dict:
+def _rollover_runtime_snapshot(agent: Any, session: dict | None = None) -> dict:
     """Capture the live route needed to build an equivalent fresh agent."""
     snapshot = {
         "model": str(getattr(agent, "model", "") or ""),
@@ -2878,6 +2939,12 @@ def _rollover_runtime_snapshot(agent: Any) -> dict:
         ),
         "disabled_toolsets": copy.deepcopy(
             getattr(agent, "disabled_toolsets", None)
+        ),
+        # The session's coding workflow rides the runtime snapshot so the
+        # rollover successor agent inherits it and persists it to the new row.
+        "coding_workflow": _coding_workflow.normalize_coding_workflow(
+            (session or {}).get("coding_workflow")
+            or getattr(agent, "coding_workflow", "")
         ),
     }
     if not snapshot["model"] or not snapshot["provider"]:
@@ -2971,7 +3038,7 @@ def _(rid, params: dict) -> dict:
                     raise RuntimeError("session database unavailable")
                 durable_history = db.get_messages(predecessor_id)
             handoff = _rollover_handoff_from_history(durable_history, fence)
-            runtime_snapshot = _rollover_runtime_snapshot(old_agent)
+            runtime_snapshot = _rollover_runtime_snapshot(old_agent, session)
 
             profile_home = str(session.get("profile_home") or "").strip()
             home_token = None
@@ -2992,6 +3059,7 @@ def _(rid, params: dict) -> dict:
                     successor_id,
                     cwd=_session_cwd(session),
                     ui_session_id=sid,
+                    coding_workflow=runtime_snapshot["coding_workflow"],
                 )
                 candidate_agent = _make_agent(
                     sid,
@@ -3416,6 +3484,7 @@ def _set_session_context(
     cwd: str | None = None,
     *,
     ui_session_id: str = "",
+    coding_workflow: str = "",
 ) -> list:
     try:
         from gateway.session_context import set_session_vars
@@ -3426,16 +3495,31 @@ def _set_session_context(
         # it instead of falling back to the gateway launch dir.
         resolved = cwd if cwd is not None else _cwd_for_session_key(session_key)
         source = _resolve_session_platform()
-        with _sessions_lock:
-            for sess in list(_sessions.values()):
-                if sess.get("session_key") == session_key:
-                    source = _session_source(sess)
-                    break
+        # The session's coding workflow is bridged to terminal subprocesses
+        # through the task-local HERMES_CODING_WORKFLOW ContextVar. Callers
+        # that already hold the workflow (rollover candidate, branch) pass it
+        # explicitly; otherwise reverse-map the live session record so a child
+        # process (OMP wrapper) inherits its session's workflow without a
+        # process-global os.environ leak. Concurrent sessions are isolated
+        # because ContextVars are task-local.
+        resolved_coding_workflow = coding_workflow
+        if not resolved_coding_workflow:
+            with _sessions_lock:
+                for sess in list(_sessions.values()):
+                    if sess.get("session_key") == session_key:
+                        source = _session_source(sess)
+                        resolved_coding_workflow = str(
+                            sess.get("coding_workflow")
+                            or getattr(sess.get("agent"), "coding_workflow", "")
+                            or ""
+                        )
+                        break
         return set_session_vars(
             session_key=session_key,
             source=source,
             cwd=resolved,
             ui_session_id=ui_session_id,
+            coding_workflow=resolved_coding_workflow,
         )
     except Exception:
         return []
@@ -3861,6 +3945,17 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     elif service_tier:
         overrides["service_tier_override"] = service_tier
 
+    # Coding workflow persisted in sessions.model_config.coding_workflow. A
+    # genuinely absent value (missing key / None / empty) leaves no override so
+    # _make_agent falls back to the profile default; an *explicitly present*
+    # but malformed/unknown value fails closed here (the read boundary for a
+    # stored session value) instead of silently downgrading.
+    raw_coding_workflow = model_config.get("coding_workflow")
+    if raw_coding_workflow is not None and str(raw_coding_workflow).strip():
+        overrides["coding_workflow"] = _coding_workflow.validate_coding_workflow(
+            raw_coding_workflow
+        )
+
     return overrides
 
 
@@ -3919,6 +4014,12 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     else:
         config.pop("service_tier", None)
 
+    coding_workflow = str(getattr(agent, "coding_workflow", "") or "").strip()
+    if coding_workflow:
+        config["coding_workflow"] = coding_workflow
+    else:
+        config.pop("coding_workflow", None)
+
     return config
 
 
@@ -3959,6 +4060,37 @@ def _persist_live_session_runtime(session: dict | None) -> None:
             db.update_session_model(session_key, model)
     except Exception:
         logger.debug("failed to persist live session runtime", exc_info=True)
+
+
+def _persist_route_runtime_strict(session: dict) -> None:
+    """Persist one route triple atomically, raising so the caller can rollback."""
+    agent = session.get("agent")
+    session_key = str(session.get("session_key") or "").strip()
+    if agent is None or not session_key:
+        return
+
+    db = getattr(agent, "_session_db", None) or _get_db()
+    if db is None:
+        return
+
+    row = db.get_session(session_key) or {}
+    raw_config = row.get("model_config")
+    existing_config = {}
+    if isinstance(raw_config, dict):
+        existing_config = raw_config
+    elif isinstance(raw_config, str) and raw_config.strip():
+        parsed = json.loads(raw_config)
+        if isinstance(parsed, dict):
+            existing_config = parsed
+    model_config = _runtime_model_config(agent, existing_config)
+    create_service_tier_override = session.get("create_service_tier_override")
+    if create_service_tier_override is not None:
+        model_config["service_tier"] = create_service_tier_override or "normal"
+    model = str(getattr(agent, "model", "") or "").strip()
+    if hasattr(db, "update_session_meta"):
+        db.update_session_meta(session_key, json.dumps(model_config), model or None)
+    elif model and hasattr(db, "update_session_model"):
+        db.update_session_model(session_key, model)
 
 
 def _persist_live_session_system_prompt(session: dict | None) -> None:
@@ -4457,6 +4589,7 @@ def _apply_model_switch(
     pin_session_override: bool = True,
     parsed_flags: Any | None = None,
     persist_override: bool | None = None,
+    defer_session_commit: bool = False,
 ) -> dict:
     from hermes_cli.model_switch import (
         parse_model_flags_detailed,
@@ -4614,13 +4747,14 @@ def _apply_model_switch(
                 f"Model switch to {result.new_model} failed ({exc}); "
                 f"staying on {getattr(agent, 'model', current_model)}."
             ) from exc
-        _restart_slash_worker(sid, session)
-        _persist_live_session_runtime(session)
-        _persist_live_session_system_prompt(session)
-        _append_model_switch_marker(
-            session, model=result.new_model, provider=result.target_provider
-        )
-        _emit("session.info", sid, _session_info(agent, session))
+        if not defer_session_commit:
+            _restart_slash_worker(sid, session)
+            _persist_live_session_runtime(session)
+            _persist_live_session_system_prompt(session)
+            _append_model_switch_marker(
+                session, model=result.new_model, provider=result.target_provider
+            )
+            _emit("session.info", sid, _session_info(agent, session))
         if one_turn:
             session["one_turn_model_restore"] = restore_snapshot
         else:
@@ -5184,6 +5318,10 @@ def _session_info(
     info: dict = {
         "model": mirror.get("model", getattr(agent, "model", "")),
         "provider": mirror.get("provider", getattr(agent, "provider", "")),
+        "coding_workflow": _coding_workflow.normalize_coding_workflow(
+            (session or {}).get("coding_workflow")
+            or getattr(agent, "coding_workflow", "")
+        ),
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
         "fast": service_tier == "priority",
@@ -5986,7 +6124,7 @@ def _apply_personality_to_session(
         with session["history_lock"]:
             session["history"].append(make_internal_system_marker(marker))
             session["history_version"] = int(session.get("history_version", 0)) + 1
-        info = _session_info(agent)
+        info = _session_info(agent, session)
         _emit("session.info", sid, info)
         return False, info
     return False, None
@@ -6222,6 +6360,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
             session["session_key"],
             session_id=session["session_key"],
             platform_override=_session_source(session),
+            coding_workflow=session.get("coding_workflow"),
         )
     finally:
         _clear_session_context(tokens)
@@ -6390,6 +6529,7 @@ def _make_agent(
     service_tier_override: str | None = None,
     platform_override: str | None = None,
     runtime_snapshot: dict | None = None,
+    coding_workflow: str | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -6533,7 +6673,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 90),
         provider=runtime.get("provider"),
@@ -6619,6 +6759,33 @@ def _make_agent(
         **_agent_cbs(sid),
     )
 
+    # Resolve the session's coding workflow. An explicit value (from the
+    # session record, a stored row via _stored_session_runtime_overrides, or a
+    # rollover runtime_snapshot) wins; absent falls back to the profile
+    # default. Upstream boundaries (session.create, _stored_session_runtime_
+    # overrides) already fail-closed on malformed values, so a non-empty value
+    # here is canonical — re-validate as a belt-and-suspenders guard.
+    _cw_raw = str(
+        (runtime_snapshot.get("coding_workflow") if runtime_snapshot is not None else "")
+        or (coding_workflow or "")
+    )
+    if _cw_raw:
+        agent.coding_workflow = _coding_workflow.validate_coding_workflow(_cw_raw)
+    else:
+        agent.coding_workflow = _coding_workflow.resolve_profile_default(cfg)
+    # Thread the workflow into the initial model_config persisted on the first
+    # DB row (agent._session_init_model_config is built in agent_init; mirror
+    # it here so coding_workflow lands in sessions.model_config from the very
+    # first turn, not only via later _persist_live_session_runtime writes).
+    try:
+        _init_cfg = dict(getattr(agent, "_session_init_model_config", {}) or {})
+        _init_cfg["coding_workflow"] = agent.coding_workflow
+        agent._session_init_model_config = _init_cfg
+    except Exception:
+        logger.debug("failed to seed coding_workflow in init model_config", exc_info=True)
+
+    return agent
+
 
 def _init_session(
     sid: str,
@@ -6635,6 +6802,9 @@ def _init_session(
     with _sessions_lock:
         _sessions[sid] = {
             "agent": agent,
+            "coding_workflow": _coding_workflow.normalize_coding_workflow(
+                getattr(agent, "coding_workflow", "")
+            ),
             "session_key": key,
             "history": history,
             "history_lock": threading.Lock(),
@@ -7140,6 +7310,15 @@ def _replace_inflight_user(session: dict, text: Any) -> None:
     session["inflight_turn"] = turn
 
 
+def _session_transition_lock(session: dict):
+    """Return the per-session route/turn/build transition lock.
+
+    When another session lock is needed, acquire this lock first. Never hold it
+    across an agent/model API call.
+    """
+    return session.setdefault("transition_lock", threading.RLock())
+
+
 def _set_turn_origin_locked(session: dict, origin: TurnOrigin) -> int:
     """Start a public turn-state revision while ``history_lock`` is held."""
     if origin not in _TURN_ORIGINS:
@@ -7463,7 +7642,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     synchronous dispatch failure restores the claimed item ahead of arrivals
     that raced the failed attempt.
     """
-    with session["history_lock"]:
+    with _session_transition_lock(session), session["history_lock"]:
         queued = session.get("queued_prompt")
         if not queued or session.get("running"):
             return False
@@ -7582,19 +7761,36 @@ def _(rid, params: dict) -> dict:
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
 
+    try:
+        create_coding_workflow = _coding_workflow.resolve_session_workflow(
+            params.get("coding_workflow"),
+            {"coding_workflow": {"default": _profile_coding_workflow(profile_home)}},
+        )
+        create_provider, create_model = _coding_workflow.canonicalize_controller_route(
+            create_coding_workflow,
+            params.get("provider"),
+            params.get("model"),
+        )
+    except _coding_workflow.InvalidCodingWorkflow as exc:
+        return _err(rid, 4002, str(exc))
+
     # The desktop composer owns its model/effort/fast as plain UI state and ships
     # it on every session.create. Honor each as a PER-SESSION override (built into
     # the agent below) — never a global config write, so picking a model/effort
-    # for a new chat can't mutate the profile default. provider is optional
-    # (resolved at build).
-    create_model = str(params.get("model") or "").strip()
+    # for a new chat can't mutate the profile default. Hybrid canonicalization
+    # above supplies the fixed Sol controller when the client omitted its route.
     session_model_override = (
-        {"model": create_model, "provider": str(params.get("provider") or "").strip() or None}
+        {"model": create_model, "provider": create_provider}
         if create_model
         else None
     )
     create_reasoning_override = None
-    if effort := str(params.get("reasoning_effort") or "").strip():
+    if _coding_workflow.is_hybrid(create_coding_workflow):
+        create_reasoning_override = {
+            "enabled": True,
+            "effort": _coding_workflow.HYBRID_CONTROLLER_THINKING,
+        }
+    elif effort := str(params.get("reasoning_effort") or "").strip():
         try:
             from hermes_constants import parse_reasoning_effort
 
@@ -7627,6 +7823,7 @@ def _(rid, params: dict) -> dict:
             "close_on_disconnect": is_truthy_value(params.get("close_on_disconnect", False)),
             "active_session_lease": lease,
             "cols": cols,
+            "coding_workflow": create_coding_workflow,
             "created_at": now,
             "edit_snapshots": {},
             "explicit_cwd": explicit_cwd,
@@ -7695,6 +7892,7 @@ def _(rid, params: dict) -> dict:
                     if session_model_override
                     else _resolve_model()
                 ),
+                "coding_workflow": create_coding_workflow,
                 **(
                     {"provider": session_model_override["provider"]}
                     if session_model_override and session_model_override.get("provider")
@@ -7849,7 +8047,13 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"verification": {"status": "unknown", "evidence": None}})
 
 
-def _lazy_resume_info(cwd: str, *, model: str = "", provider: str = "") -> dict:
+def _lazy_resume_info(
+    cwd: str,
+    *,
+    model: str = "",
+    provider: str = "",
+    coding_workflow: str = "",
+) -> dict:
     """session.info for a not-yet-built session (the shape session.create
     returns). tools/skills land later when the deferred build emits session.info."""
     info = {
@@ -7857,6 +8061,7 @@ def _lazy_resume_info(cwd: str, *, model: str = "", provider: str = "") -> dict:
         "branch": _git_branch_for_cwd(cwd),
         "project": _project_info_for_cwd(cwd),
         "model": model or _resolve_model(),
+        "coding_workflow": _coding_workflow.normalize_coding_workflow(coding_workflow),
         "tools": {},
         "skills": {},
         "lazy": True,
@@ -7886,6 +8091,7 @@ def _deferred_session_record(
     lazy: bool = False,
     model_override=None,
     resume_runtime_overrides: dict | None = None,
+    coding_workflow: str = "",
 ) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
@@ -7898,6 +8104,7 @@ def _deferred_session_record(
         "close_on_disconnect": close_on_disconnect,
         "active_session_lease": lease,
         "cols": cols,
+        "coding_workflow": _coding_workflow.normalize_coding_workflow(coding_workflow),
         "created_at": now,
         "cwd": cwd,
         "display_history_prefix": display_history_prefix or [],
@@ -8034,6 +8241,14 @@ def _(rid, params: dict) -> dict:
     profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
         profile_home
     )
+    try:
+        stored_runtime_overrides = _stored_session_runtime_overrides(found) if found else {}
+        resume_coding_workflow = (
+            stored_runtime_overrides.get("coding_workflow")
+            or _profile_coding_workflow(profile_home)
+        )
+    except _coding_workflow.InvalidCodingWorkflow as exc:
+        return _err(rid, 5000, f"resume failed: {exc}")
 
     def _reuse_live_payload(sid: str, session: dict) -> dict:
         _initialize_rollover_state(
@@ -8100,6 +8315,7 @@ def _(rid, params: dict) -> dict:
             close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
             profile_home=profile_home,
             lazy=True,
+            coding_workflow=resume_coding_workflow,
         )
         _initialize_rollover_state(
             record,
@@ -8132,7 +8348,10 @@ def _(rid, params: dict) -> dict:
                 "resumed": target,
                 "message_count": len(messages),
                 "messages": messages,
-                "info": _lazy_resume_info(cwd),
+                "info": _lazy_resume_info(
+                    cwd,
+                    coding_workflow=resume_coding_workflow,
+                ),
                 "inflight": None,
                 "running": child_running,
                 "session_key": target,
@@ -8185,7 +8404,7 @@ def _(rid, params: dict) -> dict:
         # Restore the model/provider/reasoning/tier this chat last used so the
         # deferred build (and the info below) match the eager path — without them
         # the build drops the provider ("No LLM provider configured").
-        overrides = _stored_session_runtime_overrides(found) or {}
+        overrides = stored_runtime_overrides
         model_override = overrides.get("model_override") or {}
         cwd = profile_resume_cwd or _default_session_cwd()
         record = _deferred_session_record(
@@ -8200,6 +8419,7 @@ def _(rid, params: dict) -> dict:
             profile_home=profile_home,
             model_override=overrides.get("model_override"),
             resume_runtime_overrides=overrides or None,
+            coding_workflow=resume_coding_workflow,
         )
         _initialize_rollover_state(
             record,
@@ -8224,6 +8444,7 @@ def _(rid, params: dict) -> dict:
                     cwd,
                     model=model_override.get("model") or "",
                     provider=overrides.get("provider_override") or "",
+                    coding_workflow=resume_coding_workflow,
                 ),
                 "inflight": None,
                 "running": False,
@@ -8264,14 +8485,16 @@ def _(rid, params: dict) -> dict:
         display_history_prefix = db.get_ancestor_display_prefix(target)
         history = sanitize_replay_history(raw_history)
         messages = _history_to_messages(display_history)
-        tokens = _set_session_context(target)
+        tokens = _set_session_context(
+            target,
+            coding_workflow=resume_coding_workflow,
+        )
         try:
             # Pass the profile's db so the agent persists turns to the right
             # state.db; home override is active here so config/skills/model
             # resolve to the profile too. Runtime identity is restored from the
             # stored session row so switching chats does not inherit whatever
             # global model another chat last selected.
-            stored_runtime_overrides = _stored_session_runtime_overrides(found)
             agent = _make_agent(
                 sid,
                 target,
@@ -10992,6 +11215,7 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    assert session is not None
     db = _get_db()
     if db is None:
         return _db_unavailable_error(rid, code=5008)
@@ -11028,7 +11252,13 @@ def _(rid, params: dict) -> dict:
             # the parent live (no end_reason='branched'), so the legacy
             # end_reason heuristic never matches it — the marker is the only
             # thing that surfaces TUI branches. See issue #20856.
-            model_config={"_branched_from": old_key},
+            model_config={
+                "_branched_from": old_key,
+                "coding_workflow": _coding_workflow.normalize_coding_workflow(
+                    session.get("coding_workflow")
+                    or getattr(session.get("agent"), "coding_workflow", "")
+                ),
+            },
             parent_session_id=old_key,
             cwd=_session_cwd(session),
         )
@@ -11048,13 +11278,21 @@ def _(rid, params: dict) -> dict:
             lease.release()
         return _err(rid, 5008, f"branch failed: {e}")
     try:
-        tokens = _set_session_context(new_key)
+        branch_coding_workflow = _coding_workflow.normalize_coding_workflow(
+            session.get("coding_workflow")
+            or getattr(session.get("agent"), "coding_workflow", "")
+        )
+        tokens = _set_session_context(
+            new_key,
+            coding_workflow=branch_coding_workflow,
+        )
         try:
             agent = _make_agent(
                 new_sid,
                 new_key,
                 session_id=new_key,
                 platform_override=source,
+                coding_workflow=branch_coding_workflow,
             )
         finally:
             _clear_session_context(tokens)
@@ -11521,7 +11759,7 @@ def _(rid, params: dict) -> dict:
         # The old turn finished between the two lock acquisitions. Retry the
         # claim so this prompt starts normally instead of being stranded in a
         # queue whose drain already ran.
-    with session["history_lock"]:
+    with _session_transition_lock(session), session["history_lock"]:
         if t is not None:
             _rebind_session_transport(
                 session,
@@ -12077,7 +12315,7 @@ def _dispatch_notification_turn(
         from tools.async_delegation import claim_event_delivery, release_event_delivery
 
     try:
-        with session["history_lock"]:
+        with _session_transition_lock(session), session["history_lock"]:
             if session.get("running"):
                 outcome = "busy"
             else:
@@ -12158,7 +12396,7 @@ def _dispatch_notification_turn(
 
 
 def _dispatch_goal_followup(rid, sid: str, session: dict, text: str) -> bool:
-    with session["history_lock"]:
+    with _session_transition_lock(session), session["history_lock"]:
         if session.get("running"):
             return False
         session["running"] = True
@@ -14080,6 +14318,145 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     key, value = params.get("key", ""), params.get("value", "")
     session = _sessions.get(params.get("session_id", ""))
+
+    if key == "route":
+        if session is None:
+            return _err(rid, 4001, "session not found")
+        if not isinstance(value, dict):
+            return _err(rid, 4002, "route value must be an object")
+
+        model = str(value.get("model") or "").strip()
+        provider = str(value.get("provider") or "").strip()
+        try:
+            coding_workflow = _coding_workflow.validate_coding_workflow(
+                value.get("coding_workflow")
+            )
+        except _coding_workflow.InvalidCodingWorkflow as exc:
+            return _err(rid, 4002, str(exc))
+        if not model or not provider:
+            return _err(rid, 4002, "route model and provider are required")
+        if _coding_workflow.is_hybrid(coding_workflow) and (
+            provider,
+            model,
+        ) != _coding_workflow.hybrid_controller_route():
+            return _err(
+                rid,
+                4002,
+                "hybrid-v1 requires controller route custom:sudo / gpt-5.6-sol",
+            )
+
+        transition_lock = _session_transition_lock(session)
+        with transition_lock:
+            if session.get("running"):
+                return _err(
+                    rid,
+                    4009,
+                    "session busy — /interrupt the current turn before switching routes",
+                )
+
+            agent = session.get("agent")
+            build_ready = session.get("agent_ready")
+            if session.get("agent_build_started") and (
+                build_ready is None or not build_ready.is_set()
+            ):
+                return _err(
+                    rid,
+                    4009,
+                    "session agent is still building — retry the route switch after session.info",
+                )
+            previous_runtime = _snapshot_agent_model_runtime(agent) if agent is not None else None
+            try:
+                previous_workflow = _coding_workflow.normalize_coding_workflow(
+                    session.get("coding_workflow")
+                    or getattr(agent, "coding_workflow", "")
+                )
+            except _coding_workflow.InvalidCodingWorkflow as exc:
+                return _err(rid, 5001, str(exc))
+            previous_agent_workflow = (
+                getattr(agent, "coding_workflow", previous_workflow)
+                if agent is not None
+                else previous_workflow
+            )
+            missing_override = object()
+            previous_override = (
+                copy.deepcopy(session["model_override"])
+                if "model_override" in session
+                else missing_override
+            )
+
+            try:
+                result = _apply_model_switch(
+                    params.get("session_id", ""),
+                    session,
+                    f"{model} --provider {provider} --session",
+                    confirm_expensive_model=bool(
+                        params.get("confirm_expensive_model", False)
+                    ),
+                    persist_override=False,
+                    defer_session_commit=True,
+                )
+                if result.get("confirm_required"):
+                    return _ok(
+                        rid,
+                        {
+                            "key": key,
+                            "value": value,
+                            "warning": result.get("warning", ""),
+                            "confirm_required": True,
+                            "confirm_message": result.get("confirm_message", ""),
+                            "scope": "session",
+                        },
+                    )
+
+                session["coding_workflow"] = coding_workflow
+                if agent is not None:
+                    agent.coding_workflow = coding_workflow
+                _persist_route_runtime_strict(session)
+            except Exception as exc:
+                if agent is not None:
+                    _restore_agent_model_runtime(agent, previous_runtime)
+                    agent.coding_workflow = previous_agent_workflow
+                session["coding_workflow"] = previous_workflow
+                if previous_override is missing_override:
+                    session.pop("model_override", None)
+                else:
+                    session["model_override"] = previous_override
+                try:
+                    _persist_route_runtime_strict(session)
+                except Exception:
+                    logger.debug("failed to persist route rollback", exc_info=True)
+                return _err(rid, 5001, str(exc))
+
+            if agent is not None:
+                _restart_slash_worker(params.get("session_id", ""), session)
+                effective_model = str(getattr(agent, "model", "") or model)
+                effective_provider = str(getattr(agent, "provider", "") or provider)
+                info = _session_info(agent, session)
+            else:
+                override = session.get("model_override") or {}
+                effective_model = str(override.get("model") or model)
+                effective_provider = str(override.get("provider") or provider)
+                info = _lazy_resume_info(
+                    _session_cwd(session),
+                    model=effective_model,
+                    provider=effective_provider,
+                    coding_workflow=coding_workflow,
+                )
+            _emit("session.info", params.get("session_id", ""), info)
+            return _ok(
+                rid,
+                {
+                    "key": key,
+                    "value": {
+                        "model": effective_model,
+                        "provider": effective_provider,
+                        "coding_workflow": coding_workflow,
+                    },
+                    "warning": result.get("warning", ""),
+                    "confirm_required": False,
+                    "scope": "session",
+                },
+            )
 
     if key == "model":
         try:
@@ -17208,6 +17585,7 @@ def _(rid, params: dict) -> dict:
     try:
         from hermes_cli.inventory import build_models_payload
 
+        session = None
         if _MODEL_OPTIONS_RUNTIME_SNAPSHOT in params:
             runtime_snapshot = params.get(_MODEL_OPTIONS_RUNTIME_SNAPSHOT)
             agent = None
@@ -17239,6 +17617,19 @@ def _(rid, params: dict) -> dict:
             probe_custom_providers=bool(params.get("refresh")),
             probe_current_custom_provider=not bool(params.get("refresh")),
         )
+        if isinstance(runtime_snapshot, dict):
+            effective_workflow = _coding_workflow.normalize_coding_workflow(
+                runtime_snapshot.get("coding_workflow")
+            )
+        elif session is not None:
+            effective_workflow = _coding_workflow.normalize_coding_workflow(
+                session.get("coding_workflow")
+                or getattr(agent, "coding_workflow", "")
+            )
+        else:
+            effective_workflow = _coding_workflow.resolve_profile_default(_load_cfg())
+        payload["coding_workflow"] = effective_workflow
+        payload["workflow_presets"] = _coding_workflow.workflow_presets()
         return _ok(rid, payload)
     except Exception as e:
         return _err(rid, 5033, str(e))

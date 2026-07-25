@@ -156,8 +156,8 @@ describe('useModelControls', () => {
 
     expect(requestGateway).toHaveBeenCalledWith('config.set', {
       session_id: 'session-1',
-      key: 'model',
-      value: 'claude-sonnet-4.6 --provider anthropic --session'
+      key: 'route',
+      value: { coding_workflow: 'coupled-v1', model: 'claude-sonnet-4.6', provider: 'anthropic' }
     })
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
   })
@@ -178,8 +178,8 @@ describe('useModelControls', () => {
 
     expect(requestGateway).toHaveBeenCalledWith('config.set', {
       session_id: 'session-1',
-      key: 'model',
-      value: 'BeastMode --provider moa --session'
+      key: 'route',
+      value: { coding_workflow: 'coupled-v1', model: 'BeastMode', provider: 'moa' }
     })
   })
 
@@ -392,8 +392,8 @@ describe('useModelControls', () => {
 
     expect(requestGateway).toHaveBeenCalledWith('config.set', {
       session_id: 'tile-runtime',
-      key: 'model',
-      value: 'tile-model --provider anthropic --session'
+      key: 'route',
+      value: { coding_workflow: 'coupled-v1', model: 'tile-model', provider: 'anthropic' }
     })
     // Primary footer untouched — the busy primary must not absorb a tile pick.
     expect($currentModel.get()).toBe('primary/model')

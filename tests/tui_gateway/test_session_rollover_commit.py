@@ -170,6 +170,7 @@ def _session(db: SessionDB) -> dict:
         "active_session_lease": lease,
         "attached_images": [{"name": "draft.png"}],
         "close_on_disconnect": False,
+        "coding_workflow": "hybrid-v1",
         "cols": 100,
         "created_at": 1.0,
         "cwd": "/workspace/project",
@@ -238,7 +239,7 @@ def rollover_env(db: SessionDB, monkeypatch: pytest.MonkeyPatch):
     events: list[tuple[str, str, dict]] = []
     build_calls: list[dict] = []
     cwd_registrations: list[str] = []
-    context_calls: list[tuple[str, str | None, str]] = []
+    context_calls: list[tuple[str, str | None, str, str]] = []
     approval_registered: list[str] = []
     approval_unregistered: list[str] = []
 
@@ -260,8 +261,9 @@ def rollover_env(db: SessionDB, monkeypatch: pytest.MonkeyPatch):
         cwd: str | None = None,
         *,
         ui_session_id: str = "",
+        coding_workflow: str = "coupled-v1",
     ) -> list[str]:
-        context_calls.append((session_key, cwd, ui_session_id))
+        context_calls.append((session_key, cwd, ui_session_id, coding_workflow))
         return ["ctx"]
 
     monkeypatch.setattr(server, "_set_session_context", set_session_context)
@@ -310,7 +312,7 @@ def rollover_env(db: SessionDB, monkeypatch: pytest.MonkeyPatch):
         assert key == "successor-1"
         assert db.get_session("successor-1") is None
         assert context_calls == [
-            ("successor-1", "/workspace/project", "runtime-1")
+            ("successor-1", "/workspace/project", "runtime-1", "hybrid-v1")
         ]
         build_calls.append(kwargs)
         return _Agent("successor-1", db, compression_count=0)
@@ -748,7 +750,7 @@ def test_success_commits_bounded_child_and_swaps_same_runtime(rollover_env):
     assert env.approval_unregistered == ["predecessor"]
     assert env.cwd_registrations == ["successor-1"]
     assert env.context_calls == [
-        ("successor-1", "/workspace/project", "runtime-1")
+        ("successor-1", "/workspace/project", "runtime-1", "hybrid-v1")
     ]
 
     assert env.build_calls and env.build_calls[0]["session_id"] == "successor-1"
@@ -763,6 +765,7 @@ def test_success_commits_bounded_child_and_swaps_same_runtime(rollover_env):
     assert runtime["reasoning_config"] == old_agent.reasoning_config
     assert runtime["service_tier"] == old_agent.service_tier
     assert runtime["request_overrides"] == old_agent.request_overrides
+    assert runtime["coding_workflow"] == "hybrid-v1"
 
     assert [event for event, *_ in env.events] == [
         "session.rollover.complete",

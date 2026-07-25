@@ -3591,6 +3591,15 @@ DEFAULT_CONFIG = {
         "region": "global",
     },
 
+    # Coding-workflow default (Hybrid v1 routing). The shipped default is
+    # coupled-v1; activating hybrid-v1 for the orchestrator profile is a
+    # separate controlled config change after candidate verification. This is
+    # profile-local: ``coding_workflow.default`` is the future-session default
+    # only, never a session record. See hermes_cli/coding_workflow.py.
+    "coding_workflow": {
+        "default": "coupled-v1",
+    },
+
     # Config schema version - bump this when adding new required fields
     "_config_version": 33,
 }

@@ -9,17 +9,24 @@ import { notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
 import {
   $activeSessionId,
+  $currentCodingWorkflow,
   $currentModel,
   $currentProvider,
+  DEFAULT_CODING_WORKFLOW,
   getComposerSelectionGeneration,
   getCurrentModelSource,
   markComposerSelectionManual,
+  parseCodingWorkflow,
+  resetDraftCodingWorkflowOverride,
   setCurrentModel,
   setCurrentModelSource,
-  setCurrentProvider
+  setCurrentProvider,
+  setCurrentSessionCodingWorkflow,
+  setDraftCodingWorkflowOverride,
+  setProfileCodingWorkflowDefault
 } from '@/store/session'
 import { $sessionStates, sessionTileDelegate } from '@/store/session-states'
-import type { ModelOptionsResponse } from '@/types/hermes'
+import type { CodingWorkflow, ModelOptionsResponse } from '@/types/hermes'
 
 interface ModelControlsOptions {
   queryClient: QueryClient
@@ -42,9 +49,15 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
       provider: string,
       model: string,
       includeGlobal: boolean,
-      profile = $activeGatewayProfile.get()
+      profile = $activeGatewayProfile.get(),
+      codingWorkflow?: CodingWorkflow
     ) => {
-      const patch = (prev: ModelOptionsResponse | undefined) => ({ ...(prev ?? {}), provider, model })
+      const patch = (prev: ModelOptionsResponse | undefined) => ({
+        ...(prev ?? {}),
+        provider,
+        model,
+        ...(codingWorkflow ? { coding_workflow: codingWorkflow } : {})
+      })
 
       queryClient.setQueryData<ModelOptionsResponse>(modelOptionsQueryKey(profile, sessionId), patch)
 
@@ -66,6 +79,7 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
       // response for a previous profile must stand down when it resolves.
       if (force) {
         profileRefreshEpochRef.current += 1
+        resetDraftCodingWorkflowOverride()
       }
 
       const profileRefreshEpoch = profileRefreshEpochRef.current
@@ -92,9 +106,6 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
           return !manualPickRemoved(options?.providers, $currentProvider.get(), $currentModel.get())
         }
 
-        if (keepManualPick()) {
-          return
-        }
 
         // Snapshot the selection generation before awaiting so a picker click
         // that lands while getGlobalModelInfo is in flight wins over this older
@@ -102,8 +113,14 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         const selectionGeneration = getComposerSelectionGeneration()
         const result = await getGlobalModelInfo()
 
+        if (profileRefreshEpochRef.current !== profileRefreshEpoch) {
+          return
+        }
+
+        const workflow = parseCodingWorkflow(result.coding_workflow) ?? DEFAULT_CODING_WORKFLOW
+        setProfileCodingWorkflowDefault(workflow)
+
         if (
-          profileRefreshEpochRef.current !== profileRefreshEpoch ||
           $activeSessionId.get() ||
           getComposerSelectionGeneration() !== selectionGeneration ||
           keepManualPick()
@@ -118,6 +135,8 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         if (typeof result.provider === 'string') {
           setCurrentProvider(result.provider)
         }
+
+        setProfileCodingWorkflowDefault(workflow)
 
         if (typeof result.model === 'string' || typeof result.provider === 'string') {
           setCurrentModelSource('default')
@@ -140,10 +159,20 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
   // primary `$activeSessionId` is used (overlay / legacy callers). A tile
   // switch must not touch the primary globals — and must not be blocked by a
   // busy primary turn.
-  const selectModel = useCallback(
-    async (selection: ModelSelection): Promise<boolean> => {
+  const selectRoute = useCallback(
+    async ({
+      codingWorkflow,
+      model,
+      provider,
+      sessionId
+    }: {
+      codingWorkflow: CodingWorkflow
+      model: string
+      provider: string
+      sessionId?: null | string
+    }): Promise<boolean> => {
       const primaryRuntimeId = $activeSessionId.get()
-      const liveSessionId = 'sessionId' in selection ? (selection.sessionId ?? null) : primaryRuntimeId
+      const liveSessionId = sessionId === undefined ? primaryRuntimeId : sessionId
       const touchesPrimary = !liveSessionId || liveSessionId === primaryRuntimeId
 
       const prevModel = touchesPrimary ? $currentModel.get() : ($sessionStates.get()[liveSessionId!]?.model ?? '')
@@ -152,28 +181,39 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         ? $currentProvider.get()
         : ($sessionStates.get()[liveSessionId!]?.provider ?? '')
 
+      const prevCodingWorkflow = touchesPrimary
+        ? $currentCodingWorkflow.get()
+        : ($sessionStates.get()[liveSessionId!]?.codingWorkflow ?? DEFAULT_CODING_WORKFLOW)
+
       const prevSource = getCurrentModelSource()
       const liveGatewayProfile = $activeGatewayProfile.get()
 
       if (touchesPrimary) {
-        setCurrentModel(selection.model)
-        setCurrentProvider(selection.provider)
+        setCurrentModel(model)
+        setCurrentProvider(provider)
+        if (liveSessionId) {
+          setCurrentSessionCodingWorkflow(codingWorkflow)
+        } else {
+          setDraftCodingWorkflowOverride(codingWorkflow)
+        }
         markComposerSelectionManual()
       } else if (liveSessionId) {
         // Optimistic tile paint — session.info will confirm; rollback on error.
         sessionTileDelegate()?.updateSession(liveSessionId, state => ({
           ...state,
-          model: selection.model,
-          provider: selection.provider
+          codingWorkflow,
+          model,
+          provider
         }))
       }
 
       updateModelOptionsCache(
         liveSessionId,
-        selection.provider,
-        selection.model,
+        provider,
+        model,
         touchesPrimary && !liveSessionId,
-        liveGatewayProfile
+        liveGatewayProfile,
+        codingWorkflow
       )
 
       // No live session yet: the pick is pure UI state. session.create reads
@@ -185,8 +225,8 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
       try {
         await requestGateway('config.set', {
           session_id: liveSessionId,
-          key: 'model',
-          value: `${selection.model} --provider ${selection.provider} --session`
+          key: 'route',
+          value: { coding_workflow: codingWorkflow, model, provider }
         })
 
         void queryClient.invalidateQueries({ queryKey: modelOptionsQueryKey(liveGatewayProfile, liveSessionId) })
@@ -196,10 +236,16 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         if (touchesPrimary) {
           setCurrentModel(prevModel)
           setCurrentProvider(prevProvider)
+          if (liveSessionId) {
+            setCurrentSessionCodingWorkflow(prevCodingWorkflow)
+          } else {
+            setDraftCodingWorkflowOverride(prevCodingWorkflow)
+          }
           setCurrentModelSource(prevSource)
         } else if (liveSessionId) {
           sessionTileDelegate()?.updateSession(liveSessionId, state => ({
             ...state,
+            codingWorkflow: prevCodingWorkflow,
             model: prevModel,
             provider: prevProvider
           }))
@@ -210,7 +256,8 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
           prevProvider,
           prevModel,
           touchesPrimary && !liveSessionId,
-          liveGatewayProfile
+          liveGatewayProfile,
+          prevCodingWorkflow
         )
         notifyError(err, copy.modelSwitchFailed)
 
@@ -220,5 +267,27 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
     [copy.modelSwitchFailed, queryClient, requestGateway, updateModelOptionsCache]
   )
 
-  return { refreshCurrentModel, selectModel, updateModelOptionsCache }
+  const selectModel = useCallback(
+    (selection: ModelSelection): Promise<boolean> =>
+      selectRoute({
+        codingWorkflow: DEFAULT_CODING_WORKFLOW,
+        model: selection.model,
+        provider: selection.provider,
+        sessionId: 'sessionId' in selection ? (selection.sessionId ?? null) : undefined
+      }),
+    [selectRoute]
+  )
+
+  const selectHybrid = useCallback(
+    (selection: { sessionId?: null | string } = {}): Promise<boolean> =>
+      selectRoute({
+        codingWorkflow: 'hybrid-v1',
+        model: 'gpt-5.6-sol',
+        provider: 'custom:sudo',
+        sessionId: selection.sessionId
+      }),
+    [selectRoute]
+  )
+
+  return { refreshCurrentModel, selectHybrid, selectModel, updateModelOptionsCache }
 }

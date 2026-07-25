@@ -39,7 +39,7 @@ import {
   setModelVisibilityOpen
 } from '@/store/model-visibility'
 import { $collapsedProviders, toggleCollapsedProvider } from '@/store/provider-collapse'
-import type { ModelOptionProvider, ModelOptionsResponse } from '@/types/hermes'
+import type { ModelOptionProvider, ModelOptionsResponse, WorkflowPreset } from '@/types/hermes'
 
 import { ModelEditSubmenu, resolveFastControl } from './model-edit-submenu'
 
@@ -58,6 +58,7 @@ export interface ModelSelection {
 
 interface ModelMenuPanelProps {
   gateway?: HermesGateway
+  onSelectHybrid: (selection?: { sessionId?: null | string }) => Promise<boolean> | void
   onSelectModel: (selection: ModelSelection) => Promise<boolean> | void
   profile?: string
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
@@ -68,7 +69,13 @@ interface ProviderGroup {
   provider: ModelOptionProvider
 }
 
-export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', requestGateway }: ModelMenuPanelProps) {
+export function ModelMenuPanel({
+  gateway,
+  onSelectHybrid,
+  onSelectModel,
+  profile = 'default',
+  requestGateway
+}: ModelMenuPanelProps) {
   const { t } = useI18n()
   const copy = t.shell.modelMenu
   const closeMenu = useContext(ModelMenuCloseContext)
@@ -110,6 +117,8 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     : null
 
   const providers = modelOptions.data?.providers
+  const workflowPresets = modelOptions.data?.workflow_presets ?? []
+  const currentWorkflow = modelOptions.data?.coding_workflow ?? 'coupled-v1'
 
   // The catalog carries MoA presets as a virtual `moa` provider row. Render
   // them in their dedicated section below and keep the row out of the main
@@ -209,6 +218,22 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     closeMenu()
   }
 
+  const selectWorkflowPreset = async (preset: WorkflowPreset) => {
+    const succeeded = preset.hybrid
+      ? await onSelectHybrid({ sessionId: activeSessionId || null })
+      : optionsModel && optionsProvider
+        ? await onSelectModel({
+            model: optionsModel,
+            provider: optionsProvider,
+            sessionId: activeSessionId || null
+          })
+        : false
+
+    if (succeeded !== false) {
+      closeMenu()
+    }
+  }
+
   const groups = useMemo(
     () =>
       groupModels(pickerProviders, search, { model: optionsModel, provider: optionsProvider }, effectiveVisibleModels),
@@ -220,6 +245,29 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
       <DropdownMenuSearch aria-label={copy.search} onValueChange={setSearch} placeholder={copy.search} value={search} />
 
       <DropdownMenuSeparator className="mx-0" />
+
+      {!loading && !error && !search && workflowPresets.length > 0 ? (
+        <>
+          <DropdownMenuLabel className={dropdownMenuSectionLabel}>Workflow Presets</DropdownMenuLabel>
+          {workflowPresets.map(preset => (
+            <DropdownMenuItem
+              className={dropdownMenuRow}
+              disabled={!preset.hybrid && (!optionsModel || !optionsProvider)}
+              key={`workflow:${preset.id}`}
+              onSelect={event => {
+                event.preventDefault()
+                void selectWorkflowPreset(preset)
+              }}
+            >
+              <span className="min-w-0 flex-1 truncate">{preset.label}</span>
+              {currentWorkflow === preset.id ? (
+                <Codicon className="ml-auto text-foreground" name="check" size="0.75rem" />
+              ) : null}
+            </DropdownMenuItem>
+          ))}
+          <DropdownMenuSeparator className="mx-0" />
+        </>
+      ) : null}
 
       {loading ? (
         <DropdownMenuGroup className="py-1">

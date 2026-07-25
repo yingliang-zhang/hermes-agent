@@ -337,9 +337,14 @@ def test_sess_found(server):
 
 
 def test_session_resume_returns_hydrated_messages(server, monkeypatch):
+    make_agent_kwargs = {}
+
     class _DB:
         def get_session(self, _sid):
-            return {"id": "20260409_010101_abc123"}
+            return {
+                "id": "20260409_010101_abc123",
+                "model_config": {"coding_workflow": "hybrid-v1"},
+            }
 
         def get_session_by_title(self, _title):
             return None
@@ -367,7 +372,12 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
             ]
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
-    monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_id=None, session_db=None, **_kwargs: object())
+
+    def make_agent(_sid, _key, **kwargs):
+        make_agent_kwargs.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(server, "_make_agent", make_agent)
     monkeypatch.setattr(server, "_init_session", lambda sid, key, agent, history, cols=80, **_kwargs: None)
     monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None, **_kwargs: {"model": "test/model"})
 
@@ -388,6 +398,7 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
         {"role": "assistant", "text": "yo", "reasoning": "thoughts"},
         {"role": "tool", "name": "tool", "context": ""},
     ]
+    assert make_agent_kwargs["coding_workflow"] == "hybrid-v1"
 
 
 
@@ -468,7 +479,10 @@ def test_session_resume_defaults_to_deferred_build(server, monkeypatch):
             return {
                 "id": target,
                 "model": "vendor/cool-model",
-                "model_config": {"provider": "vendor"},
+                "model_config": {
+                    "provider": "vendor",
+                    "coding_workflow": "hybrid-v1",
+                },
             }
 
         def get_session_by_title(self, _title):
@@ -528,6 +542,7 @@ def test_session_resume_defaults_to_deferred_build(server, monkeypatch):
     assert result["info"]["lazy"] is True
     assert result["info"]["model"] == "vendor/cool-model"
     assert result["info"]["provider"] == "vendor"
+    assert result["info"]["coding_workflow"] == "hybrid-v1"
     assert result["info"]["desktop_contract"] == server.DESKTOP_BACKEND_CONTRACT
 
     sid = result["session_id"]
@@ -539,9 +554,11 @@ def test_session_resume_defaults_to_deferred_build(server, monkeypatch):
     assert not session["agent_ready"].is_set()
     # Not a watch spectator: a normal deferred resume is a real session.
     assert not session.get("lazy")
+    assert session["coding_workflow"] == "hybrid-v1"
     # The persisted runtime identity is stashed for the deferred build so it
     # can't drop the provider ("No LLM provider configured").
     assert session["resume_runtime_overrides"]["model_override"]["model"] == "vendor/cool-model"
+    assert session["resume_runtime_overrides"]["coding_workflow"] == "hybrid-v1"
     assert server._find_live_session_by_key(target) == (sid, session)
 
 
@@ -1351,7 +1368,10 @@ def test_session_branch_persists_branched_from_marker(server, monkeypatch):
     assert new_key == "20260101_000001_child0"
     assert kwargs["parent_session_id"] == parent_key
     # The marker — without it the branch is invisible in /resume and /sessions.
-    assert kwargs["model_config"] == {"_branched_from": parent_key}
+    assert kwargs["model_config"] == {
+        "_branched_from": parent_key,
+        "coding_workflow": "coupled-v1",
+    }
 
 
 def test_session_branch_forwards_original_timestamps(server, monkeypatch):

@@ -139,6 +139,66 @@ WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.enviro
 _log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Coding-workflow contract (Hybrid v1). The canonical allowlist / write
+# validation / profile-default resolution / preset inventory live in
+# ``hermes_cli.coding_workflow`` (pure helpers, no I/O) — imported directly,
+# there is no REST-local fallback. See docs/plans/2026-07-25-hybrid-routing-v1.md.
+# ---------------------------------------------------------------------------
+from hermes_cli.coding_workflow import (
+    DEFAULT_WORKFLOW,
+    InvalidCodingWorkflow,
+    canonicalize_controller_route,
+    resolve_profile_default,
+    validate_coding_workflow,
+    workflow_presets,
+)
+
+
+def _workflow_route_block(preset: dict, role: str) -> Optional[dict]:
+    """Nest a canonical preset's flat ``<role>_provider`` / ``<role>_model``
+    (and ``<role>_thinking`` when present) keys into the ``{provider, model,
+    thinking}`` block the model picker renders.
+
+    Passes through an already-nested dict if the helper grows one. Returns
+    None when the helper exposes no route for ``role`` — no metadata is
+    invented here (honest controller/executor surface, once the helper
+    provides it).
+    """
+    nested = preset.get(role)
+    if isinstance(nested, dict):
+        return nested
+    provider = preset.get(f"{role}_provider")
+    model = preset.get(f"{role}_model")
+    if provider or model:
+        block: dict = {"provider": provider, "model": model}
+        thinking = preset.get(f"{role}_thinking")
+        if thinking is not None:
+            block["thinking"] = thinking
+        return block
+    return None
+
+
+def _workflow_presets_rest() -> list[dict]:
+    """REST-facing workflow-preset shape, derived from the canonical
+    ``workflow_presets()``. Presentation only — ids, labels, and the
+    controller/executor routes come from the canonical helper; this only
+    nests the flat route keys. Hybrid is a preset, never a virtual model
+    provider.
+    """
+    out: list[dict] = []
+    for preset in workflow_presets():
+        out.append(
+            {
+                "id": preset.get("id"),
+                "label": preset.get("label"),
+                "hybrid": bool(preset.get("hybrid")),
+                "controller": _workflow_route_block(preset, "controller"),
+                "executor": _workflow_route_block(preset, "executor"),
+            }
+        )
+    return out
+
+# ---------------------------------------------------------------------------
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
 # and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
 # the chat tab generates on mount; entries auto-evict when the last subscriber
@@ -946,6 +1006,10 @@ _CATEGORY_MERGE: Dict[str, str] = {
     # field — fold it into the agent tab rather than spawning a one-field
     # orphan category.
     "computer_use": "agent",
+    # One profile-default field controls coding delegation behavior. The
+    # dedicated Models UI owns its rich route selector; keep the generic
+    # config schema from creating a one-field orphan tab.
+    "coding_workflow": "agent",
 }
 
 # Display order for tabs — unlisted categories sort alphabetically after these.
@@ -1358,6 +1422,13 @@ class ModelAssignment(BaseModel):
     api_key: str = ""
     confirm_expensive_model: bool = False
     profile: Optional[str] = None
+    # Optional coding workflow for scope=main only. Validates against the
+    # frozen allowlist (coupled-v1 / hybrid-v1); an unknown value fails closed
+    # with 400. hybrid-v1 requires the fixed Sol controller
+    # (custom:sudo / gpt-5.6-sol). Omitted/None on a main-model write means
+    # coupled-v1 so an ordinary model choice cannot preserve a Hybrid default.
+    # Auxiliary scope ignores it.
+    coding_workflow: Optional[str] = None
 
 
 class MoaModelSlot(BaseModel):
@@ -1575,6 +1646,45 @@ def _apply_main_model_assignment(
     if new_provider != prev_provider:
         clear_model_endpoint_credentials(model_cfg, clear_api_key=False)
     model_cfg.pop("context_length", None)
+    return model_cfg
+
+
+def _apply_main_route_assignment(
+    cfg: Dict[str, Any],
+    provider: str,
+    model: str,
+    base_url: str = "",
+    api_key: str = "",
+    *,
+    workflow: str = DEFAULT_WORKFLOW,
+) -> dict:
+    """Apply one invariant-preserving main route to a top-level config.
+
+    The model route and ``coding_workflow.default`` are mutated in the same
+    in-memory config so the caller can persist both with its single
+    ``save_config`` call. Ordinary and legacy callers inherit
+    ``DEFAULT_WORKFLOW``; the validated ``POST /api/model/set`` path is the
+    only caller that supplies an explicit workflow. Canonicalization keeps an
+    explicit Hybrid route pinned to the centrally defined controller pair.
+    """
+    canonical_workflow = validate_coding_workflow(workflow)
+    canonical_provider, canonical_model = canonicalize_controller_route(
+        canonical_workflow, provider, model
+    )
+    model_cfg = _apply_main_model_assignment(
+        cfg.get("model", {}),
+        canonical_provider or "",
+        canonical_model or "",
+        base_url,
+        api_key,
+    )
+    cfg["model"] = model_cfg
+
+    workflow_cfg = cfg.get("coding_workflow")
+    if not isinstance(workflow_cfg, dict):
+        workflow_cfg = {}
+    workflow_cfg["default"] = canonical_workflow
+    cfg["coding_workflow"] = workflow_cfg
     return model_cfg
 
 
@@ -6526,7 +6636,12 @@ def get_model_info(profile: Optional[str] = None):
             config_ctx = None
 
         if not model_name:
-            return dict(_EMPTY_MODEL_INFO, provider=provider)
+            return {
+                **_EMPTY_MODEL_INFO,
+                "provider": provider,
+                "coding_workflow": resolve_profile_default(cfg),
+                "workflow_presets": _workflow_presets_rest(),
+            }
 
         # Resolve auto-detected context length (pass config_ctx=None to get
         # purely auto-detected value, then separately report the override)
@@ -6572,6 +6687,8 @@ def get_model_info(profile: Optional[str] = None):
             "config_context_length": config_ctx_int,
             "effective_context_length": effective_ctx,
             "capabilities": caps,
+            "coding_workflow": resolve_profile_default(cfg),
+            "workflow_presets": _workflow_presets_rest(),
         }
     except HTTPException:
         # Unknown/invalid profile must surface as 404, not degrade into a
@@ -6579,7 +6696,11 @@ def get_model_info(profile: Optional[str] = None):
         raise
     except Exception:
         _log.exception("GET /api/model/info failed")
-        return dict(_EMPTY_MODEL_INFO)
+        return {
+            **_EMPTY_MODEL_INFO,
+            "coding_workflow": DEFAULT_WORKFLOW,
+            "workflow_presets": _workflow_presets_rest(),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -6635,7 +6756,7 @@ def get_model_options(
         # include_unconfigured=1 so it can still render setup affordances for
         # providers that are not yet authenticated.
         with _profile_scope(profile):
-            return build_models_payload(
+            payload = build_models_payload(
                 load_picker_context(),
                 explicit_only=bool(explicit_only),
                 include_unconfigured=bool(include_unconfigured),
@@ -6647,6 +6768,14 @@ def get_model_options(
                 probe_custom_providers=bool(refresh),
                 probe_current_custom_provider=not bool(refresh),
             )
+            coding_workflow = resolve_profile_default(load_config())
+        # Hybrid is a workflow preset, never a fake model provider — the
+        # ``providers`` array comes verbatim from build_models_payload, which
+        # never invents a hybrid/coding_workflow row.
+        if isinstance(payload, dict):
+            payload["coding_workflow"] = coding_workflow
+            payload["workflow_presets"] = _workflow_presets_rest()
+        return payload
     except HTTPException:
         raise
     except Exception:
@@ -6890,12 +7019,40 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
     if scope not in {"main", "auxiliary"}:
         raise HTTPException(status_code=400, detail="scope must be 'main' or 'auxiliary'")
 
+    # coding_workflow is a main-slot-only concern. Every ordinary main-model
+    # write is coupled unless the caller explicitly requests Hybrid; this keeps
+    # old clients from silently preserving a contradictory Hybrid profile
+    # default. Auxiliary writes remain workflow-neutral.
+    raw_workflow = body.coding_workflow
+    workflow: Optional[str] = DEFAULT_WORKFLOW if scope == "main" else None
+    if scope == "main" and raw_workflow is not None and str(raw_workflow).strip():
+        try:
+            workflow = validate_coding_workflow(raw_workflow)
+        except InvalidCodingWorkflow:
+            raise HTTPException(status_code=400, detail="Invalid coding workflow")
+
+    # Hybrid accepts only the fixed Sol controller route. Reuse the central
+    # validator so REST and session creation reject the same contradictory
+    # partial states before any config read or write.
+    effective_provider = provider
+    effective_model = model
+    if workflow == "hybrid-v1":
+        try:
+            effective_provider, effective_model = canonicalize_controller_route(
+                workflow, provider, model
+            )
+        except InvalidCodingWorkflow:
+            raise HTTPException(status_code=400, detail="Invalid Hybrid controller route")
+
+
     try:
         # Expensive-model warning runs BEFORE the profile scope is entered:
         # _profile_scope must never be held across an await (the RLock is
         # reentrant per-thread, so a second coroutine interleaving on the
         # event-loop thread could cross-restore the module globals).
-        if model and not body.confirm_expensive_model:
+        # The fixed hybrid controller is a known preset, not a user cost
+        # choice, so the confirm prompt is skipped for hybrid-v1.
+        if effective_model and not body.confirm_expensive_model and workflow != "hybrid-v1":
             try:
                 from hermes_cli.model_cost_guard import expensive_model_warning
 
@@ -6903,8 +7060,8 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
                 # cache miss — keep it off the event loop.
                 warning = await asyncio.to_thread(
                     expensive_model_warning,
-                    model,
-                    provider=provider,
+                    effective_model,
+                    provider=effective_provider,
                     base_url=base_url,
                 )
             except Exception:
@@ -6913,8 +7070,8 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
                 return {
                     "ok": False,
                     "scope": scope,
-                    "provider": provider,
-                    "model": model,
+                    "provider": effective_provider,
+                    "model": effective_model,
                     "confirm_required": True,
                     "confirm_message": warning.message,
                 }
@@ -6922,7 +7079,7 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
         def _apply_assignment():
             with _profile_scope(body.profile or profile):
                 return _apply_model_assignment_sync(
-                    scope, provider, model, task, base_url, api_key
+                    scope, effective_provider, effective_model, task, base_url, api_key, workflow
                 )
 
         return await asyncio.to_thread(_apply_assignment)
@@ -6934,13 +7091,26 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
 
 
 def _apply_model_assignment_sync(
-    scope: str, provider: str, model: str, task: str, base_url: str, api_key: str = ""
+    scope: str,
+    provider: str,
+    model: str,
+    task: str,
+    base_url: str,
+    api_key: str = "",
+    workflow: Optional[str] = None,
 ):
     """Synchronous body of POST /api/model/set.
 
     Runs inside ``_profile_scope`` (in a worker thread) so every
     load_config/save_config lands in the requested profile.  Raises
     HTTPException for validation errors — the async wrapper re-raises them.
+
+    ``workflow`` is the already-normalized coding workflow. Main assignments
+    always carry one: an omitted REST value is normalized to coupled-v1 before
+    this function runs. ``coding_workflow.default`` is written into the SAME
+    in-memory ``cfg`` and persisted by the SAME single ``save_config(cfg)``
+    call as the model provider/model (atomic global save). The auxiliary branch
+    receives None and never touches it.
     """
     cfg = load_config()
 
@@ -6952,21 +7122,27 @@ def _apply_model_assignment_sync(
         provider_entry = providers_cfg.get(provider) if isinstance(providers_cfg, dict) else None
         if not base_url and isinstance(provider_entry, dict) and provider_entry.get("base_url"):
             base_url = str(provider_entry.get("base_url") or "").strip()
-        model_cfg = _apply_main_model_assignment(
-            cfg.get("model", {}), provider, model, base_url, api_key
-        )
+        assignment_api_key = api_key
         # Fall back to the provider entry's stored key only when the request
         # didn't carry one — same precedence as the base_url fill above. An
         # unconditional overwrite silently discards a key the caller is
         # rotating in, and model.api_key outranks the environment at client
         # construction (#62269), so the stale key keeps authenticating.
         if (
-            not api_key
+            not assignment_api_key
             and isinstance(provider_entry, dict)
             and provider_entry.get("api_key")
         ):
-            model_cfg["api_key"] = provider_entry["api_key"]
-        cfg["model"] = model_cfg
+            assignment_api_key = str(provider_entry["api_key"])
+        route_workflow = workflow if workflow is not None else DEFAULT_WORKFLOW
+        model_cfg = _apply_main_route_assignment(
+            cfg,
+            provider,
+            model,
+            base_url,
+            assignment_api_key,
+            workflow=route_workflow,
+        )
 
         # When switching the main provider to Nous, mirror the CLI's
         # post-model-selection behaviour (hermes_cli/main.py
@@ -6997,7 +7173,11 @@ def _apply_model_assignment_sync(
                 # must never block saving the model assignment.
                 _log.debug("apply_nous_managed_defaults skipped", exc_info=True)
 
-        save_config(cfg)
+        # Single atomic save: model provider/default + coding_workflow.default
+        # land in one write. preserve_keys forces coupled-v1 to survive
+        # save_config's default stripping so the ordinary-model choice remains
+        # an explicit profile default.
+        save_config(cfg, preserve_keys={("coding_workflow", "default")})
 
         # Register a named ``custom_providers`` entry for a custom/local
         # endpoint, mirroring the ``hermes model`` custom flow
@@ -7054,6 +7234,9 @@ def _apply_model_assignment_sync(
             "scope": "main",
             "provider": provider,
             "model": model,
+            "coding_workflow": (
+                workflow if workflow is not None else resolve_profile_default(cfg)
+            ),
             "base_url": model_cfg.get("base_url", ""),
             "gateway_tools": gateway_tools,
             "stale_aux": stale_aux,
@@ -7174,6 +7357,13 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
     from the dict so get_model_context_length() uses its normal resolution).
     """
     config = dict(config)
+    # The generic Config-page PUT must not bypass the validated
+    # ``/api/model/set`` workflow authority. Strip any incoming
+    # ``coding_workflow`` *before* model-change processing so that only
+    # ``_apply_main_route_assignment`` (called below on a real model
+    # change) can set it — an unchanged-model save preserves the disk
+    # value through deep-merge.
+    config.pop("coding_workflow", None)
     # Remove any _model_meta that might have leaked in (shouldn't happen
     # with the stripped GET response, but be defensive)
     config.pop("_model_meta", None)
@@ -7202,37 +7392,86 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
                 # ollama-local keeps the stale provider and 404s. Only fires
                 # on a real model change so saving unrelated config fields
                 # never overwrites an explicit provider.
-                if model_val != prev_default and prev_provider:
+                if model_val != prev_default:
                     new_provider, resolved_model = _infer_provider_on_model_change(
                         model_val, prev_provider
                     )
-                    if new_provider and new_provider.strip().lower() != prev_provider.lower():
+                    norm_provider = prev_provider
+                    norm_model = model_val
+                    if (
+                        new_provider
+                        and new_provider.strip().lower() != prev_provider.lower()
+                    ):
                         # Route through the canonical assignment chokepoints so
                         # the model is normalized for the new provider and stale
-                        # base_url/api_mode/api_key are cleared on the switch
-                        # (and preserved on a same-provider re-pick).
+                        # base_url/api_mode/api_key are cleared on the switch.
                         norm_provider, norm_model = _normalize_main_model_assignment(
                             new_provider, resolved_model
                         )
-                        disk_model = _apply_main_model_assignment(
-                            disk_model, norm_provider, norm_model
-                        )
-                        model_val = norm_model
-                # Preserve all subkeys, update default with the new value
-                disk_model["default"] = model_val
+                    # Every actual flat main-model change is an ordinary route
+                    # write, including same-provider and legacy assignments.
+                    # Preserve the disk model's unrelated subkeys while coupling
+                    # the workflow in this same top-level config.
+                    config["model"] = disk_model
+                    disk_model = _apply_main_route_assignment(
+                        config, norm_provider, norm_model
+                    )
+                    model_val = norm_model
+                else:
+                    # Unchanged model: this is an unrelated config save, not a
+                    # route mutation, so leave an explicit Hybrid choice alone.
+                    disk_model["default"] = model_val
                 # Write context_length into the model dict (0 = remove/auto)
                 if ctx_override > 0:
                     disk_model["context_length"] = ctx_override
                 else:
                     disk_model.pop("context_length", None)
                 config["model"] = disk_model
-            # Model was previously a bare string — upgrade to dict if
-            # user is setting a context_length override
-            elif ctx_override > 0:
-                config["model"] = {
-                    "default": model_val,
-                    "context_length": ctx_override,
-                }
+            else:
+                # Model was previously a bare string or absent — route an
+                # actual model change through the invariant helper so the
+                # workflow is atomically coupled, same as the dict path. An
+                # unchanged model is not a route mutation, so leave an
+                # explicit Hybrid choice alone.
+                prev_default = (
+                    str(disk_model).strip()
+                    if isinstance(disk_model, str)
+                    else ""
+                )
+                if model_val != prev_default:
+                    prev_provider = str(
+                        disk_config.get("provider") or ""
+                    ).strip()
+                    new_provider, resolved_model = (
+                        _infer_provider_on_model_change(
+                            model_val, prev_provider
+                        )
+                    )
+                    norm_provider = prev_provider
+                    norm_model = model_val
+                    if (
+                        new_provider
+                        and new_provider.strip().lower()
+                        != prev_provider.lower()
+                    ):
+                        norm_provider, norm_model = (
+                            _normalize_main_model_assignment(
+                                new_provider, resolved_model
+                            )
+                        )
+                    new_model_cfg = _apply_main_route_assignment(
+                        config, norm_provider, norm_model
+                    )
+                    if ctx_override > 0:
+                        new_model_cfg["context_length"] = ctx_override
+                    else:
+                        new_model_cfg.pop("context_length", None)
+                    config["model"] = new_model_cfg
+                elif ctx_override > 0:
+                    config["model"] = {
+                        "default": model_val,
+                        "context_length": ctx_override,
+                    }
         except Exception:
             pass  # can't read disk config — just use the string form
     return config
@@ -7649,11 +7888,13 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
     cfg["providers"] = providers
 
     if body.make_default:
-        cfg["model"] = _apply_main_model_assignment(
-            cfg.get("model", {}), endpoint_id, model, base_url
+        _apply_main_route_assignment(
+            cfg,
+            endpoint_id,
+            model,
+            base_url,
+            str(entry.get("api_key") or ""),
         )
-        if entry.get("api_key") and isinstance(cfg["model"], dict):
-            cfg["model"]["api_key"] = entry["api_key"]
 
     return endpoint_id, entry
 
@@ -7703,10 +7944,13 @@ def activate_custom_endpoint(endpoint_id: str):
         if not model or not base_url:
             raise HTTPException(status_code=400, detail="custom endpoint is incomplete")
 
-        model_cfg = _apply_main_model_assignment(cfg.get("model", {}), provider_key, model, base_url)
-        if entry.get("api_key"):
-            model_cfg["api_key"] = entry["api_key"]
-        cfg["model"] = model_cfg
+        _apply_main_route_assignment(
+            cfg,
+            provider_key,
+            model,
+            base_url,
+            str(entry.get("api_key") or ""),
+        )
         save_config(cfg)
         return {"ok": True, "provider": provider_key, "model": model}
     except HTTPException:
@@ -14741,7 +14985,7 @@ def _write_profile_model(profile_dir: Path, provider: str, model: str) -> None:
     try:
         provider, model = _normalize_main_model_assignment(provider, model)
         cfg = load_config()
-        cfg["model"] = _apply_main_model_assignment(cfg.get("model", {}), provider, model)
+        _apply_main_route_assignment(cfg, provider, model)
         save_config(cfg)
     finally:
         reset_hermes_home_override(token)

@@ -809,6 +809,9 @@ export const zhHant = defineLocale({
     model: {
       loading: '正在載入模型設定...',
       appliesDesc: '套用至新工作階段。可在輸入框的模型選擇器中臨時切換目前對話。',
+      workflow: '編碼工作流程',
+      coupled: '耦合',
+      hybrid: '混合',
       provider: '提供方',
       model: '模型',
       applying: '套用中...',

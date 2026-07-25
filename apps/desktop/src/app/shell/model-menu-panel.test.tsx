@@ -40,13 +40,33 @@ const GOOGLE_PROVIDER = {
 }
 
 const MOCK_PROVIDERS = [DEEPSEEK_PROVIDER, GOOGLE_PROVIDER, MOA_PROVIDER]
+const WORKFLOW_PRESETS = [
+  {
+    id: 'coupled-v1',
+    label: 'Coupled',
+    hybrid: false,
+    controller_provider: null,
+    controller_model: null
+  },
+  {
+    id: 'hybrid-v1',
+    label: 'Hybrid',
+    hybrid: true,
+    controller_provider: 'custom:sudo',
+    controller_model: 'gpt-5.6-sol'
+  }
+]
 
 beforeEach(() => {
   $activeSessionId.set('runtime-1')
   $currentModel.set('')
   $currentProvider.set('')
   $collapsedProviders.set([])
-  getGlobalModelOptions.mockResolvedValue({ providers: MOCK_PROVIDERS })
+  getGlobalModelOptions.mockResolvedValue({
+    coding_workflow: 'coupled-v1',
+    providers: MOCK_PROVIDERS,
+    workflow_presets: WORKFLOW_PRESETS
+  })
 })
 
 afterEach(() => {
@@ -54,21 +74,41 @@ afterEach(() => {
   vi.clearAllMocks()
 })
 
-function renderPanel(onSelectModel = vi.fn()) {
+function renderPanel(onSelectModel = vi.fn(), onSelectHybrid = vi.fn()) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
   const content = render(
     <QueryClientProvider client={client}>
       <DropdownMenu open>
         <DropdownMenuContent>
-          <ModelMenuPanel onSelectModel={onSelectModel} requestGateway={vi.fn() as never} />
+          <ModelMenuPanel
+            onSelectHybrid={onSelectHybrid}
+            onSelectModel={onSelectModel}
+            requestGateway={vi.fn() as never}
+          />
         </DropdownMenuContent>
       </DropdownMenu>
     </QueryClientProvider>
   )
 
-  return { onSelectModel, content }
+  return { onSelectHybrid, onSelectModel, content }
 }
+
+describe('ModelMenuPanel workflow presets', () => {
+  it('renders Hybrid as a workflow preset and routes it without a virtual provider', async () => {
+    const { content, onSelectHybrid, onSelectModel } = renderPanel()
+
+    const row = await content.findByText('Hybrid')
+    fireEvent.click(row)
+
+    expect(onSelectHybrid).toHaveBeenCalledWith({ sessionId: 'runtime-1' })
+    expect(onSelectModel).not.toHaveBeenCalledWith(
+      expect.objectContaining({ provider: 'hybrid' })
+    )
+    // eslint-disable-next-line no-restricted-globals
+    expect(document.body.textContent).toContain('Workflow Presets')
+  })
+})
 
 describe('ModelMenuPanel MoA presets', () => {
   it('selecting a MoA preset switches PERSISTENTLY via onSelectModel (not the one-shot dispatch)', async () => {

@@ -284,7 +284,17 @@ export interface ModelInfoResponse {
   effective_context_length?: number
   model: string
   provider: string
+  /** Profile-default coding workflow surfaced by the backend (hybrid routing).
+   *  Absent on older backends → the renderer treats it as `coupled-v1`. */
+  coding_workflow?: CodingWorkflow
 }
+
+/** Orthogonal coding-workflow mode for hybrid routing. The shipped/default
+ *  schema is `coupled-v1`; `hybrid-v1` keeps GPT-5.6 Sol as the controller while
+ *  OMP implementation/repair rounds use GLM-5.2 Heavy. This is an internal
+ *  routing dimension, NOT a model provider — Hybrid is never represented as a
+ *  provider slug. */
+export type CodingWorkflow = 'coupled-v1' | 'hybrid-v1'
 
 export interface ModelPricing {
   /** Formatted $/Mtok input price, e.g. "$3.00", or "free", or "" if unknown. */
@@ -339,10 +349,24 @@ export interface ModelCapabilities {
   reasoning: boolean
 }
 
+export interface WorkflowPreset {
+  id: CodingWorkflow
+  label: string
+  hybrid: boolean
+  controller_provider?: null | string
+  controller_model?: null | string
+  controller_thinking?: null | string
+  executor_provider?: null | string
+  executor_model?: null | string
+  executor_thinking?: null | string
+}
+
 export interface ModelOptionsResponse {
+  coding_workflow?: CodingWorkflow
   model?: string
   provider?: string
   providers?: ModelOptionProvider[]
+  workflow_presets?: WorkflowPreset[]
 }
 
 export interface PaginatedSessions {
@@ -486,6 +510,10 @@ export interface SessionResumeResponse {
 export interface SessionRuntimeInfo {
   approval_mode?: 'manual' | 'off' | 'smart'
   branch?: string
+  /** Coding workflow the session snapshots on create and restores on resume.
+   *  Orthogonal to the primary provider/model — see {@link CodingWorkflow}.
+   *  Absent on legacy sessions → degrade to `coupled-v1` at read boundaries. */
+  coding_workflow?: CodingWorkflow
   config_warning?: string
   credential_warning?: string
   cwd?: string
@@ -1050,6 +1078,9 @@ export interface ModelAssignmentRequest {
   /** OpenAI-compatible endpoint URL. Only honored for custom/local providers
    *  on the main slot — wires a self-hosted endpoint into runtime resolution. */
   base_url?: string
+  /** Profile-default workflow written atomically with a main-model assignment. */
+  coding_workflow?: CodingWorkflow
+
   model: string
   provider: string
   scope: 'main' | 'auxiliary'
@@ -1215,6 +1246,8 @@ export interface DebugShareResponse {
 export interface ModelAssignmentResponse {
   /** Persisted endpoint URL for custom/local providers (echoed back). */
   base_url?: string
+  /** Profile-default workflow persisted by a main assignment. */
+  coding_workflow?: CodingWorkflow
   /** Toolset keys auto-routed through the Nous Tool Gateway as a result of
    *  switching the main provider to Nous. Empty unless provider === 'nous'
    *  and the user is a paid subscriber with unconfigured tools. */

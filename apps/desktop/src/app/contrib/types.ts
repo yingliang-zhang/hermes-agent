@@ -65,6 +65,7 @@ export interface WiringActions extends SidebarActions, ChatActions {
   openAgents: () => void
   openCommandCenterSection: (section: CommandCenterSection) => void
   requestGateway: GatewayRequester
+  selectHybrid: ComponentProps<typeof ModelMenuPanel>['onSelectHybrid']
   selectModel: ComponentProps<typeof ModelMenuPanel>['onSelectModel']
   toggleCommandCenter: () => void
 }

@@ -27,6 +27,7 @@ session a few steps later.
 """
 import asyncio
 from contextvars import copy_context
+from typing import Any
 
 import pytest
 
@@ -43,7 +44,7 @@ from tools.environments.local import _make_run_env
 
 SESSION_VARS = list(_VAR_MAP.keys())
 
-MINE = dict(
+MINE: dict[str, Any] = dict(
     session_key="agent:main:discord:thread:MINE:MINE",
     platform="discord",
     chat_id="MINE_CHAT",
@@ -51,8 +52,9 @@ MINE = dict(
     user_id="MINE_USER",
     chat_name="mine",
     message_id="MINE_MSG",
+    coding_workflow="hybrid-v1",
 )
-FOREIGN = dict(
+FOREIGN: dict[str, Any] = dict(
     session_key="agent:main:discord:thread:FOREIGN:FOREIGN",
     platform="discord",
     chat_id="FOREIGN_CHAT",
@@ -60,6 +62,7 @@ FOREIGN = dict(
     user_id="FOREIGN_USER",
     chat_name="foreign",
     message_id="FOREIGN_MSG",
+    coding_workflow="coupled-v1",
 )
 
 
@@ -94,6 +97,7 @@ def _spawn_view():
     """What a subprocess spawned right now would see for the session vars."""
     env = _make_run_env({})
     return {
+        "HERMES_CODING_WORKFLOW": env.get("HERMES_CODING_WORKFLOW"),
         "HERMES_SESSION_CHAT_ID": env.get("HERMES_SESSION_CHAT_ID"),
         "HERMES_SESSION_THREAD_ID": env.get("HERMES_SESSION_THREAD_ID"),
         "HERMES_SESSION_KEY": env.get("HERMES_SESSION_KEY"),
@@ -163,6 +167,18 @@ def test_reset_session_vars_closes_inheritance_leak():
     # B's own session still binds correctly after the reset window.
     assert captured["bound"]["HERMES_SESSION_CHAT_ID"] == "FOREIGN_CHAT"
     assert captured["bound"]["HERMES_SESSION_KEY"] == FOREIGN["session_key"]
+    assert captured["bound"]["HERMES_CODING_WORKFLOW"] == "coupled-v1"
+
+
+def test_coding_workflow_is_task_local_and_reset_strips_inherited_hybrid():
+    set_session_vars(**MINE)
+
+    leaked = asyncio.run(_child_turn(reset_first=False))
+    assert leaked["window"]["HERMES_CODING_WORKFLOW"] == "hybrid-v1"
+
+    isolated = asyncio.run(_child_turn(reset_first=True))
+    assert isolated["window"]["HERMES_CODING_WORKFLOW"] is None
+    assert isolated["bound"]["HERMES_CODING_WORKFLOW"] == "coupled-v1"
 
 
 def test_reset_session_vars_restores_unset_not_empty():
@@ -260,3 +276,110 @@ def test_reset_session_vars_restores_async_delivery_unset():
         f"_SESSION_ASYNC_DELIVERY is {_SESSION_ASYNC_DELIVERY.get()!r}, expected _UNSET"
     )
     assert async_delivery_supported() is True
+
+
+def test_gateway_sessions_bind_profile_fallback_without_cross_contamination(
+    monkeypatch, tmp_path
+):
+    from gateway import run as gateway_run
+    from gateway.config import GatewayConfig, Platform
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionContext, SessionSource, SessionStore
+
+    config = GatewayConfig()
+    store = SessionStore(sessions_dir=tmp_path, config=config)
+    store._db = None
+    hybrid_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="hybrid-chat",
+        user_id="hybrid-user",
+    )
+    coupled_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="coupled-chat",
+        user_id="coupled-user",
+    )
+    hybrid_entry = store.get_or_create_session(hybrid_source)
+    coupled_entry = store.get_or_create_session(coupled_source)
+    assert store.set_session_metadata(
+        coupled_entry.session_key, "coding_workflow", "coupled-v1"
+    )
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = config
+    runner.session_store = store
+    runner.adapters = {}
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"coding_workflow": {"default": "hybrid-v1"}},
+    )
+
+    hybrid_context = SessionContext(
+        source=hybrid_source,
+        connected_platforms=[],
+        home_channels={},
+        session_key=hybrid_entry.session_key,
+        session_id=hybrid_entry.session_id,
+    )
+    coupled_context = SessionContext(
+        source=coupled_source,
+        connected_platforms=[],
+        home_channels={},
+        session_key=coupled_entry.session_key,
+        session_id=coupled_entry.session_id,
+    )
+
+    async def run_concurrently():
+        hybrid_bound = asyncio.Event()
+        coupled_bound = asyncio.Event()
+
+        async def child(context, mine, sibling):
+            tokens = runner._set_session_env(context)
+            try:
+                mine.set()
+                await sibling.wait()
+                await asyncio.sleep(0)
+                return _spawn_view()
+            finally:
+                runner._clear_session_env(tokens)
+
+        return await asyncio.gather(
+            child(hybrid_context, hybrid_bound, coupled_bound),
+            child(coupled_context, coupled_bound, hybrid_bound),
+        )
+
+    hybrid_env, coupled_env = asyncio.run(run_concurrently())
+
+    assert hybrid_env["HERMES_CODING_WORKFLOW"] == "hybrid-v1"
+    assert coupled_env["HERMES_CODING_WORKFLOW"] == "coupled-v1"
+    assert (
+        store.get_session_metadata(hybrid_entry.session_key, "coding_workflow")
+        == "hybrid-v1"
+    )
+    assert (
+        store.get_session_metadata(coupled_entry.session_key, "coding_workflow")
+        == "coupled-v1"
+    )
+
+    reloaded = SessionStore(sessions_dir=tmp_path, config=config)
+    reloaded._db = None
+    resumed_entry = reloaded.get_or_create_session(hybrid_source)
+    runner.session_store = reloaded
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"coding_workflow": {"default": "coupled-v1"}},
+    )
+    resumed_context = SessionContext(
+        source=hybrid_source,
+        connected_platforms=[],
+        home_channels={},
+        session_key=resumed_entry.session_key,
+        session_id=resumed_entry.session_id,
+    )
+    tokens = runner._set_session_env(resumed_context)
+    try:
+        assert _spawn_view()["HERMES_CODING_WORKFLOW"] == "hybrid-v1"
+    finally:
+        runner._clear_session_env(tokens)

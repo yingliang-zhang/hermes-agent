@@ -3,15 +3,21 @@ import type { MutableRefObject } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ChatMessage } from '@/lib/chat-messages'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import {
   $activeSessionStoredIdRotation,
+  $currentCodingWorkflow,
   $currentFastMode,
   $currentModel,
   $currentProvider,
   $currentReasoningEffort,
   $currentServiceTier,
+  $currentSessionCodingWorkflow,
+  $draftCodingWorkflowOverride,
   $messages,
+  $profileCodingWorkflowDefault,
   $turnStartedAt,
+  resetDraftCodingWorkflowOverride,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
   setCurrentFastMode,
@@ -19,6 +25,9 @@ import {
   setCurrentProvider,
   setCurrentReasoningEffort,
   setCurrentServiceTier,
+  setCurrentSessionCodingWorkflow,
+  setDraftCodingWorkflowOverride,
+  setProfileCodingWorkflowDefault,
   setTurnStartedAt
 } from '@/store/session'
 
@@ -382,5 +391,89 @@ describe('useSessionStateCache — cross-thread error isolation', () => {
     // check must reject it instead of allowing a submit into stored-B.
     cache.runtimeIdByStoredSessionIdRef.current.set('stored-A', 'runtime-B')
     expect(cache.getRuntimeIdForStoredSession('stored-A')).toBeNull()
+  })
+})
+
+describe('useSessionStateCache — coding workflow view sync', () => {
+  beforeEach(() => {
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
+      cb(0)
+
+      return null as unknown as number
+    })
+    setActiveSessionId(null)
+    setProfileCodingWorkflowDefault('coupled-v1')
+    setCurrentSessionCodingWorkflow('coupled-v1')
+    resetDraftCodingWorkflowOverride()
+    setCurrentModel('')
+    setCurrentProvider('')
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+    setActiveSessionId(null)
+    setProfileCodingWorkflowDefault('coupled-v1')
+    setCurrentSessionCodingWorkflow('coupled-v1')
+    resetDraftCodingWorkflowOverride()
+    setCurrentModel('')
+    setCurrentProvider('')
+  })
+
+  it('updates only the focused live projection when a Hybrid tile is focused', () => {
+    setDraftCodingWorkflowOverride('coupled-v1')
+    setActiveSessionId('fg-runtime')
+    let cache!: Cache
+
+    const { rerender } = render(
+      <Harness activeSessionId="fg-runtime" onReady={c => (cache = c)} selectedStoredSessionId="fg-stored" />
+    )
+
+    act(() => {
+      cache.updateSessionState(
+        'bg-runtime',
+        state => ({ ...state, model: 'gpt-5.6-sol', provider: 'custom:sudo', codingWorkflow: 'hybrid-v1' }),
+        'bg-stored'
+      )
+    })
+
+    expect($currentSessionCodingWorkflow.get()).toBe('coupled-v1')
+    expect($profileCodingWorkflowDefault.get()).toBe('coupled-v1')
+    expect($draftCodingWorkflowOverride.get()).toBe('coupled-v1')
+
+    act(() => setActiveSessionId('bg-runtime'))
+    rerender(<Harness activeSessionId="bg-runtime" onReady={c => (cache = c)} selectedStoredSessionId="bg-stored" />)
+
+    const bgState = cache.sessionStateByRuntimeIdRef.current.get('bg-runtime')!
+    act(() => cache.syncSessionStateToView('bg-runtime', bgState))
+
+    expect($currentSessionCodingWorkflow.get()).toBe('hybrid-v1')
+    expect($currentCodingWorkflow.get()).toBe('hybrid-v1')
+    expect($profileCodingWorkflowDefault.get()).toBe('coupled-v1')
+    expect($draftCodingWorkflowOverride.get()).toBe('coupled-v1')
+    expect($currentModel.get()).toBe('gpt-5.6-sol')
+    expect($currentProvider.get()).toBe('custom:sudo')
+  })
+
+  it('does not clear profile or draft Hybrid choices when a Coupled session is focused', () => {
+    setProfileCodingWorkflowDefault('hybrid-v1')
+    setDraftCodingWorkflowOverride('hybrid-v1')
+    setCurrentSessionCodingWorkflow('hybrid-v1')
+    setActiveSessionId('fg-runtime')
+    let cache!: Cache
+
+    render(<Harness activeSessionId="fg-runtime" onReady={c => (cache = c)} selectedStoredSessionId="fg-stored" />)
+
+    act(() => {
+      cache.syncSessionStateToView('fg-runtime', {
+        ...createClientSessionState('fg-stored'),
+        codingWorkflow: 'coupled-v1'
+      })
+    })
+
+    expect($currentSessionCodingWorkflow.get()).toBe('coupled-v1')
+    expect($currentCodingWorkflow.get()).toBe('coupled-v1')
+    expect($profileCodingWorkflowDefault.get()).toBe('hybrid-v1')
+    expect($draftCodingWorkflowOverride.get()).toBe('hybrid-v1')
   })
 })

@@ -6,6 +6,17 @@ import { createClientSessionState } from '@/lib/chat-runtime'
 import { $approvalModes, approvalModeForProfile } from '@/store/approval-mode'
 import { $desktopOnboarding } from '@/store/onboarding'
 import { $activeGatewayProfile } from '@/store/profile'
+import {
+  $currentCodingWorkflow,
+  $currentSessionCodingWorkflow,
+  $draftCodingWorkflowOverride,
+  $profileCodingWorkflowDefault,
+  resetDraftCodingWorkflowOverride,
+  setActiveSessionId,
+  setCurrentSessionCodingWorkflow,
+  setDraftCodingWorkflowOverride,
+  setProfileCodingWorkflowDefault
+} from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
 
 import {
@@ -555,5 +566,53 @@ describe('appendLiveSessionProjection', () => {
     const stored = [msg('stored-user', 'user', 'earlier')]
 
     expect(appendLiveSessionProjection(stored, { session_id: 'runtime-1' })).toBe(stored)
+  })
+})
+
+describe('applyRuntimeInfo coding workflow', () => {
+  beforeEach(() => {
+    setActiveSessionId('session-live')
+    setProfileCodingWorkflowDefault('coupled-v1')
+    setCurrentSessionCodingWorkflow('coupled-v1')
+    resetDraftCodingWorkflowOverride()
+    $activeGatewayProfile.set('default')
+  })
+
+  afterEach(() => {
+    setActiveSessionId(null)
+    setProfileCodingWorkflowDefault('coupled-v1')
+    setCurrentSessionCodingWorkflow('coupled-v1')
+    resetDraftCodingWorkflowOverride()
+  })
+
+  it('reconciles a hybrid-v1 workflow into the state patch and live-session projection only', () => {
+    setDraftCodingWorkflowOverride('coupled-v1')
+    const patch = applyRuntimeInfo({ coding_workflow: 'hybrid-v1' })
+
+    expect(patch).toMatchObject({ codingWorkflow: 'hybrid-v1' })
+    expect($currentSessionCodingWorkflow.get()).toBe('hybrid-v1')
+    expect($currentCodingWorkflow.get()).toBe('hybrid-v1')
+    expect($draftCodingWorkflowOverride.get()).toBe('coupled-v1')
+    expect($profileCodingWorkflowDefault.get()).toBe('coupled-v1')
+  })
+
+  it('rejects an unknown workflow without clobbering authorities; absent legacy data becomes coupled-v1', () => {
+    setProfileCodingWorkflowDefault('hybrid-v1')
+    setDraftCodingWorkflowOverride('hybrid-v1')
+    setCurrentSessionCodingWorkflow('hybrid-v1')
+    expect(() => applyRuntimeInfo({ coding_workflow: 'nonsense' as never })).toThrow(
+      'Unknown coding workflow value'
+    )
+    expect($currentSessionCodingWorkflow.get()).toBe('hybrid-v1')
+    expect($draftCodingWorkflowOverride.get()).toBe('hybrid-v1')
+    expect($profileCodingWorkflowDefault.get()).toBe('hybrid-v1')
+
+    const patch = applyRuntimeInfo({ model: 'm1', provider: 'p1' })
+
+    expect(patch?.codingWorkflow).toBe('coupled-v1')
+    expect($currentSessionCodingWorkflow.get()).toBe('coupled-v1')
+    expect($currentCodingWorkflow.get()).toBe('coupled-v1')
+    expect($draftCodingWorkflowOverride.get()).toBe('hybrid-v1')
+    expect($profileCodingWorkflowDefault.get()).toBe('hybrid-v1')
   })
 })

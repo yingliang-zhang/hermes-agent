@@ -45,6 +45,7 @@ export function ModelPill({
   const viewProvider = useStore(view.$provider)
   const currentModel = model.model || viewModel
   const currentProvider = model.provider || viewProvider
+  const codingWorkflow = useStore(view.$codingWorkflow)
   const fastMode = useStore(view.$fast)
   const reasoningEffort = useStore(view.$reasoningEffort)
   const modelSource = useStore($currentModelSource)
@@ -63,12 +64,15 @@ export function ModelPill({
   // The model resolves a beat after the gateway/session comes up. Rather than
   // flash a literal "No model", show a quiet loader (inherits the pill text
   // color at half opacity) until a model lands.
+  const modelLabel = formatModelStatusLabel(currentModel, { fastMode, reasoningEffort })
+  const statusLabel = codingWorkflow === 'hybrid-v1' ? `Hybrid · ${modelLabel}` : modelLabel
+
   const label = compact ? (
     <ChevronDown className="size-3.5 shrink-0 opacity-70" />
   ) : (
     <>
       {currentModel.trim() ? (
-        <span className="truncate">{formatModelStatusLabel(currentModel, { fastMode, reasoningEffort })}</span>
+        <span className="truncate">{statusLabel}</span>
       ) : (
         <GlyphSpinner className="opacity-50" spinner="braille" />
       )}

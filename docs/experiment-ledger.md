@@ -107,3 +107,43 @@
 - Terminal completion queues remain process-local across a full gateway crash/restart; this MVP does not add durable terminal-notification recovery.
 - The current target has broad pre-existing lint debt; exact changed-file ESLint reports zero errors and 32 warnings.
 - Patch-stack publication and runtime promotion remain external operations. The live runtime is unchanged until canonical `180-*` rebased append completes and restart is explicitly approved.
+
+## Hybrid v1 routing shim — 2026-07-25
+
+### Contract
+
+- **Plan:** `docs/plans/2026-07-25-hybrid-routing-v1.md`
+- **Branch:** `feat/hybrid-routing-v1`
+- **Baseline:** `12198c191`
+- **Status:** implementation in progress; active runtime/profile unchanged
+- **Primary comparison:** existing `coupled-v1` route versus `hybrid-v1` (Sol XHigh controller/reviewer + GLM Heavy Max implement/repair)
+
+### Runs
+
+| Run | Commit | Scope | Command | Result | Notes |
+|---|---|---|---|---|---|
+| hybrid-baseline-python | `12198c191` | Existing session model/runtime persistence and subprocess context isolation | `scripts/run_tests.sh tests/tui_gateway/test_reasoning_session_scope.py tests/tui_gateway/test_custom_provider_session_persistence.py tests/tools/test_local_env_session_leak.py tests/gateway/test_session_context.py -q` | PASS | 36 passed, 0 failed; nonexistent fourth path was ignored by the runner |
+| hybrid-baseline-desktop | `12198c191` | Existing model controls, session actions/cache, picker, pill, and Settings | six focused UI Vitest files | PASS | 99 passed, 0 failed |
+| hybrid-plan-review | `12198c191` + plan | Independent Sol XHigh architecture review | route-aware hard OMP, 900 s + one exact-UUID 300 s resume, read-only | CHANGES REQUIRED | Both print-mode runs timed out; the exact-resume JSONL contained a partial final text with `VERDICT: CHANGES REQUIRED`, recovered verbatim to the profile run artifact. P0: no workflow markers, transactional route commit, controller instruction wiring, and writer ownership for every Hybrid invocation. This is not an ACCEPT verdict. |
+| hybrid-policy-r0 | worktree staging | Initial profile-local route resolver | `python -m pytest .profile-staging/scripts/tests/test_hybrid_route_policy.py -q` | TEST PASS / REVIEW REJECT | 88 passed + 50 subtests; coupled passthrough, exact roles, and review-reason contract were wrong. Findings returned to GLM repair round 1. |
+| hybrid-policy-r1 | worktree staging | Corrected resolver contract | `python -m pytest .profile-staging/scripts/tests/test_hybrid_route_policy.py -q` | TEST PASS / REVIEW ITERATE | 121 passed + 68 subtests; independent rerun passed, but omitted review facts still defaulted to false/zero. Final GLM repair round 2 requires complete explicit Hybrid review context. |
+| hybrid-portable-junk-filter | control repo working tree | Portable exporter excludes patch rejection leftovers | exporter unittest + live-profile temporary export | PASS | Focused 1/1 and full exporter 12/12 passed; temp archive exported 1906 files with `JUNK_COUNT=0`. Live `.rej/.orig` files were not deleted. |
+| hybrid-rest-profile-default | worktree | REST workflow preset/default API and existing schema integration | focused/helper/config suites + adjacent web-server file + exact failed selector rerun | PASS | Helper+REST 34/34, ContextVar leak 12/12, config 184/184. Adjacent web-server run reached 501 PASS with one new orphan-category failure; `coding_workflow` was merged into the existing agent category, then the failed selector passed 1/1 and focused REST remained 8/8. Full 502-test file was not redundantly rerun after the one-line category fix. |
+| hybrid-policy-r2 | worktree staging | Complete explicit review context and stable Hybrid run identity | Python 3.11 unittest + compile + CLI canaries | ACCEPT (resolver only) | GLM round 2 made all review facts explicit and required run IDs for every Hybrid role. Independent run passed 183 tests; Sol direct review added one whitespace-only run-id invariant, then 184/184 passed. CLI canaries: missing run/fact exit 2; safe direct review, Sol audit, and coupled passthrough exit 0 with expected JSON. |
+| hybrid-runtime-ui-focused | worktree | Session workflow persistence, atomic route RPC, ContextVar isolation, Desktop Workflow Presets/pill | 7-file Python adjacency; 9-file Desktop Vitest; Desktop typecheck; gateway inheritance | PASS | Python 280/280; Desktop 154/154; gateway inheritance 7/7; typecheck exit 0. Route transaction tests cover single session.info, marker-free commit, fixed Hybrid Sol controller, and rollback of model/provider/workflow on strict DB failure. |
+| hybrid-wrapper-slice-a | worktree staging | Typed wrapper args, resolver dispatch, coupled parity, caller resume matrix, Hybrid normal-tier session isolation | 49 baseline wrapper tests plus 9 new Hybrid route tests; resolver suite separately 184/184 | PASS (Slice A only) | Real RED exposed a broken JSON parser (heredoc owned stdin); JSON is now passed as argv. Implement→GLM Max, repairs 1–2 exact GLM resume, repair 3 fresh Sol, independent review/audit Sol, direct review no spawn, trust mismatch, coupled parity, and session-dir checks pass. Slice B remains pending. |
+| hybrid-profile-instructions | worktree staging | Workflow-generic SOUL/skill/routing references | `python -m unittest tests.test_hybrid_profile_instructions` | PASS | 8/8. Literal `--workflow "$HERMES_CODING_WORKFLOW"`, typed roles/run ID, exact repair UUID, direct-review no-OMP, explicit ACCEPT, wrapper-owned timeout, no personal paths/active session IDs, and non-overclaiming staged status are machine-checked. |
+| hybrid-wrapper-slice-b1 | worktree staging | Writer ownership, exact JSONL attribution, effective-route verification, atomic credential-free sidecar | One 600 s implementation timeout + exact-UUID 600 s resume; independent staged suite | PASS | Exact session `019f9799-1d2f-7000-8ad5-4dd69de7263e`; resume exited 0. Independent rerun: 67 wrapper + 184 resolver + 8 instructions = 259/259. Ownership binds run/session/cwd/wrapper/child fingerprints; malformed/active/unverifiable cases fail closed; sidecar mode 0600 and parity/syntax pass. |
+| hybrid-wrapper-slice-b2 | worktree staging | One exact timeout resume, bounded fresh-Sol fallback, no-overlap and ordered attempt evidence | Original + exact resume both 600 s timeout; JSONL/worktree recovery; local focused/full gates | PASS | Double-timeout policy stopped further resume. Production and 4 initial tests were on disk; local review added missing attribution-no-fallback, semantic-success, hard-slot retention, and cleanup contracts. B2 8/8; final total 75 wrapper + 184 resolver + 8 instructions = 267/267. No `--continue`; no recursive wrapper; outer hard slot retained across attempts. |
+| hybrid-final-verification | worktree candidate vs clean `HEAD@12198c191` | Full Python attribution, Desktop full suite/build, staged shim, exporter, sealed authority, lint/syntax/diff | Canonical runners + clean detached baseline worktree | PASS (candidate-only deterministic failures: 0) | Initial concurrent Python full run: 40 failure files / 130 failed tests + 10 no-run. Two candidate-specific mock/rollover gaps (17 failures) were fixed; final changed-path adjacency is 473/473. Remaining baseline subset reproduced 37 failure files / 112 failed tests + 9 no-run on clean HEAD. The two residual candidate/base differences were isolated: `test_base_environment.py` passed on retry (known timing flake) and `test_context_compressor.py` passed 222/222. Desktop: 316 files passed, 1 skipped; 2,856 tests passed, 3 skipped; typecheck/build/postbuild/native staging PASS. Post-lint focused Desktop: 58/58, lint 0 errors (60 baseline warnings). Staged shim 267/267; exporter 12/12; current sealed authority valid at 22 patches ending `180-*`; `py_compile` and `git diff --check` PASS. |
+
+### Metrics to collect after activation
+
+| Metric | Coupled arm | Hybrid arm | Evidence source |
+|---|---:|---:|---|
+| First-pass acceptance rate |  |  | Sol review decisions bound to run IDs |
+| Mean GLM repair rounds | n/a |  | Route-evidence sidecars + review records |
+| Executor escalation rate | n/a |  | `repair_budget_exhausted` / `executor_unavailable` evidence |
+| Independent-review finding rate |  |  | Fresh Sol review outputs |
+| Direct-review escape rate |  |  | Deterministic 20% sampled reviews |
+| End-to-end wall time |  |  | Wrapper evidence timestamps |

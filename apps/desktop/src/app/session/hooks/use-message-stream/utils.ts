@@ -1,12 +1,13 @@
 import type { GatewayEventPayload } from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
+import { isKnownCodingWorkflow } from '@/store/session'
 
 import type { ClientSessionState } from '../../../types'
 
 type SessionRuntimeStatePatch = Partial<
   Pick<
     ClientSessionState,
-    'branch' | 'cwd' | 'fast' | 'model' | 'personality' | 'provider' | 'reasoningEffort' | 'serviceTier' | 'yolo'
+    'branch' | 'codingWorkflow' | 'cwd' | 'fast' | 'model' | 'personality' | 'provider' | 'reasoningEffort' | 'serviceTier' | 'yolo'
   >
 >
 
@@ -47,6 +48,18 @@ export function sessionInfoStatePatch(payload: GatewayEventPayload | undefined):
 
   if (typeof payload?.yolo === 'boolean') {
     patch.yolo = payload.yolo
+  }
+
+  // Coding workflow rides the same session-scoped patch as model/provider so a
+  // session.info heartbeat lands it in that runtime's cache. Only a KNOWN value
+  // is included — an explicit unknown is fail-closed (skipped, never coerced to
+  // coupled-v1) so it cannot mutate the cache, and an absent value is left out
+  // so the cache keeps its prior workflow. The draft atom is never touched here
+  // (heartbeats/background session.info must not clobber the foreground draft).
+  const codingWorkflowRaw = (payload as Record<string, unknown> | undefined)?.coding_workflow
+
+  if (isKnownCodingWorkflow(codingWorkflowRaw)) {
+    patch.codingWorkflow = codingWorkflowRaw
   }
 
   return patch

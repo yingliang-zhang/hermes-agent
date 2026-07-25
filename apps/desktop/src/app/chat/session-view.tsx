@@ -6,6 +6,7 @@ import {
   $activeSessionId,
   $awaitingResponse,
   $busy,
+  $currentCodingWorkflow,
   $currentCwd,
   $currentFastMode,
   $currentModel,
@@ -16,6 +17,7 @@ import {
   $messagesEmpty,
   $selectedStoredSessionId
 } from '@/store/session'
+import type { CodingWorkflow } from '@/types/hermes'
 
 /**
  * SESSION VIEW — the store surface a ChatView renders from. The PRIMARY view
@@ -34,6 +36,7 @@ export interface SessionView {
   $storedId: ReadableAtom<string | null>
   $messages: ReadableAtom<ChatMessage[]>
   $busy: ReadableAtom<boolean>
+  $codingWorkflow: ReadableAtom<CodingWorkflow>
   $awaitingResponse: ReadableAtom<boolean>
   $messagesEmpty: ReadableAtom<boolean>
   $lastVisibleIsUser: ReadableAtom<boolean>
@@ -48,6 +51,7 @@ export const PRIMARY_SESSION_VIEW: SessionView = {
   kind: 'primary',
   $awaitingResponse,
   $busy,
+  $codingWorkflow: $currentCodingWorkflow,
   $cwd: $currentCwd,
   $fast: $currentFastMode,
   $lastVisibleIsUser: $lastVisibleMessageIsUser,

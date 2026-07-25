@@ -14,6 +14,7 @@ import {
   setCurrentProvider,
   setCurrentReasoningEffort,
   setCurrentServiceTier,
+  setCurrentSessionCodingWorkflow,
   setTurnOrigin,
   setTurnStartedAt,
   setYoloActive
@@ -41,6 +42,9 @@ function syncRuntimeMetadataToView(state: ClientSessionState) {
   setCurrentFastMode(state.fast ?? false)
   setYoloActive(state.yolo ?? false)
   setCurrentPersonality(state.personality ?? '')
+  // Focus updates only the live-session projection. The profile default and
+  // any explicit new-draft override remain independent.
+  setCurrentSessionCodingWorkflow(state.codingWorkflow)
   setTurnOrigin(state.turnOrigin ?? null)
 }
 

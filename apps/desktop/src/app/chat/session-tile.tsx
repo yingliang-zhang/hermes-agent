@@ -90,6 +90,7 @@ function buildTileView(storedSessionId: string): SessionView {
     kind: 'tile',
     $awaitingResponse: computed($state, state => Boolean(state?.awaitingResponse)),
     $busy: computed($state, state => Boolean(state?.busy)),
+    $codingWorkflow: computed($state, state => state?.codingWorkflow ?? 'coupled-v1'),
     $cwd: computed($state, state => state?.cwd ?? ''),
     $fast: computed($state, state => Boolean(state?.fast)),
     $lastVisibleIsUser: computed($messages, lastVisibleMessageIsUser),
@@ -115,7 +116,7 @@ function TileChat({
 }) {
   const { gatewayRef, requestGateway } = useGatewayRequest()
   const queryClient = useQueryClient()
-  const { selectModel } = useModelControls({ queryClient, requestGateway })
+  const { selectHybrid, selectModel } = useModelControls({ queryClient, requestGateway })
   const activeGatewayProfile = useStore($activeGatewayProfile)
   const cwd = useStore(view.$cwd)
   const gatewayOpen = useStore($gatewayState) === 'open'
@@ -152,12 +153,13 @@ function TileChat({
       gatewayOpen ? (
         <ModelMenuPanel
           gateway={gatewayRef.current || undefined}
+          onSelectHybrid={selectHybrid}
           onSelectModel={selectModel}
           profile={activeGatewayProfile}
           requestGateway={requestGateway}
         />
       ) : null,
-    [activeGatewayProfile, gatewayOpen, gatewayRef, requestGateway, selectModel]
+    [activeGatewayProfile, gatewayOpen, gatewayRef, requestGateway, selectHybrid, selectModel]
   )
 
   return (

@@ -833,6 +833,9 @@ export const ja = defineLocale({
       loading: 'モデル設定を読み込み中...',
       appliesDesc:
         '新しいセッションに適用されます。コンポーザーのモデルピッカーを使ってアクティブなチャットをホットスワップできます。',
+      workflow: 'コーディングワークフロー',
+      coupled: '連携',
+      hybrid: 'ハイブリッド',
       provider: 'プロバイダー',
       model: 'モデル',
       applying: '適用中...',

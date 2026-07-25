@@ -7,6 +7,7 @@ import type { SessionInfo } from '@/types/hermes'
 import {
   $activeSessionId,
   $connection,
+  $currentCodingWorkflow,
   $currentCwd,
   $selectedStoredSessionId,
   $unreadFinishedSessionIds,
@@ -17,6 +18,7 @@ import {
   resolveComposerSessionKey,
   sessionPinId,
   setCurrentCwd,
+  setCurrentSessionCodingWorkflow,
   setRememberedSessionId,
   setSelectedStoredSessionId,
   workspaceCwdForNewSession
@@ -400,6 +402,26 @@ describe('unread finished sessions', () => {
 
     setSelectedStoredSessionId('s1')
     expect($unreadFinishedSessionIds.get()).toEqual([])
+  })
+})
+
+describe('coding workflow projection persistence', () => {
+  beforeEach(() => {
+    localStorage.removeItem('hermes.desktop.composer.coding-workflow')
+    $activeSessionId.set('live')
+    setCurrentSessionCodingWorkflow('coupled-v1')
+  })
+
+  afterEach(() => {
+    $activeSessionId.set(null)
+    setCurrentSessionCodingWorkflow('coupled-v1')
+  })
+
+  it('keeps the current session projection out of localStorage', () => {
+    setCurrentSessionCodingWorkflow('hybrid-v1')
+
+    expect($currentCodingWorkflow.get()).toBe('hybrid-v1')
+    expect(localStorage.getItem('hermes.desktop.composer.coding-workflow')).toBeNull()
   })
 })
 
