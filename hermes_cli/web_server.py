@@ -148,6 +148,7 @@ from hermes_cli.coding_workflow import (
     DEFAULT_WORKFLOW,
     InvalidCodingWorkflow,
     canonicalize_controller_route,
+    hybrid_controller_route,
     resolve_profile_default,
     validate_coding_workflow,
     workflow_presets,
@@ -1498,35 +1499,30 @@ class MoaConfigPayload(_MoaReferenceControls):
     profile: Optional[str] = None
 
 
-def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, str]:
-    """Normalize a main-slot (provider, model) pair before persisting.
+class _UnresolvedProviderError(ValueError):
+    """A provider string is neither built-in nor declared by the user."""
 
-    The Models page has two assignment paths and only one of them was safe:
 
-    - The "Change" picker sends a real Hermes provider slug — fine.
-    - The per-card "Use as → Main model" menu sends ``entry.provider``
-      from the analytics rows, falling back to the model's VENDOR prefix
-      (``modelVendor("anthropic/claude-opus-4.6") == "anthropic"``) when
-      the session row has no ``billing_provider`` (older sessions, NULL
-      rows).  That wrote ``provider: anthropic`` +
-      ``default: anthropic/claude-opus-4.6`` to config — a vendor-prefixed
-      OpenRouter slug on the NATIVE Anthropic provider.  New sessions then
-      400 against api.anthropic.com ("model: anthropic/claude-opus-4.6 not
-      found") and the user reads it as "changing models does nothing".
+def _normalize_main_model_assignment(
+    provider: str,
+    model: str,
+    *,
+    config_snapshot: Optional[Dict[str, Any]] = None,
+    strict: bool = False,
+) -> tuple[str, str]:
+    """Normalize a main-slot route while preserving legacy best effort.
 
-    Two repairs, both at this single chokepoint so every caller inherits:
-
-    1. Vendor-name → Hermes-provider mapping: when the provider string is
-       not a known Hermes provider/alias (e.g. ``moonshotai``, ``x-ai`` is
-       known but ``poolside`` isn't) but the model is a vendor-prefixed
-       aggregator slug, keep the user's CURRENT aggregator if they're on
-       one, else fall back to openrouter.
-    2. Model-format normalization for the resolved provider via
-       ``normalize_model_for_provider`` (e.g. ``anthropic/claude-opus-4.6``
-       on native anthropic → ``claude-opus-4-6``).
+    Strict callers fail closed when config recovery, current-provider
+    normalization, model-format normalization, or provider resolution fails.
+    The generic config endpoint uses strict mode; historical callers retain the
+    previous best-effort behavior by default.
     """
     from hermes_cli.config import get_compatible_custom_providers
-    from hermes_cli.models import _KNOWN_PROVIDER_NAMES, normalize_provider
+    from hermes_cli.models import (
+        _AGGREGATOR_PROVIDERS,
+        _KNOWN_PROVIDER_NAMES,
+        normalize_provider,
+    )
     from hermes_cli.model_normalize import normalize_model_for_provider
     from hermes_cli.providers import resolve_custom_provider, resolve_user_provider
 
@@ -1534,14 +1530,19 @@ def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, st
     model_in = (model or "").strip()
     canonical = normalize_provider(prov_in)
 
-    # User-declared providers are real routing targets, not analytics vendor
-    # labels. Resolve them before the unknown-vendor fallback. ``providers:``
-    # keeps its declared bare slug; ``custom_providers:`` canonicalizes both a
-    # bare display name and ``custom:<name>`` to the durable custom slug.
-    try:
-        cfg = load_config()
-    except Exception:
-        cfg = {}
+    if config_snapshot is None:
+        try:
+            cfg = load_config()
+        except Exception:
+            if strict:
+                raise
+            cfg = {}
+    else:
+        cfg = config_snapshot
+
+    # Declared provider ids are durable routes, even when their names are not
+    # part of the built-in registry. Resolve them before treating an analytics
+    # vendor label as an unknown provider.
     user_providers = cfg.get("providers") if isinstance(cfg, dict) else None
     user_provider = resolve_user_provider(
         prov_in, user_providers if isinstance(user_providers, dict) else {}
@@ -1555,35 +1556,56 @@ def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, st
     if custom_provider is not None:
         return custom_provider.id, model_in
 
-    if canonical not in _KNOWN_PROVIDER_NAMES and "/" in model_in:
-        # Vendor prefix posing as a provider (analytics fallback). Resolve
-        # against the user's current provider when it's an aggregator that
-        # serves vendor-prefixed slugs; otherwise default to openrouter.
+    if canonical in _KNOWN_PROVIDER_NAMES:
+        # Persist canonical ids, not aliases such as ``google`` or ``github``.
+        prov_in = canonical
+    elif "/" in model_in:
+        # Unknown analytics vendor + vendor/model slug: retain a valid current
+        # aggregator, otherwise choose the canonical fallback.
         try:
-            cur_cfg = cfg.get("model", {})
-            cur_provider = (
-                str(cur_cfg.get("provider", "") or "").strip().lower()
-                if isinstance(cur_cfg, dict) else ""
+            cur_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+            raw_cur_provider = (
+                cur_cfg.get("provider") if isinstance(cur_cfg, dict) else None
             )
+            cur_provider = (
+                raw_cur_provider.strip()
+                if isinstance(raw_cur_provider, str) and raw_cur_provider.strip()
+                else ""
+            )
+            cur_canonical = normalize_provider(cur_provider) if cur_provider else ""
         except Exception:
-            cur_provider = ""
-        from hermes_cli.models import _AGGREGATOR_PROVIDERS
-        if cur_provider and normalize_provider(cur_provider) in _AGGREGATOR_PROVIDERS:
-            canonical = normalize_provider(cur_provider)
-            prov_in = cur_provider
+            if strict:
+                raise
+            cur_canonical = ""
+        if cur_canonical in _AGGREGATOR_PROVIDERS:
+            canonical = cur_canonical
+            prov_in = cur_canonical
         else:
             canonical = "openrouter"
             prov_in = "openrouter"
+    else:
+        if strict:
+            raise _UnresolvedProviderError(
+                f"unresolved model provider: {prov_in!r}"
+            )
+        return prov_in, model_in
 
-    # Custom/user-config providers keep the model verbatim — the registry
-    # normalizer doesn't know their namespaces.
+    # Custom/user-config providers keep model ids verbatim; the built-in
+    # registry normalizer does not know their namespaces.
     if canonical in _KNOWN_PROVIDER_NAMES and not canonical.startswith("custom"):
         try:
             normalized_model = normalize_model_for_provider(model_in, canonical)
             if normalized_model:
                 model_in = normalized_model
         except Exception:
-            _log.debug("model normalization failed for %s/%s", prov_in, model_in, exc_info=True)
+            if strict:
+                raise
+            _log.debug(
+                "model normalization failed for %s/%s",
+                prov_in,
+                model_in,
+                exc_info=True,
+            )
 
     return prov_in, model_in
 
@@ -6580,8 +6602,11 @@ async def update_memory_provider_config(
 @app.get("/api/config")
 async def get_config(profile: Optional[str] = None):
     with _profile_scope(profile):
+        raw_config = read_raw_config()
         config = _normalize_config_for_web(load_config())
-    # Strip internal keys that the frontend shouldn't see or send back
+        if "model" not in raw_config:
+            config.pop("model", None)
+    # Strip internal keys that the frontend shouldn't see or send back.
     return {k: v for k, v in config.items() if not k.startswith("_")}
 
 
@@ -7294,22 +7319,15 @@ def _apply_model_assignment_sync(
 
 
 
-def _infer_provider_on_model_change(model_val: str, prev_provider: str) -> tuple[str, str]:
-    """Infer which provider serves ``model_val`` when the flat Config-page Model
-    field changes, given the previously-saved ``prev_provider``.
+def _infer_provider_on_model_change(
+    model_val: str, prev_provider: str, *, strict: bool = False
+) -> tuple[str, str]:
+    """Infer the provider for a changed flat Config-page model field.
 
-    Returns ``(provider, model)``; ``provider`` is empty when no switch is
-    warranted (leave the existing provider untouched). Two signals, in order:
-
-    1. Curated-catalog detection (``detect_provider_for_model``) — handles the
-       ~28 OpenRouter-curated models and direct provider-static catalogs.
-    2. Vendor-slug heuristic — a ``vendor/model`` slug cannot belong to a
-       single-model / non-aggregator provider (e.g. ``ollama-local``). When the
-       current provider is not an aggregator that serves vendor-prefixed slugs,
-       route to an aggregator. ``_normalize_main_model_assignment`` (called by
-       the caller) keeps the user's current aggregator when they're already on
-       one, else falls back to openrouter — the same chokepoint logic as
-       ``POST /api/model/set``.
+    Default mode retains the historical best-effort fallbacks. Strict mode is
+    used by the generic config write boundary and re-raises import, detector,
+    and provider-normalization faults so the route cannot be guessed after an
+    internal failure.
     """
     name = (model_val or "").strip()
     if not name:
@@ -7321,22 +7339,27 @@ def _infer_provider_on_model_change(model_val: str, prev_provider: str) -> tuple
             normalize_provider,
         )
     except Exception:
+        if strict:
+            raise
         return "", name
 
     try:
         detected = detect_provider_for_model(name, prev_provider)
     except Exception:
+        if strict:
+            raise
         detected = None
     if detected:
         return detected[0], detected[1]
 
-    # Vendor-prefixed slug under a non-aggregator provider → reassign. Use a
-    # sentinel "openrouter" here; _normalize_main_model_assignment resolves the
-    # real aggregator (keeps a current aggregator, else openrouter).
     if "/" in name:
         try:
-            cur_is_aggregator = normalize_provider(prev_provider) in _AGGREGATOR_PROVIDERS
+            cur_is_aggregator = (
+                normalize_provider(prev_provider) in _AGGREGATOR_PROVIDERS
+            )
         except Exception:
+            if strict:
+                raise
             cur_is_aggregator = False
         if not cur_is_aggregator:
             return "openrouter", name
@@ -7344,7 +7367,139 @@ def _infer_provider_on_model_change(model_val: str, prev_provider: str) -> tuple
     return "", name
 
 
-def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_generic_model_route(
+    inferred_provider: str,
+    prior_provider: str,
+    model: str,
+    config_snapshot: Dict[str, Any],
+) -> tuple[str, str]:
+    """Select inference, a valid prior route, then the safe aggregator."""
+    candidate = inferred_provider or prior_provider or "openrouter"
+    try:
+        return _normalize_main_model_assignment(
+            candidate,
+            model,
+            config_snapshot=config_snapshot,
+            strict=True,
+        )
+    except _UnresolvedProviderError:
+        # Only an untrusted prior provider may fall through. A detector that
+        # confidently returned an invalid provider is an internal route fault.
+        if inferred_provider or not prior_provider:
+            raise
+        return _normalize_main_model_assignment(
+            "openrouter",
+            model,
+            config_snapshot=config_snapshot,
+            strict=True,
+        )
+
+
+def _validate_existing_generic_config_route(existing_config: Dict[str, Any]) -> None:
+    """Require an already-Hybrid profile to have its complete fixed route."""
+    if resolve_profile_default(existing_config) != "hybrid-v1":
+        return
+
+    model_config = existing_config.get("model")
+    if isinstance(model_config, dict):
+        raw_provider = model_config.get("provider")
+        raw_model = model_config.get("default")
+    elif isinstance(model_config, str):
+        raw_provider = existing_config.get("provider")
+        raw_model = model_config
+    else:
+        raw_provider = None
+        raw_model = None
+
+    provider = raw_provider.strip() if isinstance(raw_provider, str) else ""
+    model = raw_model.strip() if isinstance(raw_model, str) else ""
+    fixed_provider, fixed_model = hybrid_controller_route()
+    if provider != fixed_provider or model != fixed_model:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Existing hybrid-v1 profile requires controller route "
+                "custom:sudo / gpt-5.6-sol; use POST /api/model/set to correct it"
+            ),
+        )
+
+
+def _prepare_generic_config_patch(
+    config: Dict[str, Any], existing_config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Reject workflow changes and strip an identical round-tripped default.
+
+    ``PUT /api/config`` may edit sibling workflow settings, but the workflow
+    default itself belongs exclusively to the validated model-assignment API.
+    The caller supplies the same persisted snapshot it will later merge and
+    save, keeping validation and mutation in one profile-scoped transaction.
+    """
+    config = dict(config)
+    _validate_existing_generic_config_route(existing_config)
+    if "model" in config:
+        model = config["model"]
+        if not isinstance(model, str) or not model.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "model must be a non-empty string in PUT /api/config; "
+                    "use POST /api/model/set for model route changes"
+                ),
+            )
+    if "coding_workflow" not in config:
+        return config
+
+    workflow_patch = config["coding_workflow"]
+    if not isinstance(workflow_patch, dict):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "coding_workflow.default cannot be changed through PUT "
+                "/api/config; use POST /api/model/set"
+            ),
+        )
+
+    workflow_patch = dict(workflow_patch)
+    if "default" in workflow_patch:
+        submitted_default = workflow_patch.pop("default")
+        if not isinstance(submitted_default, str):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "coding_workflow.default cannot be changed through PUT "
+                    "/api/config; use POST /api/model/set"
+                ),
+            )
+        try:
+            submitted_default = validate_coding_workflow(submitted_default)
+            persisted_default = resolve_profile_default(existing_config)
+        except InvalidCodingWorkflow:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "coding_workflow.default cannot be changed through PUT "
+                    "/api/config; use POST /api/model/set"
+                ),
+            )
+        if submitted_default != persisted_default:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "coding_workflow.default cannot be changed through PUT "
+                    "/api/config; use POST /api/model/set"
+                ),
+            )
+
+    if workflow_patch:
+        config["coding_workflow"] = workflow_patch
+    else:
+        config.pop("coding_workflow", None)
+    return config
+
+
+def _denormalize_config_from_web(
+    config: Dict[str, Any], *, existing_config: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """Reverse _normalize_config_for_web before saving.
 
     Reconstructs ``model`` as a dict by reading the current on-disk config
@@ -7357,13 +7512,6 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
     from the dict so get_model_context_length() uses its normal resolution).
     """
     config = dict(config)
-    # The generic Config-page PUT must not bypass the validated
-    # ``/api/model/set`` workflow authority. Strip any incoming
-    # ``coding_workflow`` *before* model-change processing so that only
-    # ``_apply_main_route_assignment`` (called below on a real model
-    # change) can set it — an unchanged-model save preserves the disk
-    # value through deep-merge.
-    config.pop("coding_workflow", None)
     # Remove any _model_meta that might have leaked in (shouldn't happen
     # with the stripped GET response, but be defensive)
     config.pop("_model_meta", None)
@@ -7378,13 +7526,23 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
 
     model_val = config.get("model")
     if isinstance(model_val, str) and model_val:
-        # Read the current disk config to recover model subkeys
+        # Reuse the endpoint's persisted snapshot when supplied so workflow
+        # validation, model recovery, merge, and save all observe one config.
         try:
-            disk_config = load_config()
+            disk_config = (
+                existing_config if existing_config is not None else load_config()
+            )
             disk_model = disk_config.get("model")
             if isinstance(disk_model, dict):
+                disk_model = dict(disk_model)
+            if isinstance(disk_model, dict):
                 prev_default = str(disk_model.get("default") or "").strip()
-                prev_provider = str(disk_model.get("provider") or "").strip()
+                raw_prev_provider = disk_model.get("provider")
+                prev_provider = (
+                    raw_prev_provider.strip()
+                    if isinstance(raw_prev_provider, str) and raw_prev_provider.strip()
+                    else ""
+                )
                 # When the model name actually changed, re-detect which
                 # provider serves it. The Config-page Model field is a flat
                 # string with no provider info, so without this a user who
@@ -7394,20 +7552,14 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
                 # never overwrites an explicit provider.
                 if model_val != prev_default:
                     new_provider, resolved_model = _infer_provider_on_model_change(
-                        model_val, prev_provider
+                        model_val, prev_provider, strict=True
                     )
-                    norm_provider = prev_provider
-                    norm_model = model_val
-                    if (
-                        new_provider
-                        and new_provider.strip().lower() != prev_provider.lower()
-                    ):
-                        # Route through the canonical assignment chokepoints so
-                        # the model is normalized for the new provider and stale
-                        # base_url/api_mode/api_key are cleared on the switch.
-                        norm_provider, norm_model = _normalize_main_model_assignment(
-                            new_provider, resolved_model
-                        )
+                    norm_provider, norm_model = _normalize_generic_model_route(
+                        new_provider,
+                        prev_provider,
+                        resolved_model,
+                        disk_config,
+                    )
                     # Every actual flat main-model change is an ordinary route
                     # write, including same-provider and legacy assignments.
                     # Preserve the disk model's unrelated subkeys while coupling
@@ -7439,26 +7591,22 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
                     else ""
                 )
                 if model_val != prev_default:
-                    prev_provider = str(
-                        disk_config.get("provider") or ""
-                    ).strip()
-                    new_provider, resolved_model = (
-                        _infer_provider_on_model_change(
-                            model_val, prev_provider
-                        )
+                    raw_prev_provider = disk_config.get("provider")
+                    prev_provider = (
+                        raw_prev_provider.strip()
+                        if isinstance(raw_prev_provider, str)
+                        and raw_prev_provider.strip()
+                        else ""
                     )
-                    norm_provider = prev_provider
-                    norm_model = model_val
-                    if (
-                        new_provider
-                        and new_provider.strip().lower()
-                        != prev_provider.lower()
-                    ):
-                        norm_provider, norm_model = (
-                            _normalize_main_model_assignment(
-                                new_provider, resolved_model
-                            )
-                        )
+                    new_provider, resolved_model = _infer_provider_on_model_change(
+                        model_val, prev_provider, strict=True
+                    )
+                    norm_provider, norm_model = _normalize_generic_model_route(
+                        new_provider,
+                        prev_provider,
+                        resolved_model,
+                        disk_config,
+                    )
                     new_model_cfg = _apply_main_route_assignment(
                         config, norm_provider, norm_model
                     )
@@ -7472,8 +7620,20 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
                         "default": model_val,
                         "context_length": ctx_override,
                     }
-        except Exception:
-            pass  # can't read disk config — just use the string form
+        except HTTPException:
+            raise
+        except Exception as exc:
+            if existing_config is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Invalid model route in PUT /api/config; "
+                        "use POST /api/model/set for model route changes"
+                    ),
+                ) from exc
+            # Legacy direct helper calls historically treat config recovery as
+            # best effort and keep the submitted flat string on failure.
+            pass
     return config
 
 
@@ -7481,15 +7641,30 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
 async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
     try:
         with _profile_scope(body.profile or profile):
-            # The dashboard form is schema-driven (see CONFIG_SCHEMA). Any root
-            # key absent from the schema — most visibly ``custom_providers``, but
-            # also ``agent.personalities``, ``terminal.lifetime_seconds``, etc. —
-            # is not sent in the PUT body. A full-replace save would silently
-            # drop those keys. Deep-merge incoming over what's on disk so the
-            # frontend can only overwrite what it explicitly sends.
+            # Raw read and final save are I/O boundaries: failures remain 500.
             existing = read_raw_config()
-            incoming = _denormalize_config_from_web(body.config)
-            save_config(_deep_merge(existing, incoming))
+            try:
+                generic_patch = _prepare_generic_config_patch(body.config, existing)
+                incoming = _denormalize_config_from_web(
+                    generic_patch, existing_config=existing
+                )
+                merged = _deep_merge(existing, incoming)
+                # model is route state, not an independently mergeable bag of
+                # fields. Removed credentials/protocol/context keys must stay
+                # removed after a provider switch or zero-auto update.
+                if "model" in incoming:
+                    merged["model"] = incoming["model"]
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Invalid config update; use POST /api/model/set for "
+                        "model route changes"
+                    ),
+                ) from exc
+            save_config(merged)
         return {"ok": True}
     except HTTPException:
         raise

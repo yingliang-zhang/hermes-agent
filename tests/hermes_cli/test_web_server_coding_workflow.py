@@ -297,6 +297,7 @@ class TestSiblingMainModelWrites:
         _write_hybrid_config()
         saves = _spy_saved_configs(monkeypatch)
         web_config = client.get("/api/config").json()
+        assert web_config["coding_workflow"]["default"] == "hybrid-v1"
         web_config["model"] = "anthropic/claude-sonnet-4.6"
 
         resp = client.put("/api/config", json={"config": web_config})
@@ -318,61 +319,328 @@ class TestSiblingMainModelWrites:
         assert persisted["model"]["default"] == "anthropic/claude-sonnet-4.6"
         assert persisted["coding_workflow"]["default"] == "coupled-v1"
 
+    @pytest.mark.parametrize(
+        (
+            "incoming_model",
+            "legacy_provider",
+            "expected_provider",
+            "expected_model",
+            "expects_aggregator",
+        ),
+        [
+            ("acme/unlisted-model", None, None, "acme/unlisted-model", True),
+            ("mimo-v2.5", None, "openrouter", "xiaomi/mimo-v2.5", False),
+            (
+                "legacy-unprefixed-model",
+                None,
+                None,
+                "legacy-unprefixed-model",
+                True,
+            ),
+        ],
+    )
     def test_flat_config_bare_string_model_change_forces_coupled(
-        self, client, monkeypatch
+        self,
+        client,
+        monkeypatch,
+        incoming_model,
+        legacy_provider,
+        expected_provider,
+        expected_model,
+        expects_aggregator,
     ):
-        """A bare-string on-disk model with Hybrid must force coupled-v1
-        when the model changes through the flat Config page — the bare
-        string path must not bypass _apply_main_route_assignment."""
+        """Bare-string routes use the canonical assignment helper on change."""
         from hermes_constants import get_hermes_home
 
-        home = get_hermes_home()
-        cfg = {
+        raw = {
             "model": "gpt-5.6-sol",
-            "coding_workflow": {"default": "hybrid-v1"},
+            "provider": "custom:sudo",
+            "coding_workflow": {
+                "default": "hybrid-v1",
+                "review_policy": "keep-review-policy",
+            },
         }
-        (home / "config.yaml").write_text(
-            yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8"
+        if legacy_provider is not None:
+            raw["provider"] = legacy_provider
+        (get_hermes_home() / "config.yaml").write_text(
+            yaml.safe_dump(raw, sort_keys=False), encoding="utf-8"
         )
         saves = _spy_saved_configs(monkeypatch)
 
         web_config = client.get("/api/config").json()
-        web_config["model"] = "anthropic/claude-sonnet-4.6"
-
+        web_config["model"] = incoming_model
         resp = client.put("/api/config", json={"config": web_config})
 
         assert resp.status_code == 200, resp.text
         assert len(saves) == 1
         saved, _ = saves[0]
-        # The bare-string model was upgraded to a dict and the workflow
-        # was forced to coupled-v1 — not preserving hybrid-v1.
-        assert isinstance(saved["model"], dict)
-        assert saved["model"]["default"] == "anthropic/claude-sonnet-4.6"
-        assert saved["coding_workflow"]["default"] == "coupled-v1"
-        persisted = _cfg()
-        assert persisted["coding_workflow"]["default"] == "coupled-v1"
+        model_cfg = saved["model"]
+        assert model_cfg["default"] == expected_model
+        assert set(model_cfg) == {"provider", "default"}
+        if expects_aggregator:
+            from hermes_cli.models import _AGGREGATOR_PROVIDERS, normalize_provider
 
-    def test_put_config_cannot_write_coding_workflow(
+            assert normalize_provider(model_cfg["provider"]) in _AGGREGATOR_PROVIDERS
+        else:
+            assert model_cfg["provider"] == expected_provider
+        assert saved["coding_workflow"] == {
+            "default": "coupled-v1",
+            "review_policy": "keep-review-policy",
+        }
+        assert _cfg()["coding_workflow"]["default"] == "coupled-v1"
+
+    @pytest.mark.parametrize(
+        "disk_model",
+        [
+            "gpt-5.6-sol",
+            {"provider": "custom:sudo", "default": "gpt-5.6-sol"},
+        ],
+        ids=["bare-model", "dict-model"],
+    )
+    def test_flat_config_route_change_fails_closed_on_malformed_custom_providers(
+        self, client, monkeypatch, disk_model
+    ):
+        from hermes_constants import get_hermes_home
+
+        raw = _hybrid_config()
+        raw["model"] = disk_model
+        if isinstance(disk_model, str):
+            raw["provider"] = "custom:sudo"
+        raw["custom_providers"] = [{1: "malformed"}]
+        config_path = get_hermes_home() / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(raw, sort_keys=False), encoding="utf-8"
+        )
+        before_bytes = config_path.read_bytes()
+        before_config = _cfg()
+        saves = _spy_saved_configs(monkeypatch)
+
+        web_config = client.get("/api/config").json()
+        web_config["model"] = "acme/unlisted-model"
+        resp = client.put("/api/config", json={"config": web_config})
+
+        assert resp.status_code == 400, resp.text
+        detail = resp.json()["detail"].lower()
+        assert "model" in detail and "route" in detail
+        assert saves == []
+        assert config_path.read_bytes() == before_bytes
+        assert _cfg() == before_config
+
+    @pytest.mark.parametrize(
+        "invalid_model",
+        ["", " \t ", None, [], {}, True, 7],
+        ids=["empty", "whitespace", "null", "list", "object", "bool", "int"],
+    )
+    def test_put_config_rejects_explicit_malformed_model_without_write(
+        self, client, monkeypatch, invalid_model
+    ):
+        from hermes_constants import get_hermes_home
+
+        _write_hybrid_config()
+        config_path = get_hermes_home() / "config.yaml"
+        before_bytes = config_path.read_bytes()
+        before_config = _cfg()
+        saves = _spy_saved_configs(monkeypatch)
+
+        resp = client.put("/api/config", json={"config": {"model": invalid_model}})
+
+        assert resp.status_code == 400, resp.text
+        detail = resp.json()["detail"].lower()
+        assert "model" in detail and "/api/model/set" in detail
+        assert saves == []
+        assert config_path.read_bytes() == before_bytes
+        assert _cfg() == before_config
+
+    def test_put_config_omitted_model_allows_sibling_edit_and_preserves_hybrid(
         self, client, monkeypatch
     ):
-        """The generic PUT /api/config must not bypass the validated
-        /api/model/set workflow authority — coding_workflow in the PUT
-        body is stripped and the existing disk value is preserved."""
         _write_hybrid_config()
         saves = _spy_saved_configs(monkeypatch)
 
         web_config = client.get("/api/config").json()
-        # Attempt to change workflow through the generic config save
-        web_config["coding_workflow"] = {"default": "coupled-v1"}
-
+        web_config.pop("model")
+        web_config["coding_workflow"].pop("default")
+        web_config["coding_workflow"]["review_policy"] = "updated-review-policy"
+        web_config.setdefault("agent", {})["max_turns"] = 79
         resp = client.put("/api/config", json={"config": web_config})
 
         assert resp.status_code == 200, resp.text
         assert len(saves) == 1
         saved, _ = saves[0]
-        # The existing hybrid-v1 from disk is preserved — the incoming
-        # coupled-v1 from the PUT body was stripped.
+        assert saved["model"]["provider"] == "custom:sudo"
+        assert saved["model"]["default"] == "gpt-5.6-sol"
+        assert saved["coding_workflow"] == {
+            "default": "hybrid-v1",
+            "review_policy": "updated-review-policy",
+        }
+        assert saved["agent"]["max_turns"] == 79
+
+    @pytest.mark.parametrize(
+        "provider_patch",
+        [
+            {},
+            {"provider": None},
+            {"provider": []},
+            {"provider": {}},
+            {"provider": "  "},
+        ],
+        ids=["missing", "null", "list", "object", "blank"],
+    )
+    def test_dict_model_change_uses_aggregator_for_malformed_previous_provider(
+        self, client, monkeypatch, provider_patch
+    ):
+        from hermes_constants import get_hermes_home
+        from hermes_cli.models import _AGGREGATOR_PROVIDERS, normalize_provider
+
+        raw = _hybrid_config()
+        raw["model"] = {"default": "gpt-5.6-sol", **provider_patch}
+        raw["coding_workflow"]["default"] = "coupled-v1"
+        (get_hermes_home() / "config.yaml").write_text(
+            yaml.safe_dump(raw, sort_keys=False), encoding="utf-8"
+        )
+        saves = _spy_saved_configs(monkeypatch)
+
+        web_config = client.get("/api/config").json()
+        web_config["model"] = "acme-unlisted-model"
+        resp = client.put("/api/config", json={"config": web_config})
+
+        assert resp.status_code == 200, resp.text
+        assert len(saves) == 1
+        saved, _ = saves[0]
+        provider = saved["model"]["provider"]
+        assert isinstance(provider, str) and provider.strip()
+        assert normalize_provider(provider) in _AGGREGATOR_PROVIDERS
+        assert saved["model"]["default"] == "acme-unlisted-model"
+        assert saved["coding_workflow"]["default"] == "coupled-v1"
+
+    @pytest.mark.parametrize("context_length", [0, 32768])
+    def test_flat_config_unchanged_bare_model_preserves_hybrid(
+        self, client, monkeypatch, context_length
+    ):
+        from hermes_constants import get_hermes_home
+
+        raw = {
+            "model": "gpt-5.6-sol",
+            "provider": "custom:sudo",
+            "coding_workflow": {"default": "hybrid-v1"},
+        }
+        (get_hermes_home() / "config.yaml").write_text(
+            yaml.safe_dump(raw, sort_keys=False), encoding="utf-8"
+        )
+        saves = _spy_saved_configs(monkeypatch)
+
+        web_config = client.get("/api/config").json()
+        web_config["model_context_length"] = context_length
+        web_config.setdefault("agent", {})["max_turns"] = 77
+        resp = client.put("/api/config", json={"config": web_config})
+
+        assert resp.status_code == 200, resp.text
+        assert len(saves) == 1
+        saved, _ = saves[0]
+        if context_length:
+            assert saved["model"] == {
+                "default": "gpt-5.6-sol",
+                "context_length": context_length,
+            }
+        else:
+            assert saved["model"] == "gpt-5.6-sol"
+        assert saved["agent"]["max_turns"] == 77
         assert saved["coding_workflow"]["default"] == "hybrid-v1"
+
+    @pytest.mark.parametrize(
+        ("current_workflow", "attempted_workflow"),
+        [
+            ("coupled-v1", "hybrid-v1"),
+            ("hybrid-v1", "coupled-v1"),
+        ],
+    )
+    def test_put_config_rejects_workflow_change(
+        self, client, monkeypatch, current_workflow, attempted_workflow
+    ):
+        from hermes_constants import get_hermes_home
+
+        raw = _hybrid_config()
+        raw["coding_workflow"]["default"] = current_workflow
+        (get_hermes_home() / "config.yaml").write_text(
+            yaml.safe_dump(raw, sort_keys=False), encoding="utf-8"
+        )
+        before = _cfg()
+        saves = _spy_saved_configs(monkeypatch)
+
+        web_config = client.get("/api/config").json()
+        web_config["coding_workflow"]["default"] = attempted_workflow
+        resp = client.put("/api/config", json={"config": web_config})
+
+        assert resp.status_code == 400, resp.text
+        assert "/api/model/set" in resp.json()["detail"]
+        assert saves == []
+        assert _cfg() == before
+
+    @pytest.mark.parametrize(
+        "submitted_workflow",
+        [
+            {"default": "bogus-v9"},
+            {"default": 7},
+            {"default": None},
+            {"default": ["hybrid-v1"]},
+            "hybrid-v1",
+        ],
+    )
+    def test_put_config_rejects_malformed_workflow_default(
+        self, client, monkeypatch, submitted_workflow
+    ):
+        _write_hybrid_config()
+        before = _cfg()
+        saves = _spy_saved_configs(monkeypatch)
+
+        web_config = client.get("/api/config").json()
+        web_config["coding_workflow"] = submitted_workflow
+        resp = client.put("/api/config", json={"config": web_config})
+
+        assert resp.status_code == 400, resp.text
+        assert "/api/model/set" in resp.json()["detail"]
+        assert saves == []
+        assert _cfg() == before
+
+    def test_put_config_identical_workflow_roundtrip_preserves_default_and_siblings(
+        self, client, monkeypatch
+    ):
+        _write_hybrid_config()
+        saves = _spy_saved_configs(monkeypatch)
+
+        web_config = client.get("/api/config").json()
+        assert web_config["coding_workflow"]["default"] == "hybrid-v1"
+        web_config["coding_workflow"]["review_policy"] = "updated-review-policy"
+        web_config.setdefault("agent", {})["max_turns"] = 73
+        resp = client.put("/api/config", json={"config": web_config})
+
+        assert resp.status_code == 200, resp.text
+        assert len(saves) == 1
+        saved, _ = saves[0]
+        assert saved["coding_workflow"] == {
+            "default": "hybrid-v1",
+            "review_policy": "updated-review-policy",
+        }
+        assert saved["agent"]["max_turns"] == 73
+
+    def test_put_config_omitted_workflow_default_preserves_it_and_saves_siblings(
+        self, client, monkeypatch
+    ):
+        _write_hybrid_config()
+        saves = _spy_saved_configs(monkeypatch)
+
+        web_config = client.get("/api/config").json()
+        web_config["coding_workflow"].pop("default")
+        web_config["coding_workflow"]["review_policy"] = "updated-review-policy"
+        resp = client.put("/api/config", json={"config": web_config})
+
+        assert resp.status_code == 200, resp.text
+        assert len(saves) == 1
+        saved, _ = saves[0]
+        assert saved["coding_workflow"] == {
+            "default": "hybrid-v1",
+            "review_policy": "updated-review-policy",
+        }
         assert _cfg()["coding_workflow"]["default"] == "hybrid-v1"
 
     def test_profile_model_update_forces_coupled_in_target_profile(
@@ -431,6 +699,475 @@ class TestSiblingMainModelWrites:
         assert saved["auxiliary"]["vision"]["provider"] == "openrouter"
         assert saved["auxiliary"]["vision"]["model"] == "google/gemini-2.5-flash"
         assert _cfg()["coding_workflow"]["default"] == "hybrid-v1"
+
+
+
+class TestGenericConfigFinalReviewBoundary:
+    @staticmethod
+    def _write_raw(config):
+        from hermes_constants import get_hermes_home
+
+        path = get_hermes_home() / "config.yaml"
+        path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+        return path
+
+    @pytest.mark.parametrize(
+        ("module_name", "attribute"),
+        [
+            ("hermes_cli.models", "detect_provider_for_model"),
+            ("hermes_cli.model_normalize", "normalize_model_for_provider"),
+        ],
+        ids=["detector", "model-normalizer"],
+    )
+    def test_internal_route_fault_is_400_without_save(
+        self, client, monkeypatch, module_name, attribute
+    ):
+        import importlib
+
+        self._write_raw(
+            {"model": {"provider": "openrouter", "default": "old-model"}}
+        )
+        before = _cfg()
+        saves = _spy_saved_configs(monkeypatch)
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError(f"injected {attribute} fault")
+
+        monkeypatch.setattr(importlib.import_module(module_name), attribute, boom)
+        resp = client.put(
+            "/api/config",
+            json={"config": {"model": "final-review-unlisted-model"}},
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert "post /api/model/set" in resp.json()["detail"].lower()
+        assert saves == []
+        assert _cfg() == before
+
+    @pytest.mark.parametrize(
+        "target",
+        ["_prepare_generic_config_patch", "_denormalize_config_from_web"],
+        ids=["prepare", "whole-denormalizer"],
+    )
+    def test_route_processing_fault_is_400_without_save(
+        self, client, monkeypatch, target
+    ):
+        import hermes_cli.web_server as web_server
+
+        self._write_raw(
+            {"model": {"provider": "openrouter", "default": "old-model"}}
+        )
+        before = _cfg()
+        saves = _spy_saved_configs(monkeypatch)
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError(f"injected {target} fault")
+
+        monkeypatch.setattr(web_server, target, boom)
+        resp = client.put(
+            "/api/config", json={"config": {"agent": {"max_turns": 57}}}
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert "post /api/model/set" in resp.json()["detail"].lower()
+        assert saves == []
+        assert _cfg() == before
+
+    def test_save_io_fault_remains_500_and_leaves_file_unchanged(
+        self, client, monkeypatch
+    ):
+        import hermes_cli.web_server as web_server
+
+        path = self._write_raw(
+            {"model": {"provider": "openrouter", "default": "old-model"}}
+        )
+        before = path.read_bytes()
+        calls = []
+
+        def boom(*_args, **_kwargs):
+            calls.append(True)
+            raise OSError("injected save fault")
+
+        monkeypatch.setattr(web_server, "save_config", boom)
+        resp = client.put(
+            "/api/config", json={"config": {"agent": {"max_turns": 58}}}
+        )
+
+        assert resp.status_code == 500, resp.text
+        assert calls == [True]
+        assert path.read_bytes() == before
+
+    def test_success_reads_one_snapshot_and_saves_once(self, client, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        self._write_raw(
+            {"model": {"provider": "openrouter", "default": "old-model"}}
+        )
+        real_read = web_server.read_raw_config
+        real_save = web_server.save_config
+        calls = {"read": 0, "save": 0}
+
+        def read_spy(*args, **kwargs):
+            calls["read"] += 1
+            return real_read(*args, **kwargs)
+
+        def save_spy(*args, **kwargs):
+            calls["save"] += 1
+            return real_save(*args, **kwargs)
+
+        monkeypatch.setattr(web_server, "read_raw_config", read_spy)
+        monkeypatch.setattr(web_server, "save_config", save_spy)
+        resp = client.put(
+            "/api/config", json={"config": {"agent": {"max_turns": 59}}}
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert calls == {"read": 1, "save": 1}
+
+    def test_fresh_get_omits_model_and_exact_put_succeeds(
+        self, client, monkeypatch
+    ):
+        path = self._write_raw({"agent": {"max_turns": 12}})
+        web_config = client.get("/api/config").json()
+        assert "model" not in web_config
+
+        saves = _spy_saved_configs(monkeypatch)
+        resp = client.put("/api/config", json={"config": web_config})
+
+        assert resp.status_code == 200, resp.text
+        assert len(saves) == 1
+        persisted = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        assert "model" not in persisted
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            {"agent": {"max_turns": 12}},
+            {"coding_workflow": {"default": "hybrid-v1"}},
+        ],
+        ids=["fresh", "hybrid-without-model"],
+    )
+    def test_explicit_empty_model_always_rejected(self, client, monkeypatch, raw):
+        self._write_raw(raw)
+        before = _cfg()
+        saves = _spy_saved_configs(monkeypatch)
+
+        resp = client.put("/api/config", json={"config": {"model": ""}})
+
+        assert resp.status_code == 400, resp.text
+        assert "/api/model/set" in resp.json()["detail"]
+        assert saves == []
+        assert _cfg() == before
+
+    @pytest.mark.parametrize(
+        "route",
+        [
+            {},
+            {"model": {"provider": "openrouter", "default": "ordinary/model"}},
+            {"model": {"provider": "custom:sudo"}},
+            {"model": {"default": "gpt-5.6-sol"}},
+            {"model": "gpt-5.6-sol"},
+            {"model": "gpt-5.6-sol", "provider": "openrouter"},
+        ],
+        ids=[
+            "missing-model",
+            "ordinary-route",
+            "missing-default",
+            "missing-provider",
+            "legacy-missing-provider",
+            "legacy-ordinary-provider",
+        ],
+    )
+    def test_existing_hybrid_requires_complete_canonical_route_before_any_save(
+        self, client, monkeypatch, route
+    ):
+        raw = dict(route)
+        raw["coding_workflow"] = {"default": "hybrid-v1"}
+        self._write_raw(raw)
+        before = _cfg()
+        saves = _spy_saved_configs(monkeypatch)
+
+        resp = client.put(
+            "/api/config",
+            json={
+                "config": {
+                    "coding_workflow": {"default": "hybrid-v1"},
+                    "agent": {"max_turns": 61},
+                }
+            },
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert "/api/model/set" in resp.json()["detail"]
+        assert saves == []
+        assert _cfg() == before
+
+    @pytest.mark.parametrize(
+        "route",
+        [
+            {"model": {"provider": "custom:sudo", "default": "gpt-5.6-sol"}},
+            {"model": "gpt-5.6-sol", "provider": "custom:sudo"},
+        ],
+        ids=["canonical-dict", "canonical-legacy"],
+    )
+    def test_existing_canonical_hybrid_allows_unrelated_save(
+        self, client, monkeypatch, route
+    ):
+        raw = dict(route)
+        raw["coding_workflow"] = {"default": "hybrid-v1"}
+        self._write_raw(raw)
+        saves = _spy_saved_configs(monkeypatch)
+
+        resp = client.put(
+            "/api/config", json={"config": {"agent": {"max_turns": 62}}}
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert len(saves) == 1
+        assert saves[0][0]["agent"]["max_turns"] == 62
+
+    @pytest.mark.parametrize("workflow", [None, "coupled-v1"])
+    def test_non_hybrid_existing_route_is_unaffected(
+        self, client, monkeypatch, workflow
+    ):
+        raw = {"model": {"provider": "openrouter", "default": "ordinary/model"}}
+        if workflow is not None:
+            raw["coding_workflow"] = {"default": workflow}
+        self._write_raw(raw)
+        saves = _spy_saved_configs(monkeypatch)
+
+        resp = client.put(
+            "/api/config", json={"config": {"agent": {"max_turns": 63}}}
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert len(saves) == 1
+
+    @pytest.mark.parametrize("shape", ["dict", "bare"])
+    @pytest.mark.parametrize(
+        "prior_provider",
+        ["unknown-provider", ["not", "a-provider"], {"not": "a-provider"}],
+        ids=["unknown-string", "nonempty-list", "nonempty-object"],
+    )
+    def test_invalid_prior_provider_falls_back_without_stringifying(
+        self, client, monkeypatch, shape, prior_provider
+    ):
+        if shape == "dict":
+            raw = {
+                "model": {"provider": prior_provider, "default": "old-model"},
+                "coding_workflow": {"default": "coupled-v1"},
+            }
+        else:
+            raw = {
+                "model": "old-model",
+                "provider": prior_provider,
+                "coding_workflow": {"default": "coupled-v1"},
+            }
+        self._write_raw(raw)
+        saves = _spy_saved_configs(monkeypatch)
+
+        resp = client.put(
+            "/api/config",
+            json={"config": {"model": "final-review-unlisted-model"}},
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert len(saves) == 1
+        provider = saves[0][0]["model"]["provider"]
+        assert provider == "openrouter"
+        assert provider not in {str(prior_provider), ""}
+
+    def test_provider_switch_replaces_model_section_atomically(
+        self, client, monkeypatch
+    ):
+        path = self._write_raw(
+            {
+                "model": {
+                    "provider": "custom",
+                    "default": "old-model",
+                    "base_url": "https://old.example/v1",
+                    "api_key": "sk-stale",
+                    "api": "sk-legacy-stale",
+                    "api_mode": "anthropic_messages",
+                    "context_length": 99999,
+                },
+                "agent": {"max_turns": 64},
+            }
+        )
+        saves = _spy_saved_configs(monkeypatch)
+
+        resp = client.put(
+            "/api/config",
+            json={
+                "config": {
+                    "model": "google/gemini-2.5-flash",
+                    "model_context_length": 0,
+                }
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert len(saves) == 1
+        persisted = (yaml.safe_load(path.read_text(encoding="utf-8")) or {})
+        model = persisted["model"]
+        assert model["provider"] == "openrouter"
+        assert model["default"] == "google/gemini-2.5-flash"
+        assert model["base_url"] == ""
+        assert not ({"api_key", "api", "api_mode", "context_length"} & set(model))
+        assert persisted["agent"]["max_turns"] == 64
+
+    def test_same_provider_custom_reassignment_preserves_endpoint_fields(
+        self, client, monkeypatch
+    ):
+        path = self._write_raw(
+            {
+                "model": {
+                    "provider": "custom",
+                    "default": "old-model",
+                    "base_url": "https://same.example/v1",
+                    "api_key": "sk-keep",
+                    "api_mode": "chat_completions",
+                }
+            }
+        )
+        saves = _spy_saved_configs(monkeypatch)
+
+        resp = client.put(
+            "/api/config",
+            json={
+                "config": {
+                    "model": "final-review-unlisted-model",
+                    "model_context_length": 0,
+                }
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert len(saves) == 1
+        model = (yaml.safe_load(path.read_text(encoding="utf-8")) or {})["model"]
+        assert model == {
+            "provider": "custom",
+            "default": "final-review-unlisted-model",
+            "base_url": "https://same.example/v1",
+            "api_key": "sk-keep",
+            "api_mode": "chat_completions",
+        }
+
+
+class TestStrictGenericConfigHelpers:
+    def test_infer_import_fault_is_best_effort_by_default_and_strict_raises(
+        self, monkeypatch
+    ):
+        import builtins
+
+        from hermes_cli.web_server import _infer_provider_on_model_change
+
+        real_import = builtins.__import__
+
+        def import_with_fault(name, *args, **kwargs):
+            if name == "hermes_cli.models":
+                raise RuntimeError("injected import fault")
+            return real_import(name, *args, **kwargs)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(builtins, "__import__", import_with_fault)
+            assert _infer_provider_on_model_change("model-x", "openrouter") == (
+                "",
+                "model-x",
+            )
+            with pytest.raises(RuntimeError, match="injected import fault"):
+                _infer_provider_on_model_change(
+                    "model-x", "openrouter", strict=True
+                )
+
+    @pytest.mark.parametrize(
+        "attribute", ["detect_provider_for_model", "normalize_provider"]
+    )
+    def test_infer_internal_fault_is_best_effort_by_default_and_strict_raises(
+        self, monkeypatch, attribute
+    ):
+        import hermes_cli.models as models
+        from hermes_cli.web_server import _infer_provider_on_model_change
+
+        if attribute == "normalize_provider":
+            monkeypatch.setattr(models, "detect_provider_for_model", lambda *_: None)
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError(f"injected {attribute} fault")
+
+        monkeypatch.setattr(models, attribute, boom)
+        default = _infer_provider_on_model_change(
+            "vendor/final-review-model", "local-provider"
+        )
+        assert default in {
+            ("", "vendor/final-review-model"),
+            ("openrouter", "vendor/final-review-model"),
+        }
+        with pytest.raises(RuntimeError, match=f"injected {attribute} fault"):
+            _infer_provider_on_model_change(
+                "vendor/final-review-model", "local-provider", strict=True
+            )
+
+    def test_assignment_model_normalization_fault_has_strict_contract(
+        self, monkeypatch
+    ):
+        import hermes_cli.model_normalize as model_normalize
+        from hermes_cli.web_server import _normalize_main_model_assignment
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("injected model normalization fault")
+
+        monkeypatch.setattr(model_normalize, "normalize_model_for_provider", boom)
+        assert _normalize_main_model_assignment(
+            "openrouter", "vendor/model"
+        ) == ("openrouter", "vendor/model")
+        with pytest.raises(RuntimeError, match="injected model normalization fault"):
+            _normalize_main_model_assignment(
+                "openrouter", "vendor/model", strict=True
+            )
+
+    def test_assignment_strict_rejects_unknown_but_default_preserves_history(self):
+        from hermes_cli.web_server import _normalize_main_model_assignment
+
+        assert _normalize_main_model_assignment(
+            "unknown-provider", "bare-model", config_snapshot={}
+        ) == ("unknown-provider", "bare-model")
+        with pytest.raises(ValueError, match="unknown-provider"):
+            _normalize_main_model_assignment(
+                "unknown-provider", "bare-model", config_snapshot={}, strict=True
+            )
+
+    @pytest.mark.parametrize(
+        ("provider", "snapshot", "expected"),
+        [
+            ("google", {}, "gemini"),
+            (
+                "acme",
+                {"providers": {"acme": {"base_url": "https://acme.example/v1"}}},
+                "acme",
+            ),
+            (
+                "custom:sudo",
+                {
+                    "custom_providers": [
+                        {"name": "sudo", "base_url": "https://sudo.example/v1"}
+                    ]
+                },
+                "custom:sudo",
+            ),
+        ],
+        ids=["known-alias", "declared-user", "declared-custom"],
+    )
+    def test_assignment_strict_returns_only_canonical_or_declared_provider(
+        self, provider, snapshot, expected
+    ):
+        from hermes_cli.web_server import _normalize_main_model_assignment
+
+        normalized, _model = _normalize_main_model_assignment(
+            provider, "bare-model", config_snapshot=snapshot, strict=True
+        )
+        assert normalized == expected
+
 
 class TestModelInfoExposesWorkflow:
     def test_info_has_coding_workflow_and_presets(self, client):

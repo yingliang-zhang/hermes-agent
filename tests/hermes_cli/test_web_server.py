@@ -4935,11 +4935,25 @@ class TestConfigRoundTrip:
         internal = [k for k in config if k.startswith("_")]
         assert not internal, f"Internal keys leaked to frontend: {internal}"
 
-    def test_get_config_model_is_string(self):
-        """GET /api/config should normalize model dict to a string."""
+    def test_get_config_explicit_model_is_string(self):
+        """GET /api/config normalizes a raw model dict to a string."""
+        from hermes_cli.config import save_config
+
+        save_config(
+            {"model": {"provider": "openrouter", "default": "explicit/model"}}
+        )
         config = self.client.get("/api/config").json()
-        assert isinstance(config.get("model"), str), \
-            f"model should be string, got {type(config.get('model'))}"
+        assert config.get("model") == "explicit/model"
+
+    def test_get_config_omits_model_without_raw_provenance(self):
+        """Resolved defaults must not invent an explicit fresh-profile model."""
+        from hermes_constants import get_hermes_home
+
+        (get_hermes_home() / "config.yaml").write_text(
+            "agent:\n  max_turns: 12\n", encoding="utf-8"
+        )
+        config = self.client.get("/api/config").json()
+        assert "model" not in config
 
     def test_round_trip_preserves_model_subkeys(self):
         """Save and reload should not lose model.provider, model.base_url, etc."""
@@ -4972,8 +4986,11 @@ class TestConfigRoundTrip:
 
     def test_edit_model_name_preserved(self):
         """Changing the model string should update model.default on disk."""
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config, save_config
 
+        save_config(
+            {"model": {"provider": "openrouter", "default": "original/model"}}
+        )
         web_config = self.client.get("/api/config").json()
         original_model = web_config["model"]
 
@@ -6861,24 +6878,34 @@ class TestDenormalizeProviderSwitch:
         assert model["provider"] == "ollama-local"
         assert model["base_url"] == "http://localhost:11434/v1"
 
-    def test_bare_model_name_change_keeps_local_provider(self):
-        """A bare (non-slug) model name gives no provider signal — leave the
-        existing provider alone rather than guessing."""
+    def test_bare_model_name_change_keeps_declared_local_provider(self):
+        """A bare model with no signal retains a valid declared provider."""
         from hermes_cli.web_server import _denormalize_config_from_web
         from hermes_cli.config import save_config
 
-        save_config({
-            "model": {
-                "default": "llama3.2",
-                "provider": "ollama-local",
-                "base_url": "http://localhost:11434/v1",
+        save_config(
+            {
+                "model": {
+                    "default": "llama3.2",
+                    "provider": "local-endpoint",
+                    "base_url": "http://localhost:11434/v1",
+                },
+                "providers": {
+                    "local-endpoint": {
+                        "base_url": "http://localhost:11434/v1",
+                        "models": {"llama3.2": {}},
+                    }
+                },
             }
-        })
+        )
 
-        result = _denormalize_config_from_web({"model": "qwen2.5"})
+        result = _denormalize_config_from_web(
+            {"model": "local-unlisted-model-review"}
+        )
         model = result["model"]
-        assert model["provider"] == "ollama-local"
-        assert model["default"] == "qwen2.5"
+        assert model["provider"] == "local-endpoint"
+        assert model["default"] == "local-unlisted-model-review"
+        assert model["base_url"] == "http://localhost:11434/v1"
 
     def test_same_aggregator_model_swap_keeps_provider(self):
         """Swapping models within an aggregator must not change the provider."""
