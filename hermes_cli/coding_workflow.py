@@ -23,9 +23,74 @@ Authority model (see docs/plans/2026-07-25-hybrid-routing-v1.md):
 
 from __future__ import annotations
 
-from copy import deepcopy
+from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
+
+class _FrozenList(tuple):
+    """Tuple-backed marker that thaws to the caller's original list shape."""
+
+
+class _FrozenSet(frozenset):
+    """Frozenset-backed marker that thaws to the caller's original set shape."""
+
+
+def _freeze_reasoning_value(value: Any, active: set[int] | None = None) -> Any:
+    """Recursively isolate JSON-like reasoning state in immutable containers."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+
+    active = active if active is not None else set()
+    if isinstance(value, (Mapping, list, tuple, set, frozenset)):
+        identity = id(value)
+        if identity in active:
+            raise TypeError("reasoning_config cannot contain cyclic containers")
+        active.add(identity)
+        try:
+            if isinstance(value, Mapping):
+                frozen = {}
+                for key, item in value.items():
+                    if not isinstance(key, str):
+                        raise TypeError("reasoning_config mapping keys must be strings")
+                    frozen[key] = _freeze_reasoning_value(item, active)
+                return MappingProxyType(frozen)
+            if isinstance(value, list):
+                return _FrozenList(
+                    _freeze_reasoning_value(item, active) for item in value
+                )
+            if isinstance(value, tuple):
+                return tuple(_freeze_reasoning_value(item, active) for item in value)
+            if isinstance(value, set):
+                return _FrozenSet(
+                    _freeze_reasoning_value(item, active) for item in value
+                )
+            return frozenset(
+                _freeze_reasoning_value(item, active) for item in value
+            )
+        finally:
+            active.remove(identity)
+
+    raise TypeError(
+        "reasoning_config values must be JSON-like immutable scalars or containers"
+    )
+
+
+def _thaw_reasoning_value(value: Any) -> Any:
+    """Return mutable caller-owned copies without exposing frozen route nodes."""
+    if isinstance(value, Mapping):
+        return {key: _thaw_reasoning_value(item) for key, item in value.items()}
+    if isinstance(value, _FrozenList):
+        return [_thaw_reasoning_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_thaw_reasoning_value(item) for item in value)
+    if isinstance(value, _FrozenSet):
+        return {_thaw_reasoning_value(item) for item in value}
+    if isinstance(value, frozenset):
+        return frozenset(_thaw_reasoning_value(item) for item in value)
+    return value
+
+
 
 #: The two allowed workflow identifiers. Order is the canonical display order.
 ALLOWED_WORKFLOWS: tuple[str, ...] = ("coupled-v1", "hybrid-v1")
@@ -64,19 +129,27 @@ class InvalidCodingWorkflow(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class CanonicalRoute:
-    """One immutable controller route, including its reasoning contract."""
+    """One immutable controller route with a durable requested identity."""
 
     coding_workflow: str
-    provider: str | None
+    requested_provider: str | None
     model: str | None
     _reasoning_items: tuple[tuple[str, Any], ...] | None = None
+
+    @property
+    def provider(self) -> str | None:
+        """Backward-compatible alias for the durable requested provider."""
+        return self.requested_provider
 
     @property
     def reasoning_config(self) -> dict | None:
         """Return an isolated mutable copy for agent/session runtime fields."""
         if self._reasoning_items is None:
             return None
-        return deepcopy(dict(self._reasoning_items))
+        return {
+            key: _thaw_reasoning_value(value)
+            for key, value in self._reasoning_items
+        }
 
 
 def canonicalize_route(
@@ -104,7 +177,7 @@ def canonicalize_route(
             )
         return CanonicalRoute(
             coding_workflow=canonical_workflow,
-            provider=fixed_provider,
+            requested_provider=fixed_provider,
             model=fixed_model,
             _reasoning_items=(
                 ("enabled", True),
@@ -115,14 +188,52 @@ def canonicalize_route(
     reasoning_items = None
     if isinstance(reasoning_config, dict):
         reasoning_items = tuple(
-            (str(key), deepcopy(value)) for key, value in reasoning_config.items()
+            (str(key), _freeze_reasoning_value(value))
+            for key, value in reasoning_config.items()
         )
     return CanonicalRoute(
         coding_workflow=canonical_workflow,
-        provider=requested_provider or None,
+        requested_provider=requested_provider or None,
         model=requested_model or None,
         _reasoning_items=reasoning_items,
     )
+
+
+def route_matches_live_runtime(
+    route: CanonicalRoute,
+    *,
+    provider: Any,
+    model: Any,
+    base_url: Any = None,
+    requested_provider: Any = None,
+) -> bool:
+    """Compare live transport state with a route's durable provider identity."""
+    if str(model or "").strip() != str(route.model or ""):
+        return False
+
+    transport_identity = str(provider or "").strip()
+    durable_live_identity = str(requested_provider or "").strip()
+    if _clean(transport_identity) == "custom":
+        healed_identity = None
+        try:
+            from hermes_cli.runtime_provider import canonical_custom_identity
+
+            healed_identity = canonical_custom_identity(
+                base_url=str(base_url or "").strip() or None,
+                config_provider=durable_live_identity or None,
+            )
+        except Exception:
+            healed_identity = None
+        if healed_identity:
+            durable_live_identity = healed_identity
+        elif not _clean(durable_live_identity).startswith("custom:"):
+            durable_live_identity = transport_identity
+    elif not durable_live_identity or (
+        _clean(durable_live_identity) != _clean(transport_identity)
+    ):
+        durable_live_identity = transport_identity
+
+    return _clean(durable_live_identity) == _clean(route.requested_provider)
 
 
 def canonicalize_controller_route(

@@ -1344,7 +1344,15 @@ def test_session_branch_persists_branched_from_marker(server, monkeypatch):
             model="test/model", session_id=session_id or key
         ),
     )
-    monkeypatch.setattr(server, "_init_session", lambda *_a, **_k: None)
+
+    def init_session(sid, key, agent, history, **_kwargs):
+        server._sessions[sid] = {
+            "agent": agent,
+            "session_key": key,
+            "history": history,
+        }
+
+    monkeypatch.setattr(server, "_init_session", init_session)
     monkeypatch.setattr(server, "_set_session_context", lambda *_a, **_k: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda *_a, **_k: None)
     monkeypatch.setattr(server, "_session_cwd", lambda _s: "/tmp/branch-cwd")
@@ -1423,7 +1431,15 @@ def test_session_branch_forwards_original_timestamps(server, monkeypatch):
             model="test/model", session_id=session_id or key
         ),
     )
-    monkeypatch.setattr(server, "_init_session", lambda *_a, **_k: None)
+
+    def init_session(sid, key, agent, history, **_kwargs):
+        server._sessions[sid] = {
+            "agent": agent,
+            "session_key": key,
+            "history": history,
+        }
+
+    monkeypatch.setattr(server, "_init_session", init_session)
     monkeypatch.setattr(server, "_set_session_context", lambda *_a, **_k: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda *_a, **_k: None)
     monkeypatch.setattr(server, "_session_cwd", lambda _s: "/tmp/branch-cwd")

@@ -2904,7 +2904,11 @@ def _rollover_runtime_snapshot(agent: Any, session: dict | None = None) -> dict:
     """Capture the live route needed to build an equivalent fresh agent."""
     snapshot = {
         "model": str(getattr(agent, "model", "") or ""),
-        "provider": str(getattr(agent, "provider", "") or ""),
+        "provider": str(
+            getattr(agent, "requested_provider", None)
+            or getattr(agent, "provider", "")
+            or ""
+        ),
         "base_url": str(getattr(agent, "base_url", "") or ""),
         "api_key": str(getattr(agent, "api_key", "") or ""),
         "api_mode": str(getattr(agent, "api_mode", "") or ""),
@@ -4029,7 +4033,8 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     return _runtime_model_config_from_snapshot(
         {
             "model": getattr(agent, "model", ""),
-            "provider": getattr(agent, "provider", ""),
+            "provider": getattr(agent, "requested_provider", None)
+            or getattr(agent, "provider", ""),
             "base_url": getattr(agent, "base_url", ""),
             "api_mode": getattr(agent, "api_mode", ""),
             "reasoning_config": getattr(agent, "reasoning_config", None),
@@ -4047,18 +4052,30 @@ def _install_canonical_route(
 ) -> None:
     """Install one canonical workflow/reasoning identity in live state."""
     session["coding_workflow"] = route.coding_workflow
+    if route.model and route.requested_provider:
+        model_override = session.get("model_override")
+        durable_override = (
+            dict(model_override) if isinstance(model_override, dict) else {}
+        )
+        durable_override.update(
+            {"model": route.model, "provider": route.requested_provider}
+        )
+        session["model_override"] = durable_override
+
     reasoning_config = route.reasoning_config
     if reasoning_config is not None:
         session["create_reasoning_override"] = copy.deepcopy(reasoning_config)
     if agent is None:
         return
     agent.coding_workflow = route.coding_workflow
-    if reasoning_config is None:
-        return
-    agent.reasoning_config = copy.deepcopy(reasoning_config)
+    agent.requested_provider = route.requested_provider
+    if reasoning_config is not None:
+        agent.reasoning_config = copy.deepcopy(reasoning_config)
     primary_runtime = getattr(agent, "_primary_runtime", None)
     if isinstance(primary_runtime, dict):
-        primary_runtime["reasoning_config"] = copy.deepcopy(reasoning_config)
+        primary_runtime["requested_provider"] = route.requested_provider
+        if reasoning_config is not None:
+            primary_runtime["reasoning_config"] = copy.deepcopy(reasoning_config)
 
 
 def _persist_live_session_runtime(session: dict | None) -> None:
@@ -4583,46 +4600,36 @@ def _persist_model_switch(result) -> None:
 
 
 def _snapshot_agent_model_runtime(agent) -> dict:
-    """Capture all mutable route state needed for an exact rollback."""
-    return {
-        "model": getattr(agent, "model", ""),
-        "provider": getattr(agent, "provider", ""),
-        "api_key": getattr(agent, "api_key", ""),
-        "base_url": getattr(agent, "base_url", ""),
-        "api_mode": getattr(agent, "api_mode", ""),
-        "reasoning_config": copy.deepcopy(
-            getattr(agent, "reasoning_config", None)
-        ),
-        "cached_system_prompt": getattr(agent, "_cached_system_prompt", None),
-        "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None)),
-    }
+    """Capture the shared exact model-switch transaction state."""
+    from agent.agent_runtime_helpers import snapshot_model_switch_state
+
+    return snapshot_model_switch_state(agent)
 
 
 def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
-    """Restore an agent route without leaking switch-time reasoning or cache."""
+    """Directly restore a model route without rebuilding clients or fallbacks."""
     if not snapshot or agent is None:
         return
-    primary = snapshot.get("primary_runtime")
-    restored = False
-    if primary and hasattr(agent, "_restore_primary_runtime"):
-        try:
-            agent._primary_runtime = copy.deepcopy(primary)
-            agent._fallback_activated = True
-            agent._rate_limited_until = 0
-            restored = bool(agent._restore_primary_runtime())
-        except Exception:
-            logger.debug("TUI one-turn model restore via primary runtime failed", exc_info=True)
-    if not restored and hasattr(agent, "switch_model"):
-        agent.switch_model(
-            new_model=snapshot.get("model", ""),
-            new_provider=snapshot.get("provider", ""),
-            api_key=snapshot.get("api_key", ""),
-            base_url=snapshot.get("base_url", ""),
-            api_mode=snapshot.get("api_mode", ""),
-        )
-    agent.reasoning_config = copy.deepcopy(snapshot.get("reasoning_config"))
-    agent._cached_system_prompt = snapshot.get("cached_system_prompt")
-    agent._primary_runtime = copy.deepcopy(primary)
+
+    from agent.agent_runtime_helpers import restore_model_switch_state
+
+    if restore_model_switch_state(agent, snapshot):
+        return
+
+    legacy_fields = {
+        "model": "model",
+        "provider": "provider",
+        "requested_provider": "requested_provider",
+        "api_key": "api_key",
+        "base_url": "base_url",
+        "api_mode": "api_mode",
+        "reasoning_config": "reasoning_config",
+        "cached_system_prompt": "_cached_system_prompt",
+        "primary_runtime": "_primary_runtime",
+    }
+    for snapshot_key, attribute in legacy_fields.items():
+        if snapshot_key in snapshot:
+            setattr(agent, attribute, snapshot[snapshot_key])
 
 
 
@@ -7837,7 +7844,7 @@ def _(rid, params: dict) -> dict:
     # for a new chat can't mutate the profile default. The canonical route binds
     # Hybrid's fixed Sol controller and mandatory XHigh reasoning atomically.
     create_coding_workflow = create_route.coding_workflow
-    create_provider = create_route.provider
+    create_provider = create_route.requested_provider
     create_model = create_route.model
     session_model_override = (
         {"model": create_model, "provider": create_provider}
@@ -11264,10 +11271,10 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     assert session is not None
-    db = _get_db()
-    if db is None:
-        return _db_unavailable_error(rid, code=5008)
 
+    # Branch scope is the parent's live scope, not the process launch scope.
+    # Snapshot it under the same transition lock as the route/history, then
+    # release every session lock before agent construction and SQLite work.
     try:
         with _session_transition_lock(session):
             old_key = session["session_key"]
@@ -11277,31 +11284,90 @@ def _(rid, params: dict) -> dict:
             runtime_snapshot = _rollover_runtime_snapshot(parent_agent, session)
             with session["history_lock"]:
                 history = [dict(msg) for msg in session.get("history", [])]
+            profile_home_raw = str(session.get("profile_home") or "").strip()
+            profile_home = Path(profile_home_raw) if profile_home_raw else None
+            parent_cwd = _session_cwd(session)
+            source = _session_source(session)
+            cols = session.get("cols", 80)
+            # A live profile session already owns the authoritative handle.
+            # If it does not, the rollover/resume pattern below opens that
+            # profile's state.db rather than consulting the launch-profile DB.
+            candidate_db = getattr(parent_agent, "_session_db", None)
     except Exception as exc:
         return _err(rid, 5008, f"branch failed: {exc}")
 
     if not history:
         return _err(rid, 4008, "nothing to branch — send a message first")
+
     new_key = _new_session_key()
     new_sid = uuid.uuid4().hex[:8]
-    source = _session_source(session)
     lease, limit_message = _claim_active_session_slot(
         new_key, live_session_id=new_sid, surface=source
     )
     if limit_message is not None:
         return _err(rid, 4090, limit_message)
+
     branch_name = params.get("name", "")
+    branch_coding_workflow = runtime_snapshot["coding_workflow"]
+    candidate_agent = None
+    owned_candidate_db = None
+    durable_write_started = False
+    stage = "database"
     try:
+        if candidate_db is None and profile_home is not None:
+            from hermes_state import SessionDB
+
+            owned_candidate_db = SessionDB(db_path=profile_home / "state.db")
+            candidate_db = owned_candidate_db
+        elif candidate_db is None:
+            candidate_db = _get_db()
+        if candidate_db is None:
+            raise RuntimeError("session database unavailable for branch")
+
+        # Resolve config, skills, credentials, and route against the parent's
+        # profile before any durable child row can exist.
+        stage = "agent"
+        home_token = (
+            set_hermes_home_override(profile_home) if profile_home is not None else None
+        )
+        context_tokens = None
+        try:
+            context_tokens = _set_session_context(
+                new_key,
+                cwd=parent_cwd,
+                ui_session_id=new_sid,
+                coding_workflow=branch_coding_workflow,
+            )
+            candidate_agent = _make_agent(
+                new_sid,
+                new_key,
+                session_id=new_key,
+                session_db=candidate_db,
+                reasoning_config_override=runtime_snapshot["reasoning_config"],
+                service_tier_override=runtime_snapshot["service_tier"],
+                platform_override=source,
+                runtime_snapshot=runtime_snapshot,
+                coding_workflow=branch_coding_workflow,
+            )
+        finally:
+            if context_tokens is not None:
+                _clear_session_context(context_tokens)
+            if home_token is not None:
+                reset_hermes_home_override(home_token)
+
+        # The candidate is now valid. Only now may the branch become durable.
+        stage = "persist"
         if branch_name:
             title = branch_name
         else:
-            current = db.get_session_title(old_key) or "branch"
+            current = candidate_db.get_session_title(old_key) or "branch"
             title = (
-                db.get_next_title_in_lineage(current)
-                if hasattr(db, "get_next_title_in_lineage")
+                candidate_db.get_next_title_in_lineage(current)
+                if hasattr(candidate_db, "get_next_title_in_lineage")
                 else f"{current} (branch)"
             )
-        db.create_session(
+        durable_write_started = True
+        candidate_db.create_session(
             new_key,
             source=source,
             model=runtime_snapshot["model"],
@@ -11311,10 +11377,10 @@ def _(rid, params: dict) -> dict:
                 runtime_snapshot, {"_branched_from": old_key}
             ),
             parent_session_id=old_key,
-            cwd=_session_cwd(session),
+            cwd=parent_cwd,
         )
         for msg in history:
-            db.append_message(
+            candidate_db.append_message(
                 session_id=new_key,
                 role=msg.get("role", "user"),
                 content=msg.get("content"),
@@ -11323,51 +11389,74 @@ def _(rid, params: dict) -> dict:
                     msg.get(HERMES_INTERNAL_SYSTEM_MARKER_KEY)
                 ),
             )
-        db.set_session_title(new_key, title)
-    except Exception as exc:
-        if lease is not None:
-            lease.release()
-        return _err(rid, 5008, f"branch failed: {exc}")
+        candidate_db.set_session_title(new_key, title)
 
-    try:
-        branch_coding_workflow = runtime_snapshot["coding_workflow"]
-        tokens = _set_session_context(
-            new_key,
-            coding_workflow=branch_coding_workflow,
+        # _init_session resolves display/config helpers and starts the profile-
+        # scoped worker, so bind the same profile around it (resume does this).
+        stage = "init"
+        init_home_token = (
+            set_hermes_home_override(profile_home) if profile_home is not None else None
         )
         try:
-            agent = _make_agent(
+            _init_session(
                 new_sid,
                 new_key,
-                session_id=new_key,
-                session_db=db,
-                reasoning_config_override=runtime_snapshot["reasoning_config"],
-                service_tier_override=runtime_snapshot["service_tier"],
-                platform_override=source,
-                runtime_snapshot=runtime_snapshot,
-                coding_workflow=branch_coding_workflow,
+                candidate_agent,
+                list(history),
+                cols=cols,
+                cwd=parent_cwd,
+                session_db=candidate_db,
+                source=source,
+                profile_home=profile_home,
             )
         finally:
-            _clear_session_context(tokens)
-        _init_session(
-            new_sid,
-            new_key,
-            agent,
-            list(history),
-            cols=session.get("cols", 80),
-            source=source,
-        )
+            if init_home_token is not None:
+                reset_hermes_home_override(init_home_token)
+
         with _sessions_lock:
             child_session = _sessions.get(new_sid)
-            if child_session is not None:
-                child_session.update(
-                    _live_session_overrides_from_runtime_snapshot(runtime_snapshot)
-                )
-                child_session["active_session_lease"] = lease
+            if child_session is None:
+                raise RuntimeError("branch session initialization did not register child")
+            child_session.update(
+                _live_session_overrides_from_runtime_snapshot(runtime_snapshot)
+            )
+            child_session["parent_session_id"] = old_key
+            child_session["_branch_seed_persisted"] = True
+            child_session["active_session_lease"] = lease
     except Exception as exc:
+        # Claim and detach any partial live child without running the normal
+        # finalizer: it flushes/ends rows, while this path must erase the child.
+        partial = _pop_session_by_id(new_sid)
+        if partial is not None:
+            stop_event = partial.get("_notif_stop")
+            if stop_event is not None:
+                with contextlib.suppress(Exception):
+                    stop_event.set()
+            worker = partial.get("slash_worker")
+            if worker is not None:
+                with contextlib.suppress(Exception):
+                    worker.close()
+        _clear_rollover_candidate_registration(new_key)
+
+        # create_session itself may have committed before surfacing an error,
+        # so cleanup begins as soon as the first durable write was attempted.
+        if durable_write_started and candidate_db is not None:
+            try:
+                # No sessions_dir: a failed branch has not produced transcript
+                # files, and cleanup must never reach outside the owning profile.
+                candidate_db.delete_session(new_key)
+            except Exception:
+                logger.error(
+                    "Failed to delete partial branch row: session=%s", new_key, exc_info=True
+                )
+        _close_rollover_candidate(candidate_agent, None, owned_candidate_db)
         if lease is not None:
-            lease.release()
-        return _err(rid, 5000, f"agent init failed on branch: {exc}")
+            with contextlib.suppress(Exception):
+                lease.release()
+        code = 5000 if stage in {"agent", "init"} else 5008
+        prefix = "agent init failed on branch" if code == 5000 else "branch failed"
+        return _err(rid, code, f"{prefix}: {exc}")
+
     return _ok(rid, {"session_id": new_sid, "title": title, "parent": old_key})
 
 
@@ -14394,7 +14483,7 @@ def _(rid, params: dict) -> dict:
         except _coding_workflow.InvalidCodingWorkflow as exc:
             return _err(rid, 4002, str(exc))
         model = str(route.model or "")
-        provider = str(route.provider or "")
+        provider = str(route.requested_provider or "")
         coding_workflow = route.coding_workflow
 
         transition_lock = _session_transition_lock(session)
@@ -14446,8 +14535,13 @@ def _(rid, params: dict) -> dict:
 
             try:
                 same_live_route = agent is not None and (
-                    str(getattr(agent, "model", "") or "") == model
-                    and str(getattr(agent, "provider", "") or "") == provider
+                    _coding_workflow.route_matches_live_runtime(
+                        route,
+                        model=getattr(agent, "model", ""),
+                        provider=getattr(agent, "provider", ""),
+                        requested_provider=getattr(agent, "requested_provider", None),
+                        base_url=getattr(agent, "base_url", ""),
+                    )
                 )
                 if same_live_route:
                     # A workflow-only change must not rebuild the runtime or
@@ -14512,9 +14606,7 @@ def _(rid, params: dict) -> dict:
             if agent is not None:
                 _restart_slash_worker(params.get("session_id", ""), session)
                 effective_model = str(getattr(agent, "model", "") or model)
-                effective_provider = str(
-                    getattr(agent, "provider", "") or provider
-                )
+                effective_provider = str(route.requested_provider or provider)
                 info = _session_info(agent, session)
             else:
                 override = session.get("model_override") or {}

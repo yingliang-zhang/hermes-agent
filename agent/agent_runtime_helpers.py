@@ -1978,6 +1978,186 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     return client
 
 
+_MODEL_SWITCH_AGENT_FIELDS = (
+    "model",
+    "provider",
+    "requested_provider",
+    "base_url",
+    "_base_url_lower",
+    "api_mode",
+    "api_key",
+    "client",
+    "_anthropic_client",
+    "_anthropic_api_key",
+    "_anthropic_base_url",
+    "_is_anthropic_oauth",
+    "_client_kwargs",
+    "_config_context_length",
+    "_compression_global_threshold",
+    "_use_prompt_caching",
+    "_use_native_cache_layout",
+    "_cached_system_prompt",
+    "reasoning_config",
+    "_primary_runtime",
+    "_fallback_activated",
+    "_fallback_index",
+    "_fallback_chain",
+    "_fallback_model",
+    "_rate_limited_until",
+    "_consecutive_stale_streams",
+    "_unavailable_fallback_keys",
+    "_transport_cache",
+    "_credential_pool",
+    "context_compressor",
+)
+
+_MODEL_SWITCH_COMPRESSOR_FIELDS = (
+    "model",
+    "base_url",
+    "api_key",
+    "provider",
+    "api_mode",
+    "context_length",
+    "_configured_threshold_percent",
+    "_config_threshold_percent",
+    "_base_threshold_percent",
+    "threshold_percent",
+    "threshold_tokens",
+    "tail_token_budget",
+    "max_summary_tokens",
+    "last_prompt_tokens",
+    "last_completion_tokens",
+    "last_total_tokens",
+    "last_real_prompt_tokens",
+    "last_rough_tokens_when_real_prompt_fit",
+    "last_compression_rough_tokens",
+    "awaiting_real_usage_after_compression",
+    "_ineffective_compression_count",
+    "_fallback_compression_streak",
+    "_summary_failure_cooldown_until",
+    "_last_summary_error",
+    "_consecutive_timeout_failures",
+    "_cooldown_persist_failed",
+    "_verify_compaction_cleared_threshold",
+    "_last_compression_made_progress",
+)
+
+_MODEL_SWITCH_IN_PLACE_FIELDS = frozenset(
+    {"_primary_runtime", "_transport_cache"}
+)
+_MODEL_SWITCH_STATE_KEY = "_exact_model_switch_state_v1"
+
+
+def _clone_switch_container(value: Any) -> Any:
+    """Clone built-in containers while preserving opaque SDK/lock leaves."""
+    if isinstance(value, dict):
+        return {
+            _clone_switch_container(key): _clone_switch_container(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_clone_switch_container(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_switch_container(item) for item in value)
+    if isinstance(value, set):
+        return {_clone_switch_container(item) for item in value}
+    if isinstance(value, frozenset):
+        return frozenset(_clone_switch_container(item) for item in value)
+    return value
+
+
+def _capture_switch_attribute(target: Any, name: str, *, in_place: bool = False):
+    try:
+        value = getattr(target, name)
+    except AttributeError:
+        return False, None, None
+    contents = _clone_switch_container(value) if in_place else None
+    return True, value, contents
+
+
+def _restore_switch_container(target: Any, contents: Any) -> None:
+    restored = _clone_switch_container(contents)
+    if isinstance(target, dict):
+        target.clear()
+        target.update(restored)
+    elif isinstance(target, list):
+        target[:] = restored
+    elif isinstance(target, set):
+        target.clear()
+        target.update(restored)
+
+
+def _restore_switch_attribute(target: Any, name: str, state) -> None:
+    existed, value, contents = state
+    if not existed:
+        try:
+            delattr(target, name)
+        except AttributeError:
+            pass
+        return
+    if contents is not None:
+        _restore_switch_container(value, contents)
+    setattr(target, name, value)
+
+
+def snapshot_model_switch_state(agent: Any) -> dict:
+    """Capture every in-memory field changed by a model route transaction."""
+    agent_state = {
+        name: _capture_switch_attribute(
+            agent,
+            name,
+            in_place=name in _MODEL_SWITCH_IN_PLACE_FIELDS,
+        )
+        for name in _MODEL_SWITCH_AGENT_FIELDS
+    }
+    compressor_state = None
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is not None:
+        compressor_state = {
+            name: _capture_switch_attribute(compressor, name)
+            for name in _MODEL_SWITCH_COMPRESSOR_FIELDS
+        }
+
+    snapshot = {
+        "model": getattr(agent, "model", ""),
+        "provider": getattr(agent, "provider", ""),
+        "requested_provider": getattr(agent, "requested_provider", None),
+        "api_key": getattr(agent, "api_key", ""),
+        "base_url": getattr(agent, "base_url", ""),
+        "api_mode": getattr(agent, "api_mode", ""),
+        "reasoning_config": _clone_switch_container(
+            getattr(agent, "reasoning_config", None)
+        ),
+        "cached_system_prompt": getattr(agent, "_cached_system_prompt", None),
+        "primary_runtime": _clone_switch_container(
+            getattr(agent, "_primary_runtime", None)
+        ),
+    }
+    snapshot[_MODEL_SWITCH_STATE_KEY] = {
+        "agent": agent_state,
+        "compressor": compressor,
+        "compressor_state": compressor_state,
+    }
+    return snapshot
+
+
+def restore_model_switch_state(agent: Any, snapshot: dict) -> bool:
+    """Directly restore an exact snapshot without rebuilding runtime clients."""
+    exact_state = snapshot.get(_MODEL_SWITCH_STATE_KEY)
+    if not isinstance(exact_state, dict):
+        return False
+
+    for name in _MODEL_SWITCH_AGENT_FIELDS:
+        _restore_switch_attribute(agent, name, exact_state["agent"][name])
+
+    compressor = exact_state.get("compressor")
+    compressor_state = exact_state.get("compressor_state")
+    if compressor is not None and isinstance(compressor_state, dict):
+        for name in _MODEL_SWITCH_COMPRESSOR_FIELDS:
+            _restore_switch_attribute(compressor, name, compressor_state[name])
+    return True
+
+
 def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode=''):
     """Switch the model/provider in-place for a live agent.
 
@@ -2014,42 +2194,9 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     old_model = agent.model
     old_provider = agent.provider
 
-    # ── Snapshot all fields the swap+rebuild can mutate ──
-    # If the rebuild raises (bad API key, network error, build_anthropic_client
-    # failure, etc.) we restore these atomically so the agent isn't left with a
-    # new model/provider name paired with the OLD client — that mismatch causes
-    # HTTP 400s like "claude-sonnet-4-6 is not supported on openai-codex" on the
-    # next turn.  Callers in cli.py / gateway/run.py / tui_gateway/server.py
-    # catch the re-raised exception and show the user a warning; without this
-    # rollback the warning is misleading because the swap partially succeeded.
-    # Use a sentinel so we can distinguish "attribute was unset" from
-    # "attribute was None" and skip the restore for genuinely-missing
-    # attributes (tests construct bare agents via __new__ without all fields).
-    _MISSING = object()
-    _snapshot = {
-        name: getattr(agent, name, _MISSING)
-        for name in (
-            "model",
-            "provider",
-            "requested_provider",
-            "base_url",
-            "api_mode",
-            "api_key",
-            "client",
-            "_anthropic_client",
-            "_anthropic_api_key",
-            "_anthropic_base_url",
-            "_is_anthropic_oauth",
-            "_config_context_length",
-        )
-    }
-    # _client_kwargs is a dict — snapshot a shallow copy so mutating the
-    # live dict doesn't poison the rollback target.
-    _snapshot["_client_kwargs"] = dict(getattr(agent, "_client_kwargs", {}) or {})
-    # Snapshot the credential pool reference so a failed client rebuild can
-    # restore the original pool (issue #52727: pool reload is part of this
-    # switch and must be reversible on rollback).
-    _snapshot["_credential_pool"] = getattr(agent, "_credential_pool", _MISSING)
+    # Capture the same exact state used by route transactions. This preserves
+    # missing-vs-None and opaque SDK/client identities without deep-copying them.
+    _snapshot = snapshot_model_switch_state(agent)
 
     try:
         # Re-read model.context_length from config so the endpoint-level
@@ -2232,19 +2379,9 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 shared=True,
             )
     except Exception:
-        # Rollback every mutated field to the pre-swap snapshot so the agent
-        # is left consistent (old model + old provider + old client) and the
-        # caller's exception handler can surface a meaningful warning.  The
-        # exception is re-raised; cli.py / gateway/run.py / tui_gateway catch
-        # it and print "Agent swap failed; change applied to next session".
-        for _name, _value in _snapshot.items():
-            if _value is _MISSING:
-                # Attribute did not exist before the swap — don't fabricate it.
-                continue
-            try:
-                setattr(agent, _name, _value)
-            except Exception:  # noqa: BLE001
-                pass
+        # A failed client rebuild is a true no-op, including transport-cache,
+        # credential-pool, and missing-attribute state.
+        restore_model_switch_state(agent, _snapshot)
         raise
 
     # ── Re-evaluate prompt caching ──

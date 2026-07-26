@@ -163,6 +163,42 @@ class TestCanonicalControllerRoute:
         with pytest.raises(FrozenInstanceError):
             route.model = "other"
 
+    def test_coupled_route_recursively_freezes_reasoning_state(self):
+        caller_reasoning = {
+            "nested": {
+                "sequence": [{"effort": "high"}],
+                "flags": {"trace", "cache"},
+            }
+        }
+        route = cw.canonicalize_route(
+            "coupled-v1",
+            provider="custom:sudo",
+            model="gpt-5.6-sol",
+            reasoning_config=caller_reasoning,
+        )
+
+        assert route.requested_provider == "custom:sudo"
+        caller_reasoning["nested"]["sequence"][0]["effort"] = "low"
+        caller_reasoning["nested"]["flags"].add("caller-mutation")
+        assert route.reasoning_config == {
+            "nested": {
+                "sequence": [{"effort": "high"}],
+                "flags": {"trace", "cache"},
+            }
+        }
+
+        stored_nested = dict(route._reasoning_items)["nested"]
+        with pytest.raises(TypeError):
+            stored_nested["sequence"][0]["effort"] = "private-mutation"
+        with pytest.raises(AttributeError):
+            stored_nested["sequence"].append("private-mutation")
+        with pytest.raises(AttributeError):
+            stored_nested["flags"].add("private-mutation")
+
+        thawed = route.reasoning_config
+        thawed["nested"]["sequence"][0]["effort"] = "thawed-mutation"
+        assert route.reasoning_config["nested"]["sequence"][0]["effort"] == "high"
+
 
 class TestWorkflowPresets:
     def test_inventory_ids_match_allowlist(self):
