@@ -229,7 +229,14 @@ class _RouteAgent:
         self.api_key = "old-key"
         self.base_url = "https://old.invalid/v1"
         self.api_mode = "chat_completions"
-        self._primary_runtime = None
+        self.reasoning_config = {"enabled": True, "effort": "low"}
+        self.service_tier = None
+        self._cached_system_prompt = "stable cached system prompt"
+        self._primary_runtime = {
+            "model": self.model,
+            "provider": self.provider,
+            "reasoning_config": dict(self.reasoning_config),
+        }
         self.coding_workflow = "coupled-v1"
 
     def switch_model(self, *, new_model, new_provider, api_key, base_url, api_mode):
@@ -238,6 +245,334 @@ class _RouteAgent:
         self.api_key = api_key
         self.base_url = base_url
         self.api_mode = api_mode
+        self.reasoning_config = {"enabled": True, "effort": "medium"}
+        self._cached_system_prompt = None
+        self._primary_runtime = {
+            "model": new_model,
+            "provider": new_provider,
+            "reasoning_config": dict(self.reasoning_config),
+        }
+
+
+def test_live_hybrid_route_installs_and_persists_xhigh_reasoning(monkeypatch):
+    updates = []
+
+    class RouteDB:
+        def get_session(self, session_key):
+            assert session_key == "stored-1"
+            return {"model_config": json.dumps({"retained": "value"})}
+
+        def update_session_meta(self, session_key, model_config, model):
+            updates.append((session_key, json.loads(model_config), model))
+
+    agent = _RouteAgent()
+    agent._session_db = RouteDB()
+    session = {
+        "agent": agent,
+        "coding_workflow": "coupled-v1",
+        "create_reasoning_override": {"enabled": True, "effort": "low"},
+        "running": False,
+        "session_key": "stored-1",
+    }
+    monkeypatch.setattr(server, "_sessions", {"runtime-1": session})
+    monkeypatch.setattr(server, "_apply_model_switch", _fake_route_switch)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_emit", lambda *_args: None)
+
+    response = server._methods["config.set"](
+        "r1",
+        {
+            "session_id": "runtime-1",
+            "key": "route",
+            "value": {
+                "model": "gpt-5.6-sol",
+                "provider": "custom:sudo",
+                "coding_workflow": "hybrid-v1",
+            },
+        },
+    )
+
+    expected_reasoning = {"enabled": True, "effort": "xhigh"}
+    assert "error" not in response, response
+    assert agent.reasoning_config == expected_reasoning
+    assert session["create_reasoning_override"] == expected_reasoning
+    assert agent._primary_runtime["reasoning_config"] == expected_reasoning
+    assert updates == [
+        (
+            "stored-1",
+            {
+                "retained": "value",
+                "model": "gpt-5.6-sol",
+                "provider": "custom:sudo",
+                "base_url": "https://new.invalid/v1",
+                "api_mode": "chat_completions",
+                "reasoning_config": expected_reasoning,
+                "coding_workflow": "hybrid-v1",
+            },
+            "gpt-5.6-sol",
+        )
+    ]
+
+
+def test_workflow_only_hybrid_switch_skips_model_switch_and_preserves_cache(monkeypatch):
+    agent = _RouteAgent()
+    agent.model = "gpt-5.6-sol"
+    agent.provider = "custom:sudo"
+    agent._primary_runtime.update(
+        {"model": agent.model, "provider": agent.provider}
+    )
+    cache_before = agent._cached_system_prompt
+    history = [{"role": "user", "content": "keep history stable"}]
+    session = {
+        "agent": agent,
+        "coding_workflow": "coupled-v1",
+        "history": list(history),
+        "running": False,
+        "session_key": "stored-1",
+    }
+    apply_switch = Mock(side_effect=AssertionError("workflow-only switch called model switch"))
+    persist_route = Mock()
+    monkeypatch.setattr(server, "_sessions", {"runtime-1": session})
+    monkeypatch.setattr(server, "_apply_model_switch", apply_switch)
+    monkeypatch.setattr(server, "_persist_route_runtime_strict", persist_route)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_emit", lambda *_args: None)
+
+    response = server._methods["config.set"](
+        "r1",
+        {
+            "session_id": "runtime-1",
+            "key": "route",
+            "value": {
+                "model": "gpt-5.6-sol",
+                "provider": "custom:sudo",
+                "coding_workflow": "hybrid-v1",
+            },
+        },
+    )
+
+    expected_reasoning = {"enabled": True, "effort": "xhigh"}
+    assert "error" not in response, response
+    apply_switch.assert_not_called()
+    persist_route.assert_called_once_with(session)
+    assert agent._cached_system_prompt is cache_before
+    assert session["history"] == history
+    assert agent.reasoning_config == expected_reasoning
+    assert agent._primary_runtime["reasoning_config"] == expected_reasoning
+    assert agent.coding_workflow == session["coding_workflow"] == "hybrid-v1"
+
+
+def test_route_persist_failure_rolls_back_full_runtime_and_emits_nothing(monkeypatch):
+    agent = _RouteAgent()
+    reasoning_before = dict(agent.reasoning_config)
+    cache_before = agent._cached_system_prompt
+    primary_before = json.loads(json.dumps(agent._primary_runtime))
+    session = {
+        "agent": agent,
+        "coding_workflow": "coupled-v1",
+        "model_override": {"model": "old-model", "provider": "old-provider"},
+        "create_reasoning_override": dict(reasoning_before),
+        "running": False,
+        "session_key": "stored-1",
+    }
+    monkeypatch.setattr(server, "_sessions", {"runtime-1": session})
+    monkeypatch.setattr(server, "_apply_model_switch", _fake_route_switch)
+    monkeypatch.setattr(
+        server,
+        "_persist_route_runtime_strict",
+        lambda _session: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args: None)
+    emitted = []
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+
+    response = server._methods["config.set"](
+        "r1",
+        {
+            "session_id": "runtime-1",
+            "key": "route",
+            "value": {
+                "model": "gpt-5.6-sol",
+                "provider": "custom:sudo",
+                "coding_workflow": "hybrid-v1",
+            },
+        },
+    )
+
+    assert response["error"] == {"code": 5001, "message": "disk full"}
+    assert (agent.model, agent.provider, agent.coding_workflow) == (
+        "old-model",
+        "old-provider",
+        "coupled-v1",
+    )
+    assert agent.reasoning_config == reasoning_before
+    assert agent._cached_system_prompt is cache_before
+    assert agent._primary_runtime == primary_before
+    assert session["coding_workflow"] == "coupled-v1"
+    assert session["model_override"] == {
+        "model": "old-model",
+        "provider": "old-provider",
+    }
+    assert session["create_reasoning_override"] == reasoning_before
+    assert emitted == []
+
+
+def test_session_branch_inherits_full_live_runtime_under_transition_lock(monkeypatch):
+    class TrackingLock:
+        def __init__(self):
+            self.held = False
+
+        def __enter__(self):
+            assert not self.held
+            self.held = True
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            self.held = False
+
+    created = []
+
+    class BranchDB:
+        def get_session_title(self, key):
+            assert key == "parent-key"
+            return "parent"
+
+        def get_next_title_in_lineage(self, title):
+            return f"{title} 2"
+
+        def create_session(self, key, **kwargs):
+            created.append((key, kwargs))
+
+        def append_message(self, **_kwargs):
+            pass
+
+        def set_session_title(self, _key, _title):
+            pass
+
+    lock = TrackingLock()
+    parent_agent = _RouteAgent()
+    parent_agent.model = "gpt-5.6-sol"
+    parent_agent.provider = "custom:sudo"
+    parent_agent.base_url = "https://sudo.example/v1"
+    parent_agent.api_mode = "codex_responses"
+    parent_agent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+    parent_agent.service_tier = "priority"
+    parent_agent.coding_workflow = "hybrid-v1"
+    session = {
+        "agent": parent_agent,
+        "coding_workflow": "hybrid-v1",
+        "history": [{"role": "user", "content": "branch this"}],
+        "history_lock": threading.RLock(),
+        "transition_lock": lock,
+        "running": False,
+        "session_key": "parent-key",
+        "source": "desktop",
+        "cols": 100,
+    }
+    captured_snapshots = []
+    make_agent_kwargs = []
+    real_snapshot = server._rollover_runtime_snapshot
+
+    def snapshot_while_locked(agent, current_session):
+        assert lock.held, "branch runtime snapshot escaped the transition lock"
+        snapshot = real_snapshot(agent, current_session)
+        captured_snapshots.append(snapshot)
+        return snapshot
+
+    def make_agent(_sid, _key, **kwargs):
+        make_agent_kwargs.append(kwargs)
+        return SimpleNamespace(
+            model=kwargs["runtime_snapshot"]["model"],
+            coding_workflow=kwargs["runtime_snapshot"]["coding_workflow"],
+        )
+
+    def init_session(sid, key, agent, history, **_kwargs):
+        server._sessions[sid] = {
+            "agent": agent,
+            "session_key": key,
+            "history": history,
+            "model_override": None,
+            "coding_workflow": agent.coding_workflow,
+        }
+
+    monkeypatch.setattr(server, "_sessions", {"runtime-1": session})
+    monkeypatch.setattr(server, "_get_db", lambda: BranchDB())
+    monkeypatch.setattr(server, "_new_session_key", lambda: "branch-key")
+    monkeypatch.setattr(
+        server, "_claim_active_session_slot", lambda *_args, **_kwargs: (None, None)
+    )
+    monkeypatch.setattr(server, "_resolve_model", lambda: "coupled-profile-default")
+    monkeypatch.setattr(server, "_session_cwd", lambda _session: "/tmp/project")
+    monkeypatch.setattr(server, "_rollover_runtime_snapshot", snapshot_while_locked)
+    monkeypatch.setattr(server, "_make_agent", make_agent)
+    monkeypatch.setattr(server, "_init_session", init_session)
+    monkeypatch.setattr(server, "_set_session_context", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+
+    response = server._methods["session.branch"](
+        "r1", {"session_id": "runtime-1", "name": "hybrid branch"}
+    )
+
+    assert "error" not in response, response
+    assert len(captured_snapshots) == 1
+    runtime_snapshot = captured_snapshots[0]
+    assert {
+        key: runtime_snapshot[key]
+        for key in (
+            "model",
+            "provider",
+            "base_url",
+            "api_mode",
+            "reasoning_config",
+            "service_tier",
+            "coding_workflow",
+        )
+    } == {
+        "model": "gpt-5.6-sol",
+        "provider": "custom:sudo",
+        "base_url": "https://sudo.example/v1",
+        "api_mode": "codex_responses",
+        "reasoning_config": {"enabled": True, "effort": "xhigh"},
+        "service_tier": "priority",
+        "coding_workflow": "hybrid-v1",
+    }
+    assert len(created) == 1
+    _branch_key, create_kwargs = created[0]
+    assert create_kwargs["model"] == "gpt-5.6-sol"
+    assert create_kwargs["model_config"] == {
+        "_branched_from": "parent-key",
+        "model": "gpt-5.6-sol",
+        "provider": "custom:sudo",
+        "base_url": "https://sudo.example/v1",
+        "api_mode": "codex_responses",
+        "reasoning_config": {"enabled": True, "effort": "xhigh"},
+        "service_tier": "priority",
+        "coding_workflow": "hybrid-v1",
+    }
+    assert len(make_agent_kwargs) == 1
+    assert make_agent_kwargs[0]["runtime_snapshot"] == runtime_snapshot
+    assert make_agent_kwargs[0]["reasoning_config_override"] == {
+        "enabled": True,
+        "effort": "xhigh",
+    }
+    assert make_agent_kwargs[0]["service_tier_override"] == "priority"
+    assert make_agent_kwargs[0]["coding_workflow"] == "hybrid-v1"
+    child_session = server._sessions[response["result"]["session_id"]]
+    assert child_session["model_override"] == {
+        key: runtime_snapshot[key]
+        for key in ("model", "provider", "base_url", "api_key", "api_mode")
+        if runtime_snapshot.get(key)
+    }
+    assert child_session["create_reasoning_override"] == runtime_snapshot[
+        "reasoning_config"
+    ]
+    assert child_session["create_service_tier_override"] == runtime_snapshot[
+        "service_tier"
+    ]
+    assert child_session["coding_workflow"] == runtime_snapshot["coding_workflow"]
+    assert "api_key" not in create_kwargs["model_config"]
 
 
 def _fake_route_switch(_sid, session, _raw, **kwargs):

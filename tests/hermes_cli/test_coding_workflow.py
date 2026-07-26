@@ -15,6 +15,7 @@ Read-boundary semantics (frozen contract):
 """
 
 from __future__ import annotations
+from dataclasses import FrozenInstanceError
 
 import pytest
 
@@ -144,6 +145,23 @@ class TestHybridController:
         provider, model = cw.hybrid_executor_route()
         assert provider == "custom:sudo"
         assert model == "glm-5.2-heavy"
+
+
+class TestCanonicalControllerRoute:
+    def test_hybrid_route_atomically_binds_sol_and_xhigh_reasoning(self):
+        route = cw.canonicalize_route(
+            "hybrid-v1",
+            provider="custom:sudo",
+            model="gpt-5.6-sol",
+            reasoning_config={"enabled": True, "effort": "low"},
+        )
+
+        assert route.coding_workflow == "hybrid-v1"
+        assert route.provider == "custom:sudo"
+        assert route.model == "gpt-5.6-sol"
+        assert route.reasoning_config == {"enabled": True, "effort": "xhigh"}
+        with pytest.raises(FrozenInstanceError):
+            route.model = "other"
 
 
 class TestWorkflowPresets:

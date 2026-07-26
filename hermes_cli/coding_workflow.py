@@ -23,6 +23,8 @@ Authority model (see docs/plans/2026-07-25-hybrid-routing-v1.md):
 
 from __future__ import annotations
 
+from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 
 #: The two allowed workflow identifiers. Order is the canonical display order.
@@ -58,6 +60,79 @@ class InvalidCodingWorkflow(ValueError):
     Read boundaries (legacy/absent config) use :func:`normalize_coding_workflow`
     and degrade to :data:`DEFAULT_WORKFLOW` instead of raising.
     """
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalRoute:
+    """One immutable controller route, including its reasoning contract."""
+
+    coding_workflow: str
+    provider: str | None
+    model: str | None
+    _reasoning_items: tuple[tuple[str, Any], ...] | None = None
+
+    @property
+    def reasoning_config(self) -> dict | None:
+        """Return an isolated mutable copy for agent/session runtime fields."""
+        if self._reasoning_items is None:
+            return None
+        return deepcopy(dict(self._reasoning_items))
+
+
+def canonicalize_route(
+    workflow: Any,
+    provider: Any = None,
+    model: Any = None,
+    reasoning_config: Any = None,
+) -> CanonicalRoute:
+    """Validate and canonicalize workflow, controller, and reasoning together.
+
+    Coupled sessions preserve the caller's ordinary route and reasoning.
+    Hybrid sessions reject contradictory controller components and always
+    return the fixed Sol XHigh identity.
+    """
+    canonical_workflow = validate_coding_workflow(workflow)
+    requested_provider = str(provider or "").strip()
+    requested_model = str(model or "").strip()
+    if canonical_workflow == "hybrid-v1":
+        fixed_provider, fixed_model = hybrid_controller_route()
+        if (requested_provider and requested_provider != fixed_provider) or (
+            requested_model and requested_model != fixed_model
+        ):
+            raise InvalidCodingWorkflow(
+                "hybrid-v1 requires controller route custom:sudo / gpt-5.6-sol"
+            )
+        return CanonicalRoute(
+            coding_workflow=canonical_workflow,
+            provider=fixed_provider,
+            model=fixed_model,
+            _reasoning_items=(
+                ("enabled", True),
+                ("effort", HYBRID_CONTROLLER_THINKING),
+            ),
+        )
+
+    reasoning_items = None
+    if isinstance(reasoning_config, dict):
+        reasoning_items = tuple(
+            (str(key), deepcopy(value)) for key, value in reasoning_config.items()
+        )
+    return CanonicalRoute(
+        coding_workflow=canonical_workflow,
+        provider=requested_provider or None,
+        model=requested_model or None,
+        _reasoning_items=reasoning_items,
+    )
+
+
+def canonicalize_controller_route(
+    workflow: Any,
+    provider: Any = None,
+    model: Any = None,
+) -> tuple[str | None, str | None]:
+    """Backward-compatible controller-only view of :func:`canonicalize_route`."""
+    route = canonicalize_route(workflow, provider, model)
+    return route.provider, route.model
 
 
 def _clean(value: Any) -> str:
@@ -137,31 +212,6 @@ def hybrid_controller_route() -> tuple[str, str]:
     return (HYBRID_CONTROLLER_PROVIDER, HYBRID_CONTROLLER_MODEL)
 
 
-def canonicalize_controller_route(
-    workflow: Any,
-    provider: Any = None,
-    model: Any = None,
-) -> tuple[str | None, str | None]:
-    """Validate and canonicalize a session controller route.
-
-    Coupled sessions preserve the caller's ordinary route. Hybrid sessions
-    reject any contradictory explicit component and fill absent components
-    with the fixed Sol controller pair.
-    """
-    canonical_workflow = validate_coding_workflow(workflow)
-    requested_provider = str(provider or "").strip()
-    requested_model = str(model or "").strip()
-    if canonical_workflow != "hybrid-v1":
-        return (requested_provider or None, requested_model or None)
-
-    fixed_provider, fixed_model = hybrid_controller_route()
-    if (requested_provider and requested_provider != fixed_provider) or (
-        requested_model and requested_model != fixed_model
-    ):
-        raise InvalidCodingWorkflow(
-            "hybrid-v1 requires controller route custom:sudo / gpt-5.6-sol"
-        )
-    return fixed_provider, fixed_model
 
 
 

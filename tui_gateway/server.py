@@ -2952,6 +2952,31 @@ def _rollover_runtime_snapshot(agent: Any, session: dict | None = None) -> dict:
     return snapshot
 
 
+def _live_session_overrides_from_runtime_snapshot(
+    runtime_snapshot: dict,
+    *,
+    include_api_key: bool = True,
+) -> dict:
+    """Project one runtime snapshot into rebuild-safe live session fields."""
+    model_fields = ("model", "provider", "base_url", "api_key", "api_mode")
+    if not include_api_key:
+        model_fields = ("model", "provider", "base_url", "api_mode")
+    return {
+        "model_override": {
+            key: runtime_snapshot.get(key)
+            for key in model_fields
+            if runtime_snapshot.get(key)
+        },
+        "create_reasoning_override": copy.deepcopy(
+            runtime_snapshot.get("reasoning_config")
+        ),
+        "create_service_tier_override": runtime_snapshot.get("service_tier") or "",
+        "coding_workflow": _coding_workflow.normalize_coding_workflow(
+            runtime_snapshot.get("coding_workflow")
+        ),
+    }
+
+
 def _close_rollover_candidate(agent: Any, worker: Any, owned_db: Any = None) -> None:
     if worker is not None:
         with contextlib.suppress(Exception):
@@ -3127,20 +3152,9 @@ def _(rid, params: dict) -> dict:
                 "image_counter": 0,
                 "inflight_turn": None,
                 "last_active": time.time(),
-                "model_override": {
-                    key: runtime_snapshot.get(key)
-                    for key in (
-                        "model",
-                        "provider",
-                        "base_url",
-                        "api_mode",
-                    )
-                    if runtime_snapshot.get(key)
-                },
-                "create_reasoning_override": copy.deepcopy(
-                    runtime_snapshot["reasoning_config"]
+                **_live_session_overrides_from_runtime_snapshot(
+                    runtime_snapshot, include_api_key=False
                 ),
-                "create_service_tier_override": runtime_snapshot["service_tier"] or "",
                 "parent_session_id": None,
                 "pending_title": None,
                 "queued_prompt": None,
@@ -3959,39 +3973,29 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     return overrides
 
 
-def _runtime_model_config(agent, existing: dict | None = None) -> dict:
+def _runtime_model_config_from_snapshot(
+    runtime: dict, existing: dict | None = None
+) -> dict:
+    """Project one resolved runtime snapshot into durable session metadata."""
     config = dict(existing or {})
-    model = str(getattr(agent, "model", "") or "").strip()
-    provider = str(getattr(agent, "provider", "") or "").strip()
-    base_url = str(getattr(agent, "base_url", "") or "").strip()
-    api_mode = str(getattr(agent, "api_mode", "") or "").strip()
-    reasoning_config = getattr(agent, "reasoning_config", None)
-    service_tier = getattr(agent, "service_tier", None)
+    model = str(runtime.get("model") or "").strip()
+    provider = str(runtime.get("provider") or "").strip()
+    base_url = str(runtime.get("base_url") or "").strip()
+    api_mode = str(runtime.get("api_mode") or "").strip()
+    reasoning_config = runtime.get("reasoning_config")
+    service_tier = runtime.get("service_tier")
+    coding_workflow = str(runtime.get("coding_workflow") or "").strip()
 
     if model:
         config["model"] = model
     if provider:
-        if provider.strip().lower() == "custom":
-            # ``agent.provider`` is the RESOLVED provider, and for any named
-            # ``providers:`` / ``custom_providers:`` entry that is the literal
-            # string "custom" — persisting it loses the entry identity, so a
-            # later resume/rebuild cannot re-resolve the entry's credentials
-            # (the api_key is deliberately never persisted; see
-            # _stored_session_runtime_overrides). Recover the canonical
-            # ``custom:<name>`` menu key from the endpoint URL when present,
-            # else from the configured provider — this second fallback is the
-            # fix for sessions built WITHOUT a base_url on the override (the
-            # recurring Desktop/TUI "No LLM provider configured" regression:
-            # bare "custom" with no base_url was persisted verbatim and routed
-            # to OpenRouter with no key on the next resume).
+        if provider.lower() == "custom":
+            # A resolved bare ``custom`` billing class is not routable on
+            # resume. Recover the named provider identity from its endpoint.
             try:
-                from hermes_cli.runtime_provider import (
-                    canonical_custom_identity,
-                )
+                from hermes_cli.runtime_provider import canonical_custom_identity
 
-                provider = (
-                    canonical_custom_identity(base_url=base_url) or provider
-                )
+                provider = canonical_custom_identity(base_url=base_url) or provider
             except Exception:
                 logger.debug(
                     "custom provider identity lookup failed", exc_info=True
@@ -4006,21 +4010,55 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     else:
         config.pop("api_mode", None)
     if isinstance(reasoning_config, dict):
-        config["reasoning_config"] = reasoning_config
+        config["reasoning_config"] = copy.deepcopy(reasoning_config)
     else:
         config.pop("reasoning_config", None)
     if service_tier:
         config["service_tier"] = service_tier
     else:
         config.pop("service_tier", None)
-
-    coding_workflow = str(getattr(agent, "coding_workflow", "") or "").strip()
     if coding_workflow:
         config["coding_workflow"] = coding_workflow
     else:
         config.pop("coding_workflow", None)
-
     return config
+
+
+def _runtime_model_config(agent, existing: dict | None = None) -> dict:
+    """Persist the same runtime fields used by rollover and branch creation."""
+    return _runtime_model_config_from_snapshot(
+        {
+            "model": getattr(agent, "model", ""),
+            "provider": getattr(agent, "provider", ""),
+            "base_url": getattr(agent, "base_url", ""),
+            "api_mode": getattr(agent, "api_mode", ""),
+            "reasoning_config": getattr(agent, "reasoning_config", None),
+            "service_tier": getattr(agent, "service_tier", None),
+            "coding_workflow": getattr(agent, "coding_workflow", ""),
+        },
+        existing,
+    )
+
+
+def _install_canonical_route(
+    session: dict,
+    agent: Any,
+    route: _coding_workflow.CanonicalRoute,
+) -> None:
+    """Install one canonical workflow/reasoning identity in live state."""
+    session["coding_workflow"] = route.coding_workflow
+    reasoning_config = route.reasoning_config
+    if reasoning_config is not None:
+        session["create_reasoning_override"] = copy.deepcopy(reasoning_config)
+    if agent is None:
+        return
+    agent.coding_workflow = route.coding_workflow
+    if reasoning_config is None:
+        return
+    agent.reasoning_config = copy.deepcopy(reasoning_config)
+    primary_runtime = getattr(agent, "_primary_runtime", None)
+    if isinstance(primary_runtime, dict):
+        primary_runtime["reasoning_config"] = copy.deepcopy(reasoning_config)
 
 
 def _persist_live_session_runtime(session: dict | None) -> None:
@@ -4545,32 +4583,36 @@ def _persist_model_switch(result) -> None:
 
 
 def _snapshot_agent_model_runtime(agent) -> dict:
-    """Capture the current agent model runtime for a one-turn restore."""
+    """Capture all mutable route state needed for an exact rollback."""
     return {
         "model": getattr(agent, "model", ""),
         "provider": getattr(agent, "provider", ""),
         "api_key": getattr(agent, "api_key", ""),
         "base_url": getattr(agent, "base_url", ""),
         "api_mode": getattr(agent, "api_mode", ""),
+        "reasoning_config": copy.deepcopy(
+            getattr(agent, "reasoning_config", None)
+        ),
+        "cached_system_prompt": getattr(agent, "_cached_system_prompt", None),
         "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None)),
     }
 
 
 def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
-    """Restore an agent model runtime captured before a one-turn override."""
+    """Restore an agent route without leaking switch-time reasoning or cache."""
     if not snapshot or agent is None:
         return
     primary = snapshot.get("primary_runtime")
+    restored = False
     if primary and hasattr(agent, "_restore_primary_runtime"):
         try:
             agent._primary_runtime = copy.deepcopy(primary)
             agent._fallback_activated = True
             agent._rate_limited_until = 0
-            if agent._restore_primary_runtime():
-                return
+            restored = bool(agent._restore_primary_runtime())
         except Exception:
             logger.debug("TUI one-turn model restore via primary runtime failed", exc_info=True)
-    if hasattr(agent, "switch_model"):
+    if not restored and hasattr(agent, "switch_model"):
         agent.switch_model(
             new_model=snapshot.get("model", ""),
             new_provider=snapshot.get("provider", ""),
@@ -4578,6 +4620,11 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             base_url=snapshot.get("base_url", ""),
             api_mode=snapshot.get("api_mode", ""),
         )
+    agent.reasoning_config = copy.deepcopy(snapshot.get("reasoning_config"))
+    agent._cached_system_prompt = snapshot.get("cached_system_prompt")
+    agent._primary_runtime = copy.deepcopy(primary)
+
+
 
 
 def _apply_model_switch(
@@ -7761,15 +7808,25 @@ def _(rid, params: dict) -> dict:
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
 
+    requested_reasoning = None
+    if effort := str(params.get("reasoning_effort") or "").strip():
+        try:
+            from hermes_constants import parse_reasoning_effort
+
+            requested_reasoning = parse_reasoning_effort(effort)
+        except Exception:
+            requested_reasoning = None
+
     try:
         create_coding_workflow = _coding_workflow.resolve_session_workflow(
             params.get("coding_workflow"),
             {"coding_workflow": {"default": _profile_coding_workflow(profile_home)}},
         )
-        create_provider, create_model = _coding_workflow.canonicalize_controller_route(
+        create_route = _coding_workflow.canonicalize_route(
             create_coding_workflow,
             params.get("provider"),
             params.get("model"),
+            requested_reasoning,
         )
     except _coding_workflow.InvalidCodingWorkflow as exc:
         return _err(rid, 4002, str(exc))
@@ -7777,26 +7834,17 @@ def _(rid, params: dict) -> dict:
     # The desktop composer owns its model/effort/fast as plain UI state and ships
     # it on every session.create. Honor each as a PER-SESSION override (built into
     # the agent below) — never a global config write, so picking a model/effort
-    # for a new chat can't mutate the profile default. Hybrid canonicalization
-    # above supplies the fixed Sol controller when the client omitted its route.
+    # for a new chat can't mutate the profile default. The canonical route binds
+    # Hybrid's fixed Sol controller and mandatory XHigh reasoning atomically.
+    create_coding_workflow = create_route.coding_workflow
+    create_provider = create_route.provider
+    create_model = create_route.model
     session_model_override = (
         {"model": create_model, "provider": create_provider}
         if create_model
         else None
     )
-    create_reasoning_override = None
-    if _coding_workflow.is_hybrid(create_coding_workflow):
-        create_reasoning_override = {
-            "enabled": True,
-            "effort": _coding_workflow.HYBRID_CONTROLLER_THINKING,
-        }
-    elif effort := str(params.get("reasoning_effort") or "").strip():
-        try:
-            from hermes_constants import parse_reasoning_effort
-
-            create_reasoning_override = parse_reasoning_effort(effort)
-        except Exception:
-            create_reasoning_override = None
+    create_reasoning_override = create_route.reasoning_config
     # Presence is part of the contract: omitted means inherit the profile,
     # true pins priority, and false pins normal. Empty string is the internal
     # explicit-normal sentinel because _make_agent uses None for inheritance.
@@ -11219,9 +11267,19 @@ def _(rid, params: dict) -> dict:
     db = _get_db()
     if db is None:
         return _db_unavailable_error(rid, code=5008)
-    old_key = session["session_key"]
-    with session["history_lock"]:
-        history = [dict(msg) for msg in session.get("history", [])]
+
+    try:
+        with _session_transition_lock(session):
+            old_key = session["session_key"]
+            parent_agent = session.get("agent")
+            if parent_agent is None:
+                raise RuntimeError("parent agent is unavailable")
+            runtime_snapshot = _rollover_runtime_snapshot(parent_agent, session)
+            with session["history_lock"]:
+                history = [dict(msg) for msg in session.get("history", [])]
+    except Exception as exc:
+        return _err(rid, 5008, f"branch failed: {exc}")
+
     if not history:
         return _err(rid, 4008, "nothing to branch — send a message first")
     new_key = _new_session_key()
@@ -11246,19 +11304,12 @@ def _(rid, params: dict) -> dict:
         db.create_session(
             new_key,
             source=source,
-            model=_resolve_model(),
-            # Stable _branched_from marker so list_sessions_rich() keeps the
-            # branch visible in /resume and /sessions. The TUI branch leaves
-            # the parent live (no end_reason='branched'), so the legacy
-            # end_reason heuristic never matches it — the marker is the only
-            # thing that surfaces TUI branches. See issue #20856.
-            model_config={
-                "_branched_from": old_key,
-                "coding_workflow": _coding_workflow.normalize_coding_workflow(
-                    session.get("coding_workflow")
-                    or getattr(session.get("agent"), "coding_workflow", "")
-                ),
-            },
+            model=runtime_snapshot["model"],
+            # Stable _branched_from marker keeps the live-parent branch visible
+            # in /resume and /sessions; route metadata makes it restart-safe.
+            model_config=_runtime_model_config_from_snapshot(
+                runtime_snapshot, {"_branched_from": old_key}
+            ),
             parent_session_id=old_key,
             cwd=_session_cwd(session),
         )
@@ -11273,15 +11324,13 @@ def _(rid, params: dict) -> dict:
                 ),
             )
         db.set_session_title(new_key, title)
-    except Exception as e:
+    except Exception as exc:
         if lease is not None:
             lease.release()
-        return _err(rid, 5008, f"branch failed: {e}")
+        return _err(rid, 5008, f"branch failed: {exc}")
+
     try:
-        branch_coding_workflow = _coding_workflow.normalize_coding_workflow(
-            session.get("coding_workflow")
-            or getattr(session.get("agent"), "coding_workflow", "")
-        )
+        branch_coding_workflow = runtime_snapshot["coding_workflow"]
         tokens = _set_session_context(
             new_key,
             coding_workflow=branch_coding_workflow,
@@ -11291,7 +11340,11 @@ def _(rid, params: dict) -> dict:
                 new_sid,
                 new_key,
                 session_id=new_key,
+                session_db=db,
+                reasoning_config_override=runtime_snapshot["reasoning_config"],
+                service_tier_override=runtime_snapshot["service_tier"],
                 platform_override=source,
+                runtime_snapshot=runtime_snapshot,
                 coding_workflow=branch_coding_workflow,
             )
         finally:
@@ -11304,12 +11357,17 @@ def _(rid, params: dict) -> dict:
             cols=session.get("cols", 80),
             source=source,
         )
-        if new_sid in _sessions:
-            _sessions[new_sid]["active_session_lease"] = lease
-    except Exception as e:
+        with _sessions_lock:
+            child_session = _sessions.get(new_sid)
+            if child_session is not None:
+                child_session.update(
+                    _live_session_overrides_from_runtime_snapshot(runtime_snapshot)
+                )
+                child_session["active_session_lease"] = lease
+    except Exception as exc:
         if lease is not None:
             lease.release()
-        return _err(rid, 5000, f"agent init failed on branch: {e}")
+        return _err(rid, 5000, f"agent init failed on branch: {exc}")
     return _ok(rid, {"session_id": new_sid, "title": title, "parent": old_key})
 
 
@@ -14327,23 +14385,17 @@ def _(rid, params: dict) -> dict:
 
         model = str(value.get("model") or "").strip()
         provider = str(value.get("provider") or "").strip()
+        if not model or not provider:
+            return _err(rid, 4002, "route model and provider are required")
         try:
-            coding_workflow = _coding_workflow.validate_coding_workflow(
-                value.get("coding_workflow")
+            route = _coding_workflow.canonicalize_route(
+                value.get("coding_workflow"), provider, model
             )
         except _coding_workflow.InvalidCodingWorkflow as exc:
             return _err(rid, 4002, str(exc))
-        if not model or not provider:
-            return _err(rid, 4002, "route model and provider are required")
-        if _coding_workflow.is_hybrid(coding_workflow) and (
-            provider,
-            model,
-        ) != _coding_workflow.hybrid_controller_route():
-            return _err(
-                rid,
-                4002,
-                "hybrid-v1 requires controller route custom:sudo / gpt-5.6-sol",
-            )
+        model = str(route.model or "")
+        provider = str(route.provider or "")
+        coding_workflow = route.coding_workflow
 
         transition_lock = _session_transition_lock(session)
         with transition_lock:
@@ -14364,7 +14416,9 @@ def _(rid, params: dict) -> dict:
                     4009,
                     "session agent is still building — retry the route switch after session.info",
                 )
-            previous_runtime = _snapshot_agent_model_runtime(agent) if agent is not None else None
+            previous_runtime = (
+                _snapshot_agent_model_runtime(agent) if agent is not None else None
+            )
             try:
                 previous_workflow = _coding_workflow.normalize_coding_workflow(
                     session.get("coding_workflow")
@@ -14378,49 +14432,77 @@ def _(rid, params: dict) -> dict:
                 else previous_workflow
             )
             missing_override = object()
-            previous_override = (
-                copy.deepcopy(session["model_override"])
-                if "model_override" in session
-                else missing_override
-            )
+            previous_overrides = {
+                override_key: (
+                    copy.deepcopy(session[override_key])
+                    if override_key in session
+                    else missing_override
+                )
+                for override_key in (
+                    "model_override",
+                    "create_reasoning_override",
+                )
+            }
 
             try:
-                result = _apply_model_switch(
-                    params.get("session_id", ""),
-                    session,
-                    f"{model} --provider {provider} --session",
-                    confirm_expensive_model=bool(
-                        params.get("confirm_expensive_model", False)
-                    ),
-                    persist_override=False,
-                    defer_session_commit=True,
+                same_live_route = agent is not None and (
+                    str(getattr(agent, "model", "") or "") == model
+                    and str(getattr(agent, "provider", "") or "") == provider
                 )
-                if result.get("confirm_required"):
-                    return _ok(
-                        rid,
-                        {
-                            "key": key,
-                            "value": value,
-                            "warning": result.get("warning", ""),
-                            "confirm_required": True,
-                            "confirm_message": result.get("confirm_message", ""),
-                            "scope": "session",
-                        },
+                if same_live_route:
+                    # A workflow-only change must not rebuild the runtime or
+                    # invalidate its byte-stable cached system prompt.
+                    session["model_override"] = {
+                        "model": model,
+                        "provider": provider,
+                        "base_url": getattr(agent, "base_url", ""),
+                        "api_key": getattr(agent, "api_key", ""),
+                        "api_mode": getattr(agent, "api_mode", ""),
+                    }
+                    result = {
+                        "value": model,
+                        "warning": "",
+                        "confirm_required": False,
+                        "scope": "session",
+                    }
+                else:
+                    result = _apply_model_switch(
+                        params.get("session_id", ""),
+                        session,
+                        f"{model} --provider {provider} --session",
+                        confirm_expensive_model=bool(
+                            params.get("confirm_expensive_model", False)
+                        ),
+                        persist_override=False,
+                        defer_session_commit=True,
                     )
+                    if result.get("confirm_required"):
+                        return _ok(
+                            rid,
+                            {
+                                "key": key,
+                                "value": value,
+                                "warning": result.get("warning", ""),
+                                "confirm_required": True,
+                                "confirm_message": result.get(
+                                    "confirm_message", ""
+                                ),
+                                "scope": "session",
+                            },
+                        )
 
-                session["coding_workflow"] = coding_workflow
-                if agent is not None:
-                    agent.coding_workflow = coding_workflow
+                _install_canonical_route(session, agent, route)
                 _persist_route_runtime_strict(session)
             except Exception as exc:
                 if agent is not None:
                     _restore_agent_model_runtime(agent, previous_runtime)
                     agent.coding_workflow = previous_agent_workflow
                 session["coding_workflow"] = previous_workflow
-                if previous_override is missing_override:
-                    session.pop("model_override", None)
-                else:
-                    session["model_override"] = previous_override
+                for override_key, previous_value in previous_overrides.items():
+                    if previous_value is missing_override:
+                        session.pop(override_key, None)
+                    else:
+                        session[override_key] = previous_value
                 try:
                     _persist_route_runtime_strict(session)
                 except Exception:
@@ -14430,7 +14512,9 @@ def _(rid, params: dict) -> dict:
             if agent is not None:
                 _restart_slash_worker(params.get("session_id", ""), session)
                 effective_model = str(getattr(agent, "model", "") or model)
-                effective_provider = str(getattr(agent, "provider", "") or provider)
+                effective_provider = str(
+                    getattr(agent, "provider", "") or provider
+                )
                 info = _session_info(agent, session)
             else:
                 override = session.get("model_override") or {}

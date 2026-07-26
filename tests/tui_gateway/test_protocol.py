@@ -1352,6 +1352,16 @@ def test_session_branch_persists_branched_from_marker(server, monkeypatch):
     parent_sid = "parent01"
     parent_key = "20260101_000000_parent"
     server._sessions[parent_sid] = {
+        "agent": types.SimpleNamespace(
+            model="test/model",
+            provider="test",
+            base_url="",
+            api_key="",
+            api_mode="chat_completions",
+            reasoning_config=None,
+            service_tier=None,
+            coding_workflow="coupled-v1",
+        ),
         "session_key": parent_key,
         "history": [{"role": "user", "content": "hello"}],
         "history_lock": threading.Lock(),
@@ -1368,10 +1378,15 @@ def test_session_branch_persists_branched_from_marker(server, monkeypatch):
     assert new_key == "20260101_000001_child0"
     assert kwargs["parent_session_id"] == parent_key
     # The marker — without it the branch is invisible in /resume and /sessions.
-    assert kwargs["model_config"] == {
-        "_branched_from": parent_key,
-        "coding_workflow": "coupled-v1",
-    }
+    # The parent route must travel with it, while credentials remain live-only.
+    model_config = kwargs["model_config"]
+    assert model_config["_branched_from"] == parent_key
+    assert model_config["coding_workflow"] == "coupled-v1"
+    assert (model_config["provider"], model_config["model"]) == (
+        "test",
+        "test/model",
+    )
+    assert "api_key" not in model_config
 
 
 def test_session_branch_forwards_original_timestamps(server, monkeypatch):
@@ -1416,6 +1431,16 @@ def test_session_branch_forwards_original_timestamps(server, monkeypatch):
     original_ts = [1_700_000_000.0, 1_700_000_020.0]
     parent_sid = "parent02"
     server._sessions[parent_sid] = {
+        "agent": types.SimpleNamespace(
+            model="test/model",
+            provider="test",
+            base_url="",
+            api_key="",
+            api_mode="chat_completions",
+            reasoning_config=None,
+            service_tier=None,
+            coding_workflow="coupled-v1",
+        ),
         "session_key": "20260101_000000_parent",
         "history": [
             {"role": "user", "content": "hello", "timestamp": original_ts[0]},

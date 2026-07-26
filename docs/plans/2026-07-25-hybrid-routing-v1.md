@@ -11,7 +11,7 @@
 ## Frozen acceptance contract
 
 1. `coding_workflow` is orthogonal to the primary provider/model. Allowed values are exactly `coupled-v1` and `hybrid-v1`. A genuinely absent legacy value degrades to `coupled-v1`; an explicitly stored, received, or requested malformed/unknown value fails closed instead of silently downgrading.
-2. The profile default lives at `coding_workflow.default`. The shipped/default schema remains `coupled-v1`; activation for the orchestrator profile is a separate controlled config change to `hybrid-v1` after candidate verification.
+2. The profile default lives at `coding_workflow.default`. The shipped/default schema remains `coupled-v1`. Candidate installation enables explicit per-session Hybrid canaries but does not change that default; changing the orchestrator profile default to `hybrid-v1` is a later, separately approved decision after the first 20 opt-in runs meet the frozen gates.
 3. A session snapshots its workflow on create, persists it in `sessions.model_config`, restores it on resume/rebuild/branch/rollover/compression continuation, and reports it through `session.info`. A manual session choice always wins over the profile default.
 4. Plain model selection means `coupled-v1`. Selecting Hybrid means `hybrid-v1` and forces the primary controller route to `custom:sudo / gpt-5.6-sol`. A dedicated route RPC canonicalizes the complete target under a per-session route lock, snapshots old agent/session state, applies the switch, commits model plus workflow through a raising DB transaction, then emits exactly one `session.info`. Any failure restores the complete snapshot and emits nothing, so the UI cannot observe partial state.
 5. The Desktop model picker has a dedicated **Workflow Presets** section; Hybrid is not represented as a fake model provider. The pill displays `Hybrid` while the backend continues reporting the real Sol controller provider/model.
@@ -21,7 +21,7 @@
 9. Profile OMP calls in Hybrid mode require explicit `--workflow hybrid-v1 --role ...`; the wrapper validates the explicit mode against `HERMES_CODING_WORKFLOW` when the trusted session variable is present. A mismatch fails closed.
 10. Hybrid route mapping is fixed: `implement` and repair rounds 1–2 use `sudo/glm-5.2-heavy` with `max`; `review`/`audit` independent runs and repair after the two-round budget use `sudo/gpt-5.6-sol` with `xhigh`. Terra is not part of Hybrid v1.
 11. Direct review remains in the Hermes Sol controller and must not spawn OMP. Independent review is mandatory for concurrency/lifecycle, security/auth, durability/transaction, public protocol/schema, cross-language/runtime, more than five production files, more than 300 changed lines, missing executable oracle, any substantive repair, operator request, or controller uncertainty. Every review-context field is explicit and validated; omitted/unknown facts cannot become false. Sol may upgrade but never downgrade this floor.
-12. Direct-accepted runs are independently sampled when `sha256(run_id) % 5 == 0`. Sampling is deterministic and computed by the profile-local Python resolver, never by a model.
+12. Direct-accepted runs are independently sampled when `sha256(run_id) % 5 == 0`. This is an explicit two-stage contract: the decision stage first returns direct review to Hermes, then a post-direct stage may launch the sampled independent review only after the caller records the direct outcome. Sampling is deterministic and computed by the profile-local Python resolver, never by a model.
 13. OMP effective route evidence is read from the attributed JSONL `model_change` and `thinking_level_change` records. Requested flags alone are insufficient. Missing, ambiguous, or mismatched evidence fails closed and is recorded.
 14. GLM infrastructure failure gets one bounded recovery. Every Hybrid invocation uses an isolated session directory plus a PID/fingerprint writer-ownership fence held across all attempts. A timeout resumes the exact attributed UUID once; it never uses `--continue` or opens a fresh GLM session. After recovery failure, Sol executor fallback is allowed only while the same wrapper still owns the fence, the GLM process is verifiably absent, and attribution/ownership is exact. Otherwise the wrapper fails closed. Fallback records `executor_unavailable`.
 15. Semantic review rejection is not infrastructure failure. The same GLM UUID receives at most two targeted repair rounds. A third repair/takeover routes to Sol and requires fresh independent Sol review.
@@ -144,9 +144,10 @@
 
 After all verification and review gates pass, prepare but do not execute:
 
-1. set orchestrator profile `coding_workflow.default: hybrid-v1` while keeping `model.default: gpt-5.6-sol` and `model.provider: custom:sudo`;
-2. promote the sealed candidate;
+1. promote the sealed candidate while keeping `coding_workflow.default` absent or `coupled-v1` and keeping `model.default: gpt-5.6-sol` / `model.provider: custom:sudo`;
+2. install the repaired profile-local policy and wrapper;
 3. restart gateway and Desktop;
-4. run four-way UI/session/OMP canaries and begin the first 20-run evidence ledger.
+4. run four-way UI/session/OMP canaries and collect the first 20 runs through explicit per-session `hybrid-v1` selection;
+5. only after those preregistered gates pass, prepare a separate operator decision to set `coding_workflow.default: hybrid-v1`.
 
-These actions require explicit operator approval because they change the active runtime and restart user-facing processes.
+Promotion/profile installation and the later default change are separate approval boundaries. Neither is implied by candidate verification.
