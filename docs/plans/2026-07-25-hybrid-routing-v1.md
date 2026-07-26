@@ -42,6 +42,15 @@
 | Semantic repair/review lifecycle | Hermes orchestration in v1; Ananke later | No new Hermes DB |
 | Terminal subprocess mode | Session `ContextVar` bridge | Never process-global authority |
 
+### Anti-drift projection rules
+
+- The canonical session route owns `coding_workflow`, durable `requested_provider`, model, and recursively frozen reasoning. The live transport provider remains a separate runtime fact; named custom routes are compared through canonical endpoint identity and never persisted as bare `custom`.
+- Every live model switch and route transaction uses the same field-aware snapshot/restore contract. Rollback restores client/cache, fallback and cooldown state, stale counters, reasoning, primary runtime, transport cache, credential pool, and compressor state without invoking fallback recovery.
+- Branches snapshot the parent route/profile/cwd under the transition lock, build the candidate agent in that profile before durable writes, then persist to the parent profile DB. Any later failure compensates the row/messages/live session and releases the lease.
+- OMP attribution consumes a unique session record rather than a fixed record position, canonicalizes logical/physical cwd aliases, and embeds the resolver's canonical decision in schema-v2 sidecars.
+- Portable packaging copies base plus bounded overlay into one private no-follow snapshot, validates and archives those same bytes, never executes candidate Python, and emits disabled definition-only cron data plus normalized immutable model-context metadata.
+- Mutable rollout status, test counts, metrics, and commit evidence live only in this ledger. Identity prompts and skills contain stable contracts and live verification entry points, not copied current-state claims.
+
 ## Implementation slices
 
 ### Slice 1 — Pure workflow contract and backend persistence (TDD)
