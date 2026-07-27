@@ -33,8 +33,9 @@ class _Agent:
         self.session_id = session_id
         self._session_db = db
         self.model = "openai/gpt-5.6"
-        self.provider = "openai-codex"
-        self.base_url = "https://runtime.invalid/v1"
+        self.provider = "custom"
+        self.requested_provider = "custom:sudo"
+        self.base_url = "https://sudo.example/v1"
         self.api_key = "runtime-secret"
         self.api_mode = "codex_responses"
         self.acp_command = ""
@@ -98,8 +99,8 @@ def _seed_parent(db: SessionDB) -> int:
         model="openai/gpt-5.6",
         model_config={
             "model": "openai/gpt-5.6",
-            "provider": "openai-codex",
-            "base_url": "https://runtime.invalid/v1",
+            "provider": "custom:sudo",
+            "base_url": "https://sudo.example/v1",
             "api_mode": "codex_responses",
             "reasoning_config": {"enabled": True, "effort": "high"},
             "service_tier": "priority",
@@ -182,7 +183,10 @@ def _session(db: SessionDB) -> dict:
         "image_counter": 4,
         "inflight_turn": None,
         "last_active": 2.0,
-        "model_override": {"model": old_agent.model, "provider": old_agent.provider},
+        "model_override": {
+            "model": old_agent.model,
+            "provider": old_agent.requested_provider,
+        },
         "create_reasoning_override": dict(old_agent.reasoning_config),
         "create_service_tier_override": "priority",
         "parent_session_id": None,
@@ -702,7 +706,10 @@ def test_success_commits_bounded_child_and_swaps_same_runtime(rollover_env):
     assert child["git_branch"] == "feature/rollover"
     assert child["git_repo_root"] == "/workspace/project"
     assert child["title"] == "Durable work #2"
-    assert json.loads(child["model_config"])["_rollover_from"] == "predecessor"
+    child_model_config = json.loads(child["model_config"])
+    assert child_model_config["_rollover_from"] == "predecessor"
+    assert child_model_config["provider"] == "custom:sudo"
+    assert "api_key" not in child_model_config
     durable_handoff = env.db.get_messages("successor-1")
     assert [message["role"] for message in durable_handoff] == ["user", "assistant"]
     assert ("Implement the safe runtime swap." in durable_handoff[0]["content"] and durable_handoff[1]["content"].endswith("The exact final assistant response."))
@@ -759,6 +766,7 @@ def test_success_commits_bounded_child_and_swaps_same_runtime(rollover_env):
     runtime = env.build_calls[0]["runtime_snapshot"]
     assert runtime["model"] == old_agent.model
     assert runtime["provider"] == old_agent.provider
+    assert runtime["requested_provider"] == old_agent.requested_provider
     assert runtime["base_url"] == old_agent.base_url
     assert runtime["api_key"] == old_agent.api_key
     assert runtime["api_mode"] == old_agent.api_mode

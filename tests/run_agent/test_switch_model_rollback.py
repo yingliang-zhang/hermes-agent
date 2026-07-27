@@ -188,6 +188,12 @@ def test_successful_switch_still_works_after_rollback_refactor():
 
     new_client = MagicMock(name="NewClient")
     agent._create_openai_client = lambda *_a, **_kw: new_client
+    persisted = []
+    agent._session_db = MagicMock()
+    agent._session_db.update_session_billing_route.side_effect = (
+        lambda session_id, **route: persisted.append((session_id, route))
+    )
+    agent.session_id = "stored-1"
 
     with patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None):
         agent.switch_model(
@@ -200,5 +206,64 @@ def test_successful_switch_still_works_after_rollback_refactor():
 
     assert agent.model == "openai/gpt-5"
     assert agent.provider == "openrouter"
+    assert agent.requested_provider == "openrouter"
     assert agent.api_key == "or-key-new"
     assert agent.client is new_client
+    assert persisted == [
+        (
+            "stored-1",
+            {
+                "provider": "openrouter",
+                "base_url": "https://openrouter.ai/api/v1",
+                "billing_mode": "chat_completions",
+            },
+        )
+    ]
+
+
+def test_successful_switch_can_suppress_all_session_db_writes():
+    agent = _make_agent_openrouter()
+    agent._create_openai_client = lambda *_a, **_kw: MagicMock(name="NewClient")
+    agent._session_db = MagicMock()
+    agent.session_id = "stored-1"
+
+    with patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None):
+        agent.switch_model(
+            new_model="openai/gpt-5",
+            new_provider="openrouter",
+            api_key="or-key-new",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions",
+            persist_session_runtime=False,
+        )
+
+    assert agent.model == "openai/gpt-5"
+    agent._session_db.update_session_billing_route.assert_not_called()
+
+
+def test_successful_switch_can_separate_transport_and_requested_provider():
+    agent = _make_agent_openrouter()
+    agent._create_openai_client = lambda *_a, **_kw: MagicMock(name="CustomClient")
+    agent._session_db = MagicMock()
+    agent.session_id = "stored-1"
+
+    with patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None):
+        agent.switch_model(
+            new_model="gpt-5.6-sol",
+            new_provider="custom",
+            requested_provider="custom:sudo",
+            api_key="sudo-key",
+            base_url="https://sudo.example/v1",
+            api_mode="chat_completions",
+        )
+
+    assert agent.provider == "custom"
+    assert agent.requested_provider == "custom:sudo"
+    assert agent._primary_runtime["provider"] == "custom"
+    assert agent._primary_runtime["requested_provider"] == "custom:sudo"
+    agent._session_db.update_session_billing_route.assert_called_once_with(
+        "stored-1",
+        provider="custom",
+        base_url="https://sudo.example/v1",
+        billing_mode="chat_completions",
+    )

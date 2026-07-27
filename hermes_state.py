@@ -4689,6 +4689,42 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def update_session_route(
+        self,
+        session_id: str,
+        *,
+        model: str,
+        model_config_json: str,
+        provider: str,
+        base_url: str,
+        billing_mode: Optional[str],
+        clear_system_prompt: bool,
+    ) -> None:
+        """Commit one complete runtime route in a single write transaction."""
+
+        def _do(conn):
+            conn.execute(
+                """UPDATE sessions SET
+                   model = ?,
+                   model_config = ?,
+                   billing_provider = ?,
+                   billing_base_url = ?,
+                   billing_mode = ?,
+                   system_prompt = CASE WHEN ? THEN NULL ELSE system_prompt END
+                   WHERE id = ?""",
+                (
+                    model,
+                    model_config_json,
+                    provider,
+                    base_url,
+                    billing_mode,
+                    bool(clear_system_prompt),
+                    session_id,
+                ),
+            )
+
+        self._execute_write(_do)
+
     def update_session_billing_route(
         self,
         session_id: str,

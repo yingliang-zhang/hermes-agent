@@ -2900,15 +2900,33 @@ def _rollover_handoff_from_history(history: list, fence: RolloverFence) -> list[
     )
 
 
+def _validated_runtime_provider_identities(
+    runtime: dict, *, context: str
+) -> tuple[str, str]:
+    """Return transport/durable identities or reject an incoherent snapshot."""
+    provider = str(runtime.get("provider") or "").strip()
+    requested_provider = str(runtime.get("requested_provider") or "").strip()
+    if not provider or not requested_provider:
+        raise ValueError(f"{context} provider identities are incomplete")
+
+    transport_is_custom = provider.lower() == "custom"
+    transport_is_named_custom = provider.lower().startswith("custom:")
+    requested_is_custom = requested_provider.lower().startswith("custom:")
+    if transport_is_named_custom or transport_is_custom != requested_is_custom:
+        raise ValueError(f"{context} provider identities are contradictory")
+    return provider, requested_provider
+
+
 def _rollover_runtime_snapshot(agent: Any, session: dict | None = None) -> dict:
     """Capture the live route needed to build an equivalent fresh agent."""
+    provider = str(getattr(agent, "provider", "") or "").strip()
+    requested_provider = str(
+        getattr(agent, "requested_provider", "") or ""
+    ).strip()
     snapshot = {
         "model": str(getattr(agent, "model", "") or ""),
-        "provider": str(
-            getattr(agent, "requested_provider", None)
-            or getattr(agent, "provider", "")
-            or ""
-        ),
+        "provider": provider,
+        "requested_provider": requested_provider,
         "base_url": str(getattr(agent, "base_url", "") or ""),
         "api_key": str(getattr(agent, "api_key", "") or ""),
         "api_mode": str(getattr(agent, "api_mode", "") or ""),
@@ -2951,8 +2969,9 @@ def _rollover_runtime_snapshot(agent: Any, session: dict | None = None) -> dict:
             or getattr(agent, "coding_workflow", "")
         ),
     }
-    if not snapshot["model"] or not snapshot["provider"]:
+    if not snapshot["model"]:
         raise ValueError("rollover requires a resolved live model route")
+    _validated_runtime_provider_identities(snapshot, context="rollover runtime")
     return snapshot
 
 
@@ -2962,15 +2981,20 @@ def _live_session_overrides_from_runtime_snapshot(
     include_api_key: bool = True,
 ) -> dict:
     """Project one runtime snapshot into rebuild-safe live session fields."""
-    model_fields = ("model", "provider", "base_url", "api_key", "api_mode")
-    if not include_api_key:
-        model_fields = ("model", "provider", "base_url", "api_mode")
+    _, requested_provider = _validated_runtime_provider_identities(
+        runtime_snapshot, context="live session runtime"
+    )
+    model_override = {
+        "model": runtime_snapshot.get("model"),
+        "provider": requested_provider,
+        "base_url": runtime_snapshot.get("base_url"),
+        "api_mode": runtime_snapshot.get("api_mode"),
+    }
+    if include_api_key:
+        model_override["api_key"] = runtime_snapshot.get("api_key")
+    model_override = {key: value for key, value in model_override.items() if value}
     return {
-        "model_override": {
-            key: runtime_snapshot.get(key)
-            for key in model_fields
-            if runtime_snapshot.get(key)
-        },
+        "model_override": model_override,
         "create_reasoning_override": copy.deepcopy(
             runtime_snapshot.get("reasoning_config")
         ),
@@ -3983,7 +4007,9 @@ def _runtime_model_config_from_snapshot(
     """Project one resolved runtime snapshot into durable session metadata."""
     config = dict(existing or {})
     model = str(runtime.get("model") or "").strip()
-    provider = str(runtime.get("provider") or "").strip()
+    _provider, requested_provider = _validated_runtime_provider_identities(
+        runtime, context="durable runtime"
+    )
     base_url = str(runtime.get("base_url") or "").strip()
     api_mode = str(runtime.get("api_mode") or "").strip()
     reasoning_config = runtime.get("reasoning_config")
@@ -3992,19 +4018,7 @@ def _runtime_model_config_from_snapshot(
 
     if model:
         config["model"] = model
-    if provider:
-        if provider.lower() == "custom":
-            # A resolved bare ``custom`` billing class is not routable on
-            # resume. Recover the named provider identity from its endpoint.
-            try:
-                from hermes_cli.runtime_provider import canonical_custom_identity
-
-                provider = canonical_custom_identity(base_url=base_url) or provider
-            except Exception:
-                logger.debug(
-                    "custom provider identity lookup failed", exc_info=True
-                )
-        config["provider"] = provider
+    config["provider"] = requested_provider
     if base_url:
         config["base_url"] = base_url
     else:
@@ -4033,8 +4047,8 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     return _runtime_model_config_from_snapshot(
         {
             "model": getattr(agent, "model", ""),
-            "provider": getattr(agent, "requested_provider", None)
-            or getattr(agent, "provider", ""),
+            "provider": getattr(agent, "provider", ""),
+            "requested_provider": getattr(agent, "requested_provider", ""),
             "base_url": getattr(agent, "base_url", ""),
             "api_mode": getattr(agent, "api_mode", ""),
             "reasoning_config": getattr(agent, "reasoning_config", None),
@@ -4043,6 +4057,39 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
         },
         existing,
     )
+
+
+def _replace_route_container(current: Any, replacement: Any, seen=None) -> Any:
+    """Replace route-owned values while retaining compatible container identities."""
+    seen = seen if seen is not None else set()
+    pair = (id(current), id(replacement))
+    if pair in seen:
+        return current
+    seen.add(pair)
+    if isinstance(current, dict) and isinstance(replacement, dict):
+        for key in tuple(current):
+            if key not in replacement:
+                del current[key]
+        for key, value in replacement.items():
+            if key in current:
+                current[key] = _replace_route_container(current[key], value, seen)
+            else:
+                current[key] = value
+        return current
+    if isinstance(current, list) and isinstance(replacement, list):
+        common = min(len(current), len(replacement))
+        for index in range(common):
+            current[index] = _replace_route_container(
+                current[index], replacement[index], seen
+            )
+        del current[common:]
+        current.extend(replacement[common:])
+        return current
+    if isinstance(current, set) and isinstance(replacement, set):
+        current.clear()
+        current.update(replacement)
+        return current
+    return replacement
 
 
 def _install_canonical_route(
@@ -4054,28 +4101,33 @@ def _install_canonical_route(
     session["coding_workflow"] = route.coding_workflow
     if route.model and route.requested_provider:
         model_override = session.get("model_override")
-        durable_override = (
-            dict(model_override) if isinstance(model_override, dict) else {}
-        )
-        durable_override.update(
+        if not isinstance(model_override, dict):
+            model_override = {}
+            session["model_override"] = model_override
+        model_override.update(
             {"model": route.model, "provider": route.requested_provider}
         )
-        session["model_override"] = durable_override
 
     reasoning_config = route.reasoning_config
     if reasoning_config is not None:
-        session["create_reasoning_override"] = copy.deepcopy(reasoning_config)
+        session["create_reasoning_override"] = _replace_route_container(
+            session.get("create_reasoning_override"), reasoning_config
+        )
     if agent is None:
         return
     agent.coding_workflow = route.coding_workflow
     agent.requested_provider = route.requested_provider
     if reasoning_config is not None:
-        agent.reasoning_config = copy.deepcopy(reasoning_config)
+        agent.reasoning_config = _replace_route_container(
+            getattr(agent, "reasoning_config", None), reasoning_config
+        )
     primary_runtime = getattr(agent, "_primary_runtime", None)
     if isinstance(primary_runtime, dict):
         primary_runtime["requested_provider"] = route.requested_provider
         if reasoning_config is not None:
-            primary_runtime["reasoning_config"] = copy.deepcopy(reasoning_config)
+            primary_runtime["reasoning_config"] = _replace_route_container(
+                primary_runtime.get("reasoning_config"), reasoning_config
+            )
 
 
 def _persist_live_session_runtime(session: dict | None) -> None:
@@ -4117,8 +4169,10 @@ def _persist_live_session_runtime(session: dict | None) -> None:
         logger.debug("failed to persist live session runtime", exc_info=True)
 
 
-def _persist_route_runtime_strict(session: dict) -> None:
-    """Persist one route triple atomically, raising so the caller can rollback."""
+def _persist_route_runtime_strict(
+    session: dict, *, clear_system_prompt: bool
+) -> None:
+    """Persist one complete route state atomically or raise without side effects."""
     agent = session.get("agent")
     session_key = str(session.get("session_key") or "").strip()
     if agent is None or not session_key:
@@ -4126,7 +4180,7 @@ def _persist_route_runtime_strict(session: dict) -> None:
 
     db = getattr(agent, "_session_db", None) or _get_db()
     if db is None:
-        return
+        raise RuntimeError("session database unavailable for route persistence")
 
     row = db.get_session(session_key) or {}
     raw_config = row.get("model_config")
@@ -4142,10 +4196,17 @@ def _persist_route_runtime_strict(session: dict) -> None:
     if create_service_tier_override is not None:
         model_config["service_tier"] = create_service_tier_override or "normal"
     model = str(getattr(agent, "model", "") or "").strip()
-    if hasattr(db, "update_session_meta"):
-        db.update_session_meta(session_key, json.dumps(model_config), model or None)
-    elif model and hasattr(db, "update_session_model"):
-        db.update_session_model(session_key, model)
+    if not model:
+        raise RuntimeError("live route has no model")
+    db.update_session_route(
+        session_key,
+        model=model,
+        model_config_json=json.dumps(model_config),
+        provider=str(getattr(agent, "provider", "") or "").strip(),
+        base_url=str(getattr(agent, "base_url", "") or "").strip(),
+        billing_mode=getattr(agent, "api_mode", None),
+        clear_system_prompt=clear_system_prompt,
+    )
 
 
 def _persist_live_session_system_prompt(session: dict | None) -> None:
@@ -4783,10 +4844,15 @@ def _apply_model_switch(
         try:
             agent.switch_model(
                 new_model=result.new_model,
-                new_provider=result.target_provider,
+                new_provider=(
+                    getattr(result, "runtime_provider", "")
+                    or result.target_provider
+                ),
+                requested_provider=result.target_provider,
                 api_key=result.api_key,
                 base_url=result.base_url,
                 api_mode=result.api_mode,
+                persist_session_runtime=not defer_session_commit,
             )
         except Exception as exc:
             # The in-place swap rolled the agent back to the old working
@@ -6650,8 +6716,11 @@ def _make_agent(
     # also pass scalar model/provider/runtime knobs from the persisted DB row.
     if runtime_snapshot is not None:
         model = str(runtime_snapshot.get("model") or "")
+        provider, requested_provider = _validated_runtime_provider_identities(
+            runtime_snapshot, context="rollover runtime"
+        )
         runtime = {
-            "provider": runtime_snapshot.get("provider"),
+            "provider": provider,
             "base_url": runtime_snapshot.get("base_url"),
             "api_key": runtime_snapshot.get("api_key"),
             "api_mode": runtime_snapshot.get("api_mode"),
@@ -6659,7 +6728,7 @@ def _make_agent(
             "args": list(runtime_snapshot.get("acp_args") or []),
             "credential_pool": runtime_snapshot.get("credential_pool"),
         }
-        if not model or not runtime["provider"]:
+        if not model:
             raise RuntimeError("rollover runtime snapshot is incomplete")
     elif isinstance(model_override, dict) and model_override.get("model"):
         model = str(model_override.get("model") or "")
@@ -6695,6 +6764,12 @@ def _make_agent(
         resolve_kwargs["target_model"] = model or None
         resolution = _resolve_runtime_with_fallback(resolve_kwargs)
         runtime = resolution.runtime
+        requested_provider = str(
+            runtime.get("requested_provider")
+            or requested_provider
+            or runtime.get("provider")
+            or ""
+        ).strip()
         if resolution.used_fallback:
             if not resolution.selected_model:
                 raise RuntimeError("Auth fallback resolved without a model")
@@ -6722,6 +6797,12 @@ def _make_agent(
             }
         )
         runtime = resolution.runtime
+        requested_provider = str(
+            runtime.get("requested_provider")
+            or requested_provider
+            or runtime.get("provider")
+            or ""
+        ).strip()
         if resolution.used_fallback:
             if not resolution.selected_model:
                 raise RuntimeError("Auth fallback resolved without a model")
@@ -6731,6 +6812,7 @@ def _make_agent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 90),
         provider=runtime.get("provider"),
+        requested_provider=requested_provider,
         base_url=runtime.get("base_url"),
         api_key=runtime.get("api_key"),
         api_mode=runtime.get("api_mode"),
@@ -14520,18 +14602,12 @@ def _(rid, params: dict) -> dict:
                 if agent is not None
                 else previous_workflow
             )
-            missing_override = object()
-            previous_overrides = {
-                override_key: (
-                    copy.deepcopy(session[override_key])
-                    if override_key in session
-                    else missing_override
-                )
-                for override_key in (
-                    "model_override",
-                    "create_reasoning_override",
-                )
-            }
+            from agent.agent_runtime_helpers import snapshot_mapping_field_state
+
+            previous_overrides = snapshot_mapping_field_state(
+                session,
+                ("model_override", "create_reasoning_override"),
+            )
 
             try:
                 same_live_route = agent is not None and (
@@ -14586,21 +14662,17 @@ def _(rid, params: dict) -> dict:
                         )
 
                 _install_canonical_route(session, agent, route)
-                _persist_route_runtime_strict(session)
+                _persist_route_runtime_strict(
+                    session, clear_system_prompt=not same_live_route
+                )
             except Exception as exc:
                 if agent is not None:
                     _restore_agent_model_runtime(agent, previous_runtime)
                     agent.coding_workflow = previous_agent_workflow
                 session["coding_workflow"] = previous_workflow
-                for override_key, previous_value in previous_overrides.items():
-                    if previous_value is missing_override:
-                        session.pop(override_key, None)
-                    else:
-                        session[override_key] = previous_value
-                try:
-                    _persist_route_runtime_strict(session)
-                except Exception:
-                    logger.debug("failed to persist route rollback", exc_info=True)
+                from agent.agent_runtime_helpers import restore_mapping_field_state
+
+                restore_mapping_field_state(session, previous_overrides)
                 return _err(rid, 5001, str(exc))
 
             if agent is not None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import threading
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -17,7 +17,8 @@ def _agent(workflow: str = "hybrid-v1") -> SimpleNamespace:
     return SimpleNamespace(
         coding_workflow=workflow,
         model="gpt-5.6-sol",
-        provider="custom:sudo",
+        provider="custom",
+        requested_provider="custom:sudo",
         reasoning_config=None,
         service_tier=None,
         session_id="stored-1",
@@ -28,6 +29,7 @@ def _agent(workflow: str = "hybrid-v1") -> SimpleNamespace:
 def test_runtime_model_config_roundtrip_and_malformed_stored_value_fails_closed(monkeypatch):
     agent = _agent()
     agent.provider = "anthropic"
+    agent.requested_provider = "anthropic"
 
     config = server._runtime_model_config(agent)
     assert config["coding_workflow"] == "hybrid-v1"
@@ -38,6 +40,66 @@ def test_runtime_model_config_roundtrip_and_malformed_stored_value_fails_closed(
     row["model_config"] = json.dumps({"coding_workflow": "unknown-v9"})
     with pytest.raises(ValueError, match="coding workflow"):
         server._stored_session_runtime_overrides(row)
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        {"model": "gpt", "provider": "custom", "requested_provider": ""},
+        {
+            "model": "gpt",
+            "provider": "custom",
+            "requested_provider": "anthropic",
+        },
+        {
+            "model": "gpt",
+            "provider": "custom:sudo",
+            "requested_provider": "custom:sudo",
+        },
+    ],
+)
+def test_runtime_snapshot_projection_rejects_incomplete_or_contradictory_identities(
+    runtime,
+):
+    with pytest.raises(ValueError, match="provider identit"):
+        server._runtime_model_config_from_snapshot(runtime)
+
+
+def test_make_agent_runtime_snapshot_passes_transport_and_requested_provider(
+    monkeypatch,
+):
+    from run_agent import AIAgent
+
+    runtime_snapshot = {
+        "model": "gpt-5.6-sol",
+        "provider": "custom",
+        "requested_provider": "custom:sudo",
+        "base_url": "https://sudo.example/v1",
+        "api_key": "runtime-secret",
+        "api_mode": "codex_responses",
+        "coding_workflow": "hybrid-v1",
+        "reasoning_config": {"enabled": True, "effort": "xhigh"},
+    }
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"agent": {}})
+    monkeypatch.setattr(server, "_get_db", lambda: object())
+    monkeypatch.setattr(server, "_load_reasoning_config", lambda _model: None)
+    monkeypatch.setattr(server, "_load_service_tier", lambda: None)
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: None)
+    monkeypatch.setattr(server, "_load_provider_routing", lambda: {})
+    monkeypatch.setattr(server, "_load_fallback_model", lambda: [])
+    monkeypatch.setattr(server, "_agent_cbs", lambda _sid: {})
+
+    with patch("run_agent.AIAgent", autospec=AIAgent) as constructor:
+        server._make_agent(
+            "runtime-1",
+            "stored-1",
+            runtime_snapshot=runtime_snapshot,
+            reasoning_config_override=runtime_snapshot["reasoning_config"],
+        )
+
+    kwargs = constructor.call_args.kwargs
+    assert kwargs["provider"] == "custom"
+    assert kwargs["requested_provider"] == "custom:sudo"
+    assert kwargs["api_key"] == "runtime-secret"
 
 
 def test_deferred_record_lazy_info_and_session_info_project_workflow(monkeypatch, tmp_path):
@@ -226,6 +288,7 @@ class _RouteAgent:
     def __init__(self):
         self.model = "old-model"
         self.provider = "old-provider"
+        self.requested_provider = self.provider
         self.api_key = "old-key"
         self.base_url = "https://old.invalid/v1"
         self.api_mode = "chat_completions"
@@ -238,10 +301,25 @@ class _RouteAgent:
             "reasoning_config": dict(self.reasoning_config),
         }
         self.coding_workflow = "coupled-v1"
+        self.switch_persistence_flags = []
+        self.switch_identity_calls = []
 
-    def switch_model(self, *, new_model, new_provider, api_key, base_url, api_mode):
+    def switch_model(
+        self,
+        *,
+        new_model,
+        new_provider,
+        api_key,
+        base_url,
+        api_mode,
+        requested_provider=None,
+        persist_session_runtime=True,
+    ):
+        self.switch_persistence_flags.append(persist_session_runtime)
+        self.switch_identity_calls.append((new_provider, requested_provider))
         self.model = new_model
         self.provider = new_provider
+        self.requested_provider = requested_provider or new_provider
         self.api_key = api_key
         self.base_url = base_url
         self.api_mode = api_mode
@@ -250,6 +328,7 @@ class _RouteAgent:
         self._primary_runtime = {
             "model": new_model,
             "provider": new_provider,
+            "requested_provider": self.requested_provider,
             "reasoning_config": dict(self.reasoning_config),
         }
 
@@ -262,8 +341,28 @@ def test_live_hybrid_route_installs_and_persists_xhigh_reasoning(monkeypatch):
             assert session_key == "stored-1"
             return {"model_config": json.dumps({"retained": "value"})}
 
-        def update_session_meta(self, session_key, model_config, model):
-            updates.append((session_key, json.loads(model_config), model))
+        def update_session_route(
+            self,
+            session_key,
+            *,
+            model,
+            model_config_json,
+            provider,
+            base_url,
+            billing_mode,
+            clear_system_prompt,
+        ):
+            updates.append(
+                (
+                    session_key,
+                    json.loads(model_config_json),
+                    model,
+                    provider,
+                    base_url,
+                    billing_mode,
+                    clear_system_prompt,
+                )
+            )
 
     agent = _RouteAgent()
     agent._session_db = RouteDB()
@@ -311,8 +410,126 @@ def test_live_hybrid_route_installs_and_persists_xhigh_reasoning(monkeypatch):
                 "coding_workflow": "hybrid-v1",
             },
             "gpt-5.6-sol",
+            "custom",
+            "https://new.invalid/v1",
+            "chat_completions",
+            True,
         )
     ]
+
+
+def test_deferred_model_switch_suppresses_agent_session_db_persistence(monkeypatch):
+    from hermes_cli import model_switch
+
+    agent = _RouteAgent()
+    result = SimpleNamespace(
+        success=True,
+        error_message="",
+        warning_message="",
+        new_model="gpt-5.6-sol",
+        target_provider="custom:sudo",
+        runtime_provider="custom",
+        api_key="new-key",
+        base_url="https://sudo.example/v1",
+        api_mode="chat_completions",
+        model_info=None,
+    )
+    monkeypatch.setattr(model_switch, "switch_model", lambda **_kwargs: result)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+
+    response = server._apply_model_switch(
+        "runtime-1",
+        {"agent": agent, "history": []},
+        "gpt-5.6-sol --provider custom:sudo --session",
+        confirm_expensive_model=True,
+        persist_override=False,
+        defer_session_commit=True,
+    )
+
+    assert response["value"] == "gpt-5.6-sol"
+    assert agent.switch_persistence_flags == [False]
+    assert agent.provider == "custom"
+    assert agent.requested_provider == "custom:sudo"
+    assert agent.switch_identity_calls == [("custom", "custom:sudo")]
+
+
+def test_named_custom_route_switch_is_transport_safe_and_atomic(monkeypatch):
+    from hermes_cli import config as hermes_config
+    from hermes_cli import model_switch, runtime_provider
+
+    sudo_url = "https://sudo.example/v1"
+    config = {"providers": {"sudo": {"api": sudo_url}}}
+    result = model_switch.ModelSwitchResult(
+        success=True,
+        new_model="gpt-5.6-sol",
+        target_provider="custom:sudo",
+        runtime_provider="custom",
+        api_key="sudo-key",
+        base_url=sudo_url,
+        api_mode="chat_completions",
+    )
+    switch_calls = []
+    updates = []
+
+    class RouteDB:
+        def get_session(self, session_key):
+            assert session_key == "stored-1"
+            return {"model_config": json.dumps({"retained": "value"})}
+
+        def update_session_route(self, session_key, **values):
+            updates.append(
+                {
+                    "session_key": session_key,
+                    **values,
+                    "model_config": json.loads(values["model_config_json"]),
+                }
+            )
+
+    def resolve_switch(**kwargs):
+        switch_calls.append(kwargs)
+        return result
+
+    monkeypatch.setattr(model_switch, "switch_model", resolve_switch)
+    monkeypatch.setattr(hermes_config, "load_config", lambda: config)
+    monkeypatch.setattr(runtime_provider, "load_config", lambda: config)
+    agent = _RouteAgent()
+    agent._session_db = RouteDB()
+    session = {
+        "agent": agent,
+        "coding_workflow": "coupled-v1",
+        "running": False,
+        "session_key": "stored-1",
+    }
+    monkeypatch.setattr(server, "_sessions", {"runtime-1": session})
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_emit", lambda *_args: None)
+    request = {
+        "session_id": "runtime-1",
+        "key": "route",
+        "value": {
+            "model": "gpt-5.6-sol",
+            "provider": "custom:sudo",
+            "coding_workflow": "hybrid-v1",
+        },
+        "confirm_expensive_model": True,
+    }
+
+    first = server._methods["config.set"]("r1", request)
+    second = server._methods["config.set"]("r2", request)
+
+    assert "error" not in first, first
+    assert "error" not in second, second
+    assert len(switch_calls) == 1
+    assert agent.provider == "custom"
+    assert agent.requested_provider == "custom:sudo"
+    assert session["model_override"]["provider"] == "custom:sudo"
+    assert [update["provider"] for update in updates] == ["custom", "custom"]
+    assert [update["model_config"]["provider"] for update in updates] == [
+        "custom:sudo",
+        "custom:sudo",
+    ]
+    assert [update["clear_system_prompt"] for update in updates] == [True, False]
 
 
 def test_workflow_only_hybrid_switch_skips_model_switch_and_preserves_cache(monkeypatch):
@@ -356,7 +573,7 @@ def test_workflow_only_hybrid_switch_skips_model_switch_and_preserves_cache(monk
     expected_reasoning = {"enabled": True, "effort": "xhigh"}
     assert "error" not in response, response
     apply_switch.assert_not_called()
-    persist_route.assert_called_once_with(session)
+    persist_route.assert_called_once_with(session, clear_system_prompt=False)
     assert agent._cached_system_prompt is cache_before
     assert session["history"] == history
     assert agent.reasoning_config == expected_reasoning
@@ -426,11 +643,15 @@ def test_named_custom_transport_matches_durable_hybrid_route_without_cache_break
     assert session["model_override"]["provider"] == "custom:sudo"
     assert server._runtime_model_config(agent)["provider"] == "custom:sudo"
     runtime_snapshot = server._rollover_runtime_snapshot(agent, session)
-    assert runtime_snapshot["provider"] == "custom:sudo"
+    assert runtime_snapshot["provider"] == "custom"
+    assert runtime_snapshot["requested_provider"] == "custom:sudo"
     assert response["result"]["value"]["provider"] == "custom:sudo"
 
 
-def test_route_persist_failure_rolls_back_full_runtime_and_emits_nothing(monkeypatch):
+def test_route_persist_failure_rolls_back_full_runtime_and_emits_nothing(
+    monkeypatch, tmp_path
+):
+    from hermes_state import SessionDB
     agent = _RouteAgent()
     agent.requested_provider = "custom:old"
     agent.client = object()
@@ -444,8 +665,13 @@ def test_route_persist_failure_rolls_back_full_runtime_and_emits_nothing(monkeyp
     agent._use_native_cache_layout = False
     agent._fallback_activated = True
     agent._fallback_index = 2
+    fallback_opaque = object()
     agent._fallback_chain = [
-        {"provider": "fallback-a", "model": "fallback-model-a"},
+        {
+            "provider": "fallback-a",
+            "model": "fallback-model-a",
+            "metadata": {"attempts": [1], "opaque": fallback_opaque},
+        },
         {"provider": "fallback-b", "model": "fallback-model-b"},
         {"provider": "fallback-c", "model": "fallback-model-c"},
     ]
@@ -453,7 +679,9 @@ def test_route_persist_failure_rolls_back_full_runtime_and_emits_nothing(monkeyp
     agent._rate_limited_until = 9876.5
     agent._consecutive_stale_streams = 7
     transport = object()
-    agent._transport_cache = {"chat_completions": transport}
+    transport_headers = ["stable"]
+    transport_state = {"client": transport, "headers": transport_headers}
+    agent._transport_cache = {"chat_completions": transport_state}
     agent._credential_pool = object()
     agent._config_context_length = 123_456
     agent.context_compressor = SimpleNamespace(
@@ -480,37 +708,141 @@ def test_route_persist_failure_rolls_back_full_runtime_and_emits_nothing(monkeyp
         _ineffective_compression_count=4,
         _fallback_compression_streak=5,
         _summary_failure_cooldown_until=4321.5,
-        _last_summary_error="compressor failure sentinel",
+        _last_summary_error={
+            "messages": ["compressor failure sentinel"],
+            "opaque": object(),
+        },
         _consecutive_timeout_failures=6,
         _cooldown_persist_failed=True,
         _verify_compaction_cleared_threshold=True,
         _last_compression_made_progress=True,
     )
-    reasoning_before = dict(agent.reasoning_config)
+    reasoning_opaque = object()
+    agent.reasoning_config = {
+        "enabled": True,
+        "effort": "low",
+        "nested": {"levels": ["low"], "opaque": reasoning_opaque},
+    }
+    primary_reasoning = {
+        "enabled": True,
+        "effort": "low",
+        "nested": {"levels": ["low"], "opaque": reasoning_opaque},
+    }
+    agent._primary_runtime["reasoning_config"] = primary_reasoning
+    reasoning_before_ref = agent.reasoning_config
+    reasoning_nested_before_ref = agent.reasoning_config["nested"]
+    reasoning_levels_before_ref = reasoning_nested_before_ref["levels"]
+    reasoning_before = {
+        "enabled": True,
+        "effort": "low",
+        "nested": {"levels": ["low"], "opaque": reasoning_opaque},
+    }
     cache_before = agent._cached_system_prompt
     primary_before_ref = agent._primary_runtime
-    primary_before = json.loads(json.dumps(agent._primary_runtime))
+    primary_reasoning_before_ref = primary_before_ref["reasoning_config"]
+    primary_nested_before_ref = primary_reasoning_before_ref["nested"]
+    primary_levels_before_ref = primary_nested_before_ref["levels"]
+    primary_before = {
+        "model": "old-model",
+        "provider": "old-provider",
+        "reasoning_config": {
+            "enabled": True,
+            "effort": "low",
+            "nested": {"levels": ["low"], "opaque": reasoning_opaque},
+        },
+    }
     client_before = agent.client
     anthropic_client_before = agent._anthropic_client
     client_kwargs_before = agent._client_kwargs
     fallback_chain_before = agent._fallback_chain
     fallback_model_before = agent._fallback_model
+    fallback_entry_before = fallback_chain_before[0]
+    fallback_metadata_before = fallback_entry_before["metadata"]
+    fallback_attempts_before = fallback_metadata_before["attempts"]
     transport_cache_before = agent._transport_cache
     credential_pool_before = agent._credential_pool
     compressor_before = agent.context_compressor
+    transport_state_before = transport_state
+    transport_headers_before = transport_headers
     compressor_state_before = dict(vars(compressor_before))
+    compressor_error_before = compressor_before._last_summary_error
+    compressor_messages_before = compressor_error_before["messages"]
+    model_override = {
+        "model": "old-model",
+        "provider": "custom:old",
+        "fallback": {"entries": ["old"], "opaque": object()},
+    }
+    session_reasoning = {
+        "enabled": True,
+        "effort": "low",
+        "nested": {"levels": ["low"], "opaque": object()},
+    }
+    model_override_nested_before = model_override["fallback"]
+    model_override_entries_before = model_override_nested_before["entries"]
+    session_reasoning_nested_before = session_reasoning["nested"]
+    session_reasoning_levels_before = session_reasoning_nested_before["levels"]
     session = {
         "agent": agent,
         "coding_workflow": "coupled-v1",
-        "model_override": {"model": "old-model", "provider": "old-provider"},
-        "create_reasoning_override": dict(reasoning_before),
+        "model_override": model_override,
+        "create_reasoning_override": session_reasoning,
         "running": False,
         "session_key": "stored-1",
     }
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(
+        "stored-1",
+        source="desktop",
+        model="old-model",
+        model_config={"model": "old-model", "provider": "custom:old"},
+        system_prompt="stable prompt bytes",
+    )
+    db.update_session_billing_route(
+        "stored-1",
+        provider="old-provider",
+        base_url="https://old.invalid/v1",
+        billing_mode="chat_completions",
+    )
+    db.update_system_prompt("stored-1", "stable prompt bytes")
+    agent._session_db = db
+    db_before = {
+        key: db.get_session("stored-1")[key]
+        for key in (
+            "model",
+            "model_config",
+            "billing_provider",
+            "billing_base_url",
+            "billing_mode",
+            "system_prompt",
+        )
+    }
+    db._conn.execute(
+        """CREATE TRIGGER fail_route_update
+        BEFORE UPDATE OF model, model_config, billing_provider, billing_base_url,
+                         billing_mode, system_prompt ON sessions
+        WHEN OLD.id = 'stored-1'
+        BEGIN
+            SELECT RAISE(ABORT, 'disk full');
+        END"""
+    )
+    db._conn.commit()
 
     def mutate_every_switch_field(_sid, current, _raw, **kwargs):
         assert kwargs["defer_session_commit"] is True
         switched = current["agent"]
+        switched.reasoning_config["nested"]["levels"].append("mutated")
+        switched._primary_runtime["reasoning_config"]["nested"]["levels"].append(
+            "mutated"
+        )
+        switched._fallback_chain[0]["metadata"]["attempts"].append(2)
+        switched._transport_cache["chat_completions"]["headers"].append("mutated")
+        switched.context_compressor._last_summary_error["messages"].append(
+            "mutated"
+        )
+        current["model_override"]["fallback"]["entries"].append("mutated")
+        current["create_reasoning_override"]["nested"]["levels"].append(
+            "mutated"
+        )
         switched.model = "gpt-5.6-sol"
         switched.provider = "custom"
         switched.requested_provider = "custom:sudo"
@@ -535,10 +867,14 @@ def test_route_persist_failure_rolls_back_full_runtime_and_emits_nothing(monkeyp
         }
         switched._fallback_activated = False
         switched._fallback_index = 0
+        switched._fallback_chain.clear()
         switched._fallback_chain = []
         switched._fallback_model = None
         switched._rate_limited_until = 0
         switched._consecutive_stale_streams = 0
+        switched._transport_cache["chat_completions"]["headers"].append(
+            "mutated-again"
+        )
         switched._transport_cache.clear()
         switched._credential_pool = object()
         switched._config_context_length = None
@@ -578,6 +914,10 @@ def test_route_persist_failure_rolls_back_full_runtime_and_emits_nothing(monkeyp
             "model": switched.model,
             "provider": "custom:sudo",
         }
+        current["create_reasoning_override"] = {
+            "enabled": True,
+            "effort": "xhigh",
+        }
         return {
             "value": switched.model,
             "warning": "",
@@ -587,11 +927,6 @@ def test_route_persist_failure_rolls_back_full_runtime_and_emits_nothing(monkeyp
 
     monkeypatch.setattr(server, "_sessions", {"runtime-1": session})
     monkeypatch.setattr(server, "_apply_model_switch", mutate_every_switch_field)
-    monkeypatch.setattr(
-        server,
-        "_persist_route_runtime_strict",
-        lambda _session: (_ for _ in ()).throw(OSError("disk full")),
-    )
     monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args: None)
     emitted = []
     monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
@@ -617,6 +952,9 @@ def test_route_persist_failure_rolls_back_full_runtime_and_emits_nothing(monkeyp
     )
     assert agent.requested_provider == "custom:old"
     assert agent.reasoning_config == reasoning_before
+    assert agent.reasoning_config is reasoning_before_ref
+    assert agent.reasoning_config["nested"] is reasoning_nested_before_ref
+    assert agent.reasoning_config["nested"]["levels"] is reasoning_levels_before_ref
     assert agent._cached_system_prompt is cache_before
     assert agent.client is client_before
     assert agent._anthropic_client is anthropic_client_before
@@ -629,25 +967,65 @@ def test_route_persist_failure_rolls_back_full_runtime_and_emits_nothing(monkeyp
     assert agent._use_native_cache_layout is False
     assert agent._primary_runtime is primary_before_ref
     assert agent._primary_runtime == primary_before
+    assert agent._primary_runtime["reasoning_config"] is primary_reasoning_before_ref
+    assert agent._primary_runtime["reasoning_config"]["nested"] is primary_nested_before_ref
+    assert (
+        agent._primary_runtime["reasoning_config"]["nested"]["levels"]
+        is primary_levels_before_ref
+    )
     assert agent._fallback_activated is True
     assert agent._fallback_index == 2
     assert agent._fallback_chain is fallback_chain_before
     assert agent._fallback_model is fallback_model_before
+    assert agent._fallback_chain[0] is fallback_entry_before
+    assert agent._fallback_chain[0]["metadata"] is fallback_metadata_before
+    assert agent._fallback_chain[0]["metadata"]["attempts"] is fallback_attempts_before
+    assert agent._fallback_chain[0]["metadata"]["attempts"] == [1]
+    assert agent._fallback_chain[0]["metadata"]["opaque"] is fallback_opaque
     assert agent._rate_limited_until == 9876.5
     assert agent._consecutive_stale_streams == 7
     assert agent._transport_cache is transport_cache_before
-    assert agent._transport_cache == {"chat_completions": transport}
+    assert agent._transport_cache == {
+        "chat_completions": {"client": transport, "headers": ["stable"]}
+    }
+    assert agent._transport_cache["chat_completions"] is transport_state_before
+    assert agent._transport_cache["chat_completions"]["headers"] is transport_headers_before
     assert agent._credential_pool is credential_pool_before
     assert agent._config_context_length == 123_456
     assert not hasattr(agent, "_compression_global_threshold")
     assert agent.context_compressor is compressor_before
     assert vars(agent.context_compressor) == compressor_state_before
+    assert agent.context_compressor._last_summary_error is compressor_error_before
+    assert (
+        agent.context_compressor._last_summary_error["messages"]
+        is compressor_messages_before
+    )
     assert session["coding_workflow"] == "coupled-v1"
+    assert session["model_override"] is model_override
     assert session["model_override"] == {
         "model": "old-model",
-        "provider": "old-provider",
+        "provider": "custom:old",
+        "fallback": {"entries": ["old"], "opaque": model_override["fallback"]["opaque"]},
     }
-    assert session["create_reasoning_override"] == reasoning_before
+    assert session["model_override"]["fallback"] is model_override_nested_before
+    assert session["model_override"]["fallback"]["entries"] is model_override_entries_before
+    assert session["create_reasoning_override"] is session_reasoning
+    assert session["create_reasoning_override"]["nested"] is session_reasoning_nested_before
+    assert (
+        session["create_reasoning_override"]["nested"]["levels"]
+        is session_reasoning_levels_before
+    )
+    assert session["create_reasoning_override"] == {
+        "enabled": True,
+        "effort": "low",
+        "nested": {
+            "levels": ["low"],
+            "opaque": session_reasoning["nested"]["opaque"],
+        },
+    }
+    db_after = db.get_session("stored-1")
+    assert {key: db_after[key] for key in db_before} == db_before
+    db.close()
     assert emitted == []
 
 
@@ -662,6 +1040,8 @@ class _BranchLease:
 class _BranchCandidate:
     def __init__(self, runtime_snapshot, session_db):
         self.model = runtime_snapshot["model"]
+        self.provider = runtime_snapshot["provider"]
+        self.requested_provider = runtime_snapshot["requested_provider"]
         self.coding_workflow = runtime_snapshot["coding_workflow"]
         self._session_db = session_db
         self.closed = False
@@ -861,8 +1241,11 @@ def test_session_branch_uses_parent_profile_scope_and_persists_full_route(
         "source": "desktop",
         "profile_home": profile_home,
     }
-    assert runtime_snapshot["provider"] == "custom:sudo"
+    assert runtime_snapshot["provider"] == "custom"
+    assert runtime_snapshot["requested_provider"] == "custom:sudo"
     child = server._sessions[child_sid]
+    assert child["agent"].provider == "custom"
+    assert child["agent"].requested_provider == "custom:sudo"
     assert child["model_override"] == {
         "model": "gpt-5.6-sol",
         "provider": "custom:sudo",
@@ -927,7 +1310,9 @@ def test_session_branch_make_agent_failure_writes_nothing_and_closes_owned_db(
     lease = _BranchLease()
     parent_agent = _RouteAgent()
     parent_agent.model = "gpt-5.6-sol"
-    parent_agent.provider = "custom:sudo"
+    parent_agent.provider = "custom"
+    parent_agent.requested_provider = "custom:sudo"
+    parent_agent.base_url = "https://sudo.example/v1"
     parent_agent.coding_workflow = "hybrid-v1"
     parent = {
         "agent": parent_agent,
@@ -988,7 +1373,9 @@ def test_session_branch_post_create_failure_compensates_durable_and_live_state(
     failing_db = _BranchDBProxy(durable_db, failure_point=failure_point)
     parent_agent = _RouteAgent()
     parent_agent.model = "gpt-5.6-sol"
-    parent_agent.provider = "custom:sudo"
+    parent_agent.provider = "custom"
+    parent_agent.requested_provider = "custom:sudo"
+    parent_agent.base_url = "https://sudo.example/v1"
     parent_agent.coding_workflow = "hybrid-v1"
     parent_agent._session_db = failing_db
     parent = {
@@ -1074,14 +1461,16 @@ def _fake_route_switch(_sid, session, _raw, **kwargs):
     agent = session["agent"]
     agent.switch_model(
         new_model="gpt-5.6-sol",
-        new_provider="custom:sudo",
+        new_provider="custom",
         api_key="new-key",
         base_url="https://new.invalid/v1",
         api_mode="chat_completions",
     )
+    agent.requested_provider = "custom:sudo"
+    agent._primary_runtime["requested_provider"] = "custom:sudo"
     session["model_override"] = {
         "model": agent.model,
-        "provider": agent.provider,
+        "provider": agent.requested_provider,
         "api_key": agent.api_key,
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
@@ -1138,7 +1527,9 @@ def test_route_cannot_mutate_after_prompt_admission(monkeypatch):
     monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
     monkeypatch.setattr(server, "_run_prompt_submit", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(server, "_apply_model_switch", _fake_route_switch)
-    monkeypatch.setattr(server, "_persist_route_runtime_strict", lambda _session: None)
+    monkeypatch.setattr(
+        server, "_persist_route_runtime_strict", lambda _session, **_kwargs: None
+    )
     monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args: None)
     monkeypatch.setattr(server, "_session_info", lambda *_args: {})
     monkeypatch.setattr(server, "_emit", lambda *_args: None)
@@ -1292,7 +1683,9 @@ def test_route_cannot_race_deferred_build_snapshot(monkeypatch):
     monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *_args: None)
     monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
     monkeypatch.setattr(server, "_apply_model_switch", mutate_unbuilt_route)
-    monkeypatch.setattr(server, "_persist_route_runtime_strict", lambda _session: None)
+    monkeypatch.setattr(
+        server, "_persist_route_runtime_strict", lambda _session, **_kwargs: None
+    )
 
     route_response = {}
 
@@ -1347,7 +1740,17 @@ def test_route_commit_is_atomic_emits_once_and_adds_no_marker(monkeypatch):
     monkeypatch.setattr(server, "_sessions", {"runtime-1": session})
     monkeypatch.setattr(server, "_apply_model_switch", _fake_route_switch)
     committed = []
-    monkeypatch.setattr(server, "_persist_route_runtime_strict", lambda current: committed.append((current["agent"].model, current["coding_workflow"])))
+    monkeypatch.setattr(
+        server,
+        "_persist_route_runtime_strict",
+        lambda current, **kwargs: committed.append(
+            (
+                current["agent"].model,
+                current["coding_workflow"],
+                kwargs["clear_system_prompt"],
+            )
+        ),
+    )
     monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args: None)
     monkeypatch.setattr(server, "_session_info", lambda current_agent, current: {"model": current_agent.model, "coding_workflow": current["coding_workflow"]})
     emitted = []
@@ -1367,7 +1770,7 @@ def test_route_commit_is_atomic_emits_once_and_adds_no_marker(monkeypatch):
     )
 
     assert "error" not in response
-    assert committed == [("gpt-5.6-sol", "hybrid-v1")]
+    assert committed == [("gpt-5.6-sol", "hybrid-v1", True)]
     assert agent.coding_workflow == session["coding_workflow"] == "hybrid-v1"
     assert emitted == [("session.info", "runtime-1", {"model": "gpt-5.6-sol", "coding_workflow": "hybrid-v1"})]
     assert session["history"] == history
@@ -1410,7 +1813,11 @@ def test_route_persist_failure_rolls_back_model_provider_and_workflow(monkeypatc
     }
     monkeypatch.setattr(server, "_sessions", {"runtime-1": session})
     monkeypatch.setattr(server, "_apply_model_switch", _fake_route_switch)
-    monkeypatch.setattr(server, "_persist_route_runtime_strict", lambda _session: (_ for _ in ()).throw(OSError("disk full")))
+    monkeypatch.setattr(
+        server,
+        "_persist_route_runtime_strict",
+        lambda _session, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
     monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args: None)
     emitted = []
     monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))

@@ -16,6 +16,7 @@ Read-boundary semantics (frozen contract):
 
 from __future__ import annotations
 from dataclasses import FrozenInstanceError
+from types import MappingProxyType
 
 import pytest
 
@@ -198,6 +199,58 @@ class TestCanonicalControllerRoute:
         thawed = route.reasoning_config
         thawed["nested"]["sequence"][0]["effort"] = "thawed-mutation"
         assert route.reasoning_config["nested"]["sequence"][0]["effort"] == "high"
+
+    def test_coupled_route_accepts_generic_mapping_root_without_exposing_nodes(self):
+        reasoning = MappingProxyType(
+            {
+                "effort": "xhigh",
+                "nested": MappingProxyType({"sequence": [{"enabled": True}]}),
+            }
+        )
+
+        route = cw.canonicalize_route(
+            "coupled-v1",
+            provider="custom:sudo",
+            model="gpt-5.6-sol",
+            reasoning_config=reasoning,
+        )
+
+        assert route.reasoning_config == {
+            "effort": "xhigh",
+            "nested": {"sequence": [{"enabled": True}]},
+        }
+        stored_nested = dict(route._reasoning_items)["nested"]
+        with pytest.raises(TypeError):
+            stored_nested["sequence"][0]["enabled"] = False
+
+    @pytest.mark.parametrize(
+        "bad_root",
+        [
+            {1: "bad"},
+            MappingProxyType({1: "bad"}),
+            ["not", "a", "mapping"],
+        ],
+    )
+    def test_coupled_route_rejects_invalid_reasoning_roots_and_keys(self, bad_root):
+        with pytest.raises(TypeError):
+            cw.canonicalize_route(
+                "coupled-v1",
+                provider="custom:sudo",
+                model="gpt-5.6-sol",
+                reasoning_config=bad_root,
+            )
+
+    def test_coupled_route_rejects_cyclic_reasoning_mapping(self):
+        cyclic = {}
+        cyclic["self"] = cyclic
+
+        with pytest.raises(TypeError, match="cyclic"):
+            cw.canonicalize_route(
+                "coupled-v1",
+                provider="custom:sudo",
+                model="gpt-5.6-sol",
+                reasoning_config=cyclic,
+            )
 
 
 class TestWorkflowPresets:

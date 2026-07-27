@@ -167,6 +167,16 @@ def canonicalize_route(
     canonical_workflow = validate_coding_workflow(workflow)
     requested_provider = str(provider or "").strip()
     requested_model = str(model or "").strip()
+    reasoning_items = None
+    if reasoning_config is not None:
+        if not isinstance(reasoning_config, Mapping):
+            raise TypeError("reasoning_config root must be a mapping or None")
+        frozen_items = []
+        for key, value in reasoning_config.items():
+            if not isinstance(key, str):
+                raise TypeError("reasoning_config mapping keys must be strings")
+            frozen_items.append((key, _freeze_reasoning_value(value)))
+        reasoning_items = tuple(frozen_items)
     if canonical_workflow == "hybrid-v1":
         fixed_provider, fixed_model = hybrid_controller_route()
         if (requested_provider and requested_provider != fixed_provider) or (
@@ -185,12 +195,6 @@ def canonicalize_route(
             ),
         )
 
-    reasoning_items = None
-    if isinstance(reasoning_config, dict):
-        reasoning_items = tuple(
-            (str(key), _freeze_reasoning_value(value))
-            for key, value in reasoning_config.items()
-        )
     return CanonicalRoute(
         coding_workflow=canonical_workflow,
         requested_provider=requested_provider or None,

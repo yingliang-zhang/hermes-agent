@@ -2042,72 +2042,114 @@ _MODEL_SWITCH_COMPRESSOR_FIELDS = (
     "_last_compression_made_progress",
 )
 
-_MODEL_SWITCH_IN_PLACE_FIELDS = frozenset(
-    {"_primary_runtime", "_transport_cache"}
-)
-_MODEL_SWITCH_STATE_KEY = "_exact_model_switch_state_v1"
+_MODEL_SWITCH_STATE_KEY = "_exact_model_switch_state_v2"
 
 
-def _clone_switch_container(value: Any) -> Any:
-    """Clone built-in containers while preserving opaque SDK/lock leaves."""
-    if isinstance(value, dict):
-        return {
-            _clone_switch_container(key): _clone_switch_container(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_clone_switch_container(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_clone_switch_container(item) for item in value)
-    if isinstance(value, set):
-        return {_clone_switch_container(item) for item in value}
-    if isinstance(value, frozenset):
-        return frozenset(_clone_switch_container(item) for item in value)
-    return value
+def _snapshot_mutable_container_graph(value: Any):
+    """Capture built-in mutable containers without copying opaque leaves.
+
+    Every original dict/list/set object is retained in the snapshot. Contents
+    are recorded as references, so restoration can reconnect aliases and cycles
+    while preserving every container and opaque SDK/lock identity.
+    """
+    nodes = []
+    visited: set[int] = set()
+
+    def visit(current: Any) -> None:
+        if not isinstance(current, (dict, list, set, tuple, frozenset)):
+            return
+        identity = id(current)
+        if identity in visited:
+            return
+        visited.add(identity)
+        if isinstance(current, dict):
+            contents = tuple(current.items())
+            nodes.append((current, "dict", contents))
+            for key, item in contents:
+                visit(key)
+                visit(item)
+        elif isinstance(current, list):
+            contents = tuple(current)
+            nodes.append((current, "list", contents))
+            for item in contents:
+                visit(item)
+        elif isinstance(current, set):
+            contents = tuple(current)
+            nodes.append((current, "set", contents))
+            for item in contents:
+                visit(item)
+        else:
+            for item in current:
+                visit(item)
+
+    visit(value)
+    return tuple(nodes) if nodes else None
 
 
-def _capture_switch_attribute(target: Any, name: str, *, in_place: bool = False):
+def _restore_mutable_container_graph(graph) -> None:
+    if graph is None:
+        return
+    for container, _kind, _contents in graph:
+        container.clear()
+    for container, kind, contents in graph:
+        if kind == "dict":
+            container.update(contents)
+        elif kind == "list":
+            container.extend(contents)
+        else:
+            container.update(contents)
+
+
+def _capture_switch_attribute(target: Any, name: str):
     try:
         value = getattr(target, name)
     except AttributeError:
         return False, None, None
-    contents = _clone_switch_container(value) if in_place else None
-    return True, value, contents
-
-
-def _restore_switch_container(target: Any, contents: Any) -> None:
-    restored = _clone_switch_container(contents)
-    if isinstance(target, dict):
-        target.clear()
-        target.update(restored)
-    elif isinstance(target, list):
-        target[:] = restored
-    elif isinstance(target, set):
-        target.clear()
-        target.update(restored)
+    return True, value, _snapshot_mutable_container_graph(value)
 
 
 def _restore_switch_attribute(target: Any, name: str, state) -> None:
-    existed, value, contents = state
+    existed, value, graph = state
     if not existed:
         try:
             delattr(target, name)
         except AttributeError:
             pass
         return
-    if contents is not None:
-        _restore_switch_container(value, contents)
+    _restore_mutable_container_graph(graph)
     setattr(target, name, value)
+
+
+def snapshot_mapping_field_state(target: dict, names) -> dict:
+    """Capture mapping fields with missing-vs-None and exact graph identity."""
+    snapshot = {}
+    for name in names:
+        if name not in target:
+            snapshot[name] = (False, None, None)
+            continue
+        value = target[name]
+        snapshot[name] = (
+            True,
+            value,
+            _snapshot_mutable_container_graph(value),
+        )
+    return snapshot
+
+
+def restore_mapping_field_state(target: dict, snapshot: dict) -> None:
+    """Restore fields captured by :func:`snapshot_mapping_field_state`."""
+    for name, (existed, value, graph) in snapshot.items():
+        if not existed:
+            target.pop(name, None)
+            continue
+        _restore_mutable_container_graph(graph)
+        target[name] = value
 
 
 def snapshot_model_switch_state(agent: Any) -> dict:
     """Capture every in-memory field changed by a model route transaction."""
     agent_state = {
-        name: _capture_switch_attribute(
-            agent,
-            name,
-            in_place=name in _MODEL_SWITCH_IN_PLACE_FIELDS,
-        )
+        name: _capture_switch_attribute(agent, name)
         for name in _MODEL_SWITCH_AGENT_FIELDS
     }
     compressor_state = None
@@ -2125,13 +2167,9 @@ def snapshot_model_switch_state(agent: Any) -> dict:
         "api_key": getattr(agent, "api_key", ""),
         "base_url": getattr(agent, "base_url", ""),
         "api_mode": getattr(agent, "api_mode", ""),
-        "reasoning_config": _clone_switch_container(
-            getattr(agent, "reasoning_config", None)
-        ),
+        "reasoning_config": getattr(agent, "reasoning_config", None),
         "cached_system_prompt": getattr(agent, "_cached_system_prompt", None),
-        "primary_runtime": _clone_switch_container(
-            getattr(agent, "_primary_runtime", None)
-        ),
+        "primary_runtime": getattr(agent, "_primary_runtime", None),
     }
     snapshot[_MODEL_SWITCH_STATE_KEY] = {
         "agent": agent_state,
@@ -2158,7 +2196,17 @@ def restore_model_switch_state(agent: Any, snapshot: dict) -> bool:
     return True
 
 
-def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode=''):
+def switch_model(
+    agent,
+    new_model,
+    new_provider,
+    api_key="",
+    base_url="",
+    api_mode="",
+    *,
+    requested_provider=None,
+    persist_session_runtime: bool = True,
+):
     """Switch the model/provider in-place for a live agent.
 
     Called by the /model command handlers (CLI and gateway) after
@@ -2227,7 +2275,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         # ── Swap core runtime fields ──
         agent.model = new_model
         agent.provider = new_provider
-        agent.requested_provider = new_provider
+        agent.requested_provider = requested_provider or new_provider
         # Use the new base_url when provided. When it's empty AND the
         # provider is actually changing, do NOT fall back to the current
         # (old provider's) URL — that silently pairs the new provider label
@@ -2581,7 +2629,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # See #48248 for the full bug description.
     _session_db = getattr(agent, "_session_db", None)
     _session_id = getattr(agent, "session_id", None)
-    if _session_db is not None and _session_id:
+    if persist_session_runtime and _session_db is not None and _session_id:
         try:
             _session_db.update_session_billing_route(
                 _session_id,

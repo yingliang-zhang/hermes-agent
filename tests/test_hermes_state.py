@@ -619,6 +619,130 @@ class TestSessionLifecycle:
         assert sess["billing_provider"] == "openai"
         assert sess["billing_mode"] == "local"  # preserved (COALESCE on None)
 
+    def test_update_session_route_commits_one_coherent_state_and_prompt_policy(self, db):
+        db.create_session(
+            session_id="route-atomic",
+            source="desktop",
+            model="old-model",
+            model_config={"model": "old-model", "provider": "custom:old"},
+            system_prompt="stable prompt bytes",
+        )
+        db.update_session_billing_route(
+            "route-atomic",
+            provider="custom",
+            base_url="https://old.example/v1",
+            billing_mode="chat_completions",
+        )
+        db.update_system_prompt("route-atomic", "stable prompt bytes")
+
+        same_transport_config = json.dumps(
+            {
+                "model": "gpt-5.6-sol",
+                "provider": "custom:sudo",
+                "coding_workflow": "hybrid-v1",
+            },
+            sort_keys=True,
+        )
+        db.update_session_route(
+            "route-atomic",
+            model="gpt-5.6-sol",
+            model_config_json=same_transport_config,
+            provider="custom",
+            base_url="https://old.example/v1",
+            billing_mode="chat_completions",
+            clear_system_prompt=False,
+        )
+        same_row = db.get_session("route-atomic")
+        assert same_row["model"] == "gpt-5.6-sol"
+        assert same_row["model_config"] == same_transport_config
+        assert same_row["billing_provider"] == "custom"
+        assert same_row["billing_base_url"] == "https://old.example/v1"
+        assert same_row["billing_mode"] == "chat_completions"
+        assert same_row["system_prompt"] == "stable prompt bytes"
+
+        switched_config = json.dumps(
+            {"model": "claude-opus", "provider": "anthropic"}, sort_keys=True
+        )
+        db.update_session_route(
+            "route-atomic",
+            model="claude-opus",
+            model_config_json=switched_config,
+            provider="anthropic",
+            base_url="https://api.anthropic.com",
+            billing_mode="anthropic_messages",
+            clear_system_prompt=True,
+        )
+        switched_row = db.get_session("route-atomic")
+        assert {
+            key: switched_row[key]
+            for key in (
+                "model",
+                "model_config",
+                "billing_provider",
+                "billing_base_url",
+                "billing_mode",
+                "system_prompt",
+            )
+        } == {
+            "model": "claude-opus",
+            "model_config": switched_config,
+            "billing_provider": "anthropic",
+            "billing_base_url": "https://api.anthropic.com",
+            "billing_mode": "anthropic_messages",
+            "system_prompt": None,
+        }
+
+    def test_update_session_route_failure_rolls_back_every_route_column(self, db):
+        db.create_session(
+            session_id="route-failure",
+            source="desktop",
+            model="old-model",
+            model_config={"model": "old-model", "provider": "custom:old"},
+        )
+        db.update_session_billing_route(
+            "route-failure",
+            provider="custom",
+            base_url="https://old.example/v1",
+            billing_mode="chat_completions",
+        )
+        db.update_system_prompt("route-failure", "stable prompt bytes")
+        columns = (
+            "model",
+            "model_config",
+            "billing_provider",
+            "billing_base_url",
+            "billing_mode",
+            "system_prompt",
+        )
+        before = db.get_session("route-failure")
+        before = {key: before[key] for key in columns}
+        db._conn.execute(
+            """CREATE TRIGGER force_route_failure
+            BEFORE UPDATE OF model, model_config, billing_provider,
+                             billing_base_url, billing_mode, system_prompt
+            ON sessions WHEN OLD.id = 'route-failure'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced route failure');
+            END"""
+        )
+        db._conn.commit()
+
+        with pytest.raises(sqlite3.IntegrityError, match="forced route failure"):
+            db.update_session_route(
+                "route-failure",
+                model="new-model",
+                model_config_json=json.dumps(
+                    {"model": "new-model", "provider": "anthropic"}
+                ),
+                provider="anthropic",
+                base_url="https://api.anthropic.com",
+                billing_mode="anthropic_messages",
+                clear_system_prompt=True,
+            )
+
+        after = db.get_session("route-failure")
+        assert {key: after[key] for key in columns} == before
+
     def test_per_model_usage_recorded_for_single_model(self, db):
         """Each per-call delta lands in session_model_usage (#51607)."""
         db.create_session(session_id="s1", source="cli")

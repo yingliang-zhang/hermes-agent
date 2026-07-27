@@ -450,6 +450,7 @@ class ModelSwitchResult:
     capabilities: Optional[ModelCapabilities] = None
     model_info: Optional[ModelInfo] = None
     is_global: bool = False
+    runtime_provider: str = ""
 
 
 @dataclass(frozen=True)
@@ -1028,6 +1029,7 @@ def switch_model(
     resolved_alias = ""
     new_model = raw_input.strip()
     target_provider = current_provider
+    runtime_provider = current_provider
     resolved_moa_preset = False
 
     # =================================================================
@@ -1374,6 +1376,9 @@ def switch_model(
                     explicit_base_url=_user_pdef.base_url,
                     target_model=new_model,
                 )
+                runtime_provider = str(
+                    runtime.get("provider") or target_provider
+                ).strip()
                 api_key = runtime.get("api_key", "") or _ukey
                 base_url = runtime.get("base_url", "") or _user_pdef.base_url
                 api_mode = runtime.get("api_mode", "")
@@ -1382,6 +1387,7 @@ def switch_model(
                 base_url = _user_pdef.base_url
                 api_mode = ""
         elif target_provider == "custom" and current_base_url:
+            runtime_provider = "custom"
             api_key = current_api_key
             base_url = current_base_url
             api_mode = determine_api_mode(target_provider, base_url)
@@ -1391,6 +1397,9 @@ def switch_model(
                     requested=target_provider,
                     target_model=new_model,
                 )
+                runtime_provider = str(
+                    runtime.get("provider") or target_provider
+                ).strip()
                 api_key = runtime.get("api_key", "")
                 base_url = runtime.get("base_url", "")
                 api_mode = runtime.get("api_mode", "")
@@ -1411,6 +1420,9 @@ def switch_model(
                 requested=current_provider,
                 target_model=new_model,
             )
+            runtime_provider = str(
+                runtime.get("provider") or target_provider
+            ).strip()
             # If resolution fell through to "custom" (e.g. named custom provider like
             # "ollama-launch" that resolve_runtime_provider doesn't know), keep existing
             # credentials. Otherwise use the resolved values (picks up credential rotation,
@@ -1563,6 +1575,7 @@ def switch_model(
         success=True,
         new_model=new_model,
         target_provider=target_provider,
+        runtime_provider=runtime_provider or target_provider,
         provider_changed=provider_changed,
         api_key=api_key,
         base_url=base_url,
