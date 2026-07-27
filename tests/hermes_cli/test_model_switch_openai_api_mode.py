@@ -42,6 +42,7 @@ def _run_openai_switch(
         patch(
             "hermes_cli.runtime_provider.resolve_runtime_provider",
             return_value={
+                "provider": "openai-api",
                 "api_key": "sk-test",
                 "base_url": runtime_base_url,
                 "api_mode": runtime_api_mode,
@@ -80,6 +81,7 @@ def test_stale_chat_completions_overridden_on_openai_direct():
 
     assert result.success, f"switch_model failed: {result.error_message}"
     assert result.target_provider == "openai-api"
+    assert result.runtime_provider == "openai-api"
     assert result.new_model == "gpt-5.6-sol"
     assert result.api_mode == "codex_responses"
 

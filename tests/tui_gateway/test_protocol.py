@@ -1363,6 +1363,7 @@ def test_session_branch_persists_branched_from_marker(server, monkeypatch):
         "agent": types.SimpleNamespace(
             model="test/model",
             provider="test",
+            requested_provider="test",
             base_url="",
             api_key="",
             api_mode="chat_completions",
@@ -1450,6 +1451,7 @@ def test_session_branch_forwards_original_timestamps(server, monkeypatch):
         "agent": types.SimpleNamespace(
             model="test/model",
             provider="test",
+            requested_provider="test",
             base_url="",
             api_key="",
             api_mode="chat_completions",
