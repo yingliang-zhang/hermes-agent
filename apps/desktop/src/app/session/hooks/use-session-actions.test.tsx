@@ -626,7 +626,7 @@ function ResumeHarness({
 }) {
   const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
   const runtimeMapRef = runtimeIdByStoredSessionIdRef ?? ref(new Map<string, string>())
-  const stateMapRef = sessionStateByRuntimeIdRef ?? ref(new Map<string, ClientSessionState>())
+  const sessionStatesRef = sessionStateByRuntimeIdRef ?? ref(new Map<string, ClientSessionState>())
 
   const actions = useSessionActions({
     activeSessionId: null,
@@ -642,15 +642,14 @@ function ResumeHarness({
     runtimeIdByStoredSessionIdRef: runtimeMapRef,
     selectedStoredSessionId,
     selectedStoredSessionIdRef: ref<string | null>(selectedStoredSessionId),
-    sessionStateByRuntimeIdRef: stateMapRef,
+    sessionStateByRuntimeIdRef: sessionStatesRef,
     syncSessionStateToView: vi.fn(),
     updateSessionState: (sessionId, updater, storedSessionId) => {
       // Full default shape (not a bare {} cast) so seeded/derived fields like
       // turnStartedAt behave as in production state updates.
-      const current = stateMapRef.current.get(sessionId) ?? createClientSessionState(storedSessionId ?? null)
+      const current = sessionStatesRef.current.get(sessionId) ?? createClientSessionState(storedSessionId ?? null)
       const next = updater(current)
-
-      stateMapRef.current.set(sessionId, next)
+      sessionStatesRef.current.set(sessionId, next)
       onStateUpdate?.(sessionId, next)
 
       return next
