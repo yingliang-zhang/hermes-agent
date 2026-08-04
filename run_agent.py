@@ -175,6 +175,7 @@ from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock
 from agent.process_bootstrap import _get_proxy_from_env  # noqa: F401
 from agent.message_sanitization import (  # noqa: F401
     _SURROGATE_RE,
+    HERMES_INTERNAL_SYSTEM_MARKER_KEY,
     _sanitize_surrogates,
     _sanitize_structure_surrogates,
     _sanitize_messages_surrogates,
@@ -2234,6 +2235,9 @@ class AIAgent:
                     "codex_message_items": msg.get("codex_message_items"),
                     "timestamp": _row_timestamp,
                     "api_content": _row_api_content,
+                    "internal_system_marker": bool(
+                        msg.get(HERMES_INTERNAL_SYSTEM_MARKER_KEY)
+                    ),
                     "display_kind": (
                         "hidden"
                         if msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
