@@ -9,14 +9,8 @@ import { getSession } from '@/hermes'
 import { textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
-import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
+import { $queuedPromptsBySession, enqueueQueuedPrompt, getQueuedPrompts } from '@/store/composer-queue'
 import { $hudMode } from '@/store/hud'
-import { $notifications, clearNotifications } from '@/store/notifications'
-import {
-  $queuedPromptsBySession,
-  enqueueQueuedPrompt,
-  getQueuedPrompts
-} from '@/store/composer-queue'
 import { $notifications, clearNotifications } from '@/store/notifications'
 import {
   $busy,
