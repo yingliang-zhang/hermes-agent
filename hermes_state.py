@@ -7674,6 +7674,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         platform_message_id: str = None,
         observed: bool = False,
         effect_disposition: Optional[str] = None,
+        interrupted_tool_tail: bool = False,
         timestamp: Any = None,
         api_content: Optional[str] = None,
         display_kind: Optional[str] = None,
@@ -7741,10 +7742,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
-                   tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
+                   tool_calls, tool_name, effect_disposition, interrupted_tool_tail, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -7753,6 +7754,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     tool_calls_json,
                     _scrub_surrogates(tool_name),
                     effect_disposition,
+                    1 if interrupted_tool_tail else 0,
                     message_timestamp,
                     token_count,
                     finish_reason,
@@ -7793,6 +7795,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return self._execute_write(
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
+
+    def mark_tool_tail_interrupted(
+        self,
+        session_id: str,
+        tool_call_id: str,
+    ) -> bool:
+        """Persist interruption provenance on an already-written tool result."""
+        if not session_id or not tool_call_id:
+            return False
+
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE messages SET interrupted_tool_tail = 1
+                   WHERE id = (
+                       SELECT id FROM messages
+                       WHERE session_id = ? AND active = 1
+                         AND role = 'tool' AND tool_call_id = ?
+                       ORDER BY id DESC LIMIT 1
+                   )""",
+                (session_id, tool_call_id),
+            )
+            return cursor.rowcount > 0
+
+        return bool(self._execute_write(_do))
 
     def append_messages_batch(
         self,
@@ -8164,10 +8190,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
-                   tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
+                   tool_calls, tool_name, effect_disposition, interrupted_tool_tail, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -8176,6 +8202,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     tool_calls_json,
                     _scrub_surrogates(msg.get("tool_name")),
                     msg.get("effect_disposition"),
+                    1 if (
+                        msg.get("_interrupted_tool_tail")
+                        or msg.get("interrupted_tool_tail")
+                    ) else 0,
                     message_timestamp,
                     msg.get("token_count"),
                     msg.get("finish_reason"),
@@ -8748,7 +8778,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # SELECT can feed both the model-fed and display views.
     _CONVERSATION_ROW_COLUMNS = (
         "id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
-        "finish_reason, reasoning, reasoning_content, reasoning_details, "
+        "interrupted_tool_tail, finish_reason, reasoning, reasoning_content, reasoning_details, "
         "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
         "api_content, display_kind, display_metadata"
     )
@@ -8805,6 +8835,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 msg["tool_name"] = row["tool_name"]
             if row["effect_disposition"]:
                 msg["effect_disposition"] = row["effect_disposition"]
+            if row["interrupted_tool_tail"]:
+                msg["_interrupted_tool_tail"] = True
             if row["tool_calls"]:
                 try:
                     msg["tool_calls"] = json.loads(row["tool_calls"])
