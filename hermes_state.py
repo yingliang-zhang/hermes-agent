@@ -6400,21 +6400,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         expires_at = now + ttl_seconds
 
         def _do(conn):
-            # A competing AIAgent can start compression while this session is
-            # live yet reach the lock only after the winner has rotated and
-            # released it. The lock row alone is then gone, but the ended
-            # parent is a durable completion marker. Reject that stale caller
-            # before it can create a second child. In-place compaction leaves
-            # the session open, and a failed rotation reopens it, so both keep
-            # their existing retry semantics.
-            already_rotated = conn.execute(
-                "SELECT 1 FROM sessions "
-                "WHERE id = ? AND ended_at IS NOT NULL "
-                "AND end_reason = 'compression'",
-                (session_id,),
-            ).fetchone()
-            if already_rotated is not None:
-                return False, None
+            # A competing AIAgent can reach the lock only after the winner has
+            # rotated and released it. Already-rotated detection lives in the
+            # caller — returning False here would make recovery unreachable.
             reclaimed_holder = None
             row = conn.execute(
                 "SELECT holder, expires_at FROM compression_locks "
