@@ -9384,7 +9384,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    tool_calls, tool_name, effect_disposition, interrupted_tool_tail, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(session_id, role, content, timestamp) WHERE active=1 DO NOTHING""",
                 (
                     session_id,
                     role,
@@ -9411,6 +9412,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ),
             )
             msg_id = cursor.lastrowid
+            if cursor.rowcount == 0:
+                # Duplicate of an already-live row: idempotent no-op — resolve
+                # to the existing row's id and leave sessions.* counters alone.
+                existing = conn.execute(
+                    "SELECT id FROM messages WHERE session_id = ? AND role = ? "
+                    "AND content IS ? AND timestamp = ? AND active = 1 "
+                    "ORDER BY id DESC LIMIT 1",
+                    (session_id, role, stored_content, message_timestamp),
+                ).fetchone()
+                if existing is not None:
+                    msg_id = existing["id"]
+                    # Skip counter update — the row already exists.
+                    return msg_id
 
             # Update counters
             if num_tool_calls > 0:
@@ -9842,7 +9856,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    tool_calls, tool_name, effect_disposition, interrupted_tool_tail, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(session_id, role, content, timestamp) WHERE active=1 DO NOTHING""",
                 (
                     session_id,
                     role,
@@ -9871,10 +9886,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._encode_display_metadata(msg.get("display_metadata")),
                 ),
             )
-            if isinstance(msg, dict) and cur.lastrowid is not None:
+            if cur.rowcount and isinstance(msg, dict) and cur.lastrowid is not None:
                 msg["_row_id"] = cur.lastrowid
-            inserted += 1
-            if tool_calls is not None:
+            inserted += 1 if cur.rowcount else 0
+            if cur.rowcount and tool_calls is not None:
                 tool_calls_total += (
                     len(tool_calls) if isinstance(tool_calls, list) else 1
                 )
