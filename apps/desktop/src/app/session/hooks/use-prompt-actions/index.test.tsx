@@ -10,7 +10,6 @@ import { useComposerQueue } from '@/app/chat/composer/hooks/use-composer-queue'
 import { textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
-import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
 import { $hudMode } from '@/store/hud'
 import { $notifications, clearNotifications } from '@/store/notifications'
 import {
@@ -275,6 +274,8 @@ function QueueHarness({
     branchCurrentSession: async () => true,
     busyRef: { current: false },
     createBackendSessionForSend: async () => null,
+    getRoutedStoredSessionId: () => null,
+    getRuntimeIdForStoredSession: () => null,
     getRouteToken: () => routeTokenRef.current,
     handleSkinCommand: () => '',
     openMemoryGraph: () => undefined,
@@ -300,6 +301,7 @@ function QueueHarness({
     focusInput: () => undefined,
     loadIntoComposer: () => undefined,
     onCancel: actions.cancelRun,
+    onSteer: () => Promise.resolve(true),
     onSubmit: actions.submitText,
     queueEditRef,
     queueSessionKey: activeQueueSessionKey,
