@@ -1576,6 +1576,12 @@ def restore_primary_runtime(agent) -> bool:
             agent._use_prompt_caching = False
             agent._use_native_cache_layout = False
 
+        # Revert the per-provider reasoning-echo opt-in to the primary's
+        # snapshot value — a fallback entry's opt-in must not persist into
+        # the restored primary runtime (default False for snapshots taken
+        # before this field existed).
+        agent._reasoning_echo_flag = bool(rt.get("reasoning_echo_flag", False))
+
         # ── Rebuild client for the primary provider ──
         if agent.provider == "moa":
             # MoA is a virtual chat-completions provider.  It never has real
@@ -1606,8 +1612,11 @@ def restore_primary_runtime(agent) -> bool:
             )
 
         # ── Restore context engine state ──
-        cc = agent.context_compressor
-        cc.update_model(
+        # The compressor may not exist yet (e.g. partially-constructed agents
+        # in gateway/CLI paths that create it lazily); skip the rebind then.
+        cc = getattr(agent, "context_compressor", None)
+        if cc is not None:
+            cc.update_model(
             model=rt["compressor_model"],
             context_length=rt["compressor_context_length"],
             base_url=rt["compressor_base_url"],
