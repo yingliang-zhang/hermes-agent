@@ -50,6 +50,7 @@ from tui_gateway.transport import (
     current_transport,
     reset_transport,
 )
+_MODEL_OPTIONS_RUNTIME_SNAPSHOT = "_model_runtime_snapshot"
 
 logger = logging.getLogger(__name__)
 
@@ -16138,7 +16139,6 @@ def _mcp_summarize_server(name, cfg):  # noqa: E402
 # over already exists; register() rebinds them onto this namespace.
 from . import (  # noqa: E402
 
-_MODEL_OPTIONS_RUNTIME_SNAPSHOT = "_model_runtime_snapshot"
     methods_complete as _methods_complete,
     methods_config as _methods_config,
     methods_images as _methods_images,
