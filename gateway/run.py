@@ -28289,19 +28289,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # snapshot while the tail generated between that snapshot and
                 # stream completion never reached any API call (#71643).
                 # Reconcile the recorded turn-final payload against the
-                # completed response; only a demonstrable mismatch (False)
-                # overrides the flag — including payload-less multi-message
-                # split delivery (#78541). None (no record on a non-split
-                # legacy path) keeps the legacy trust so ambiguous-timeout
-                # dedup is not regressed.
+                # completed response.  Only a demonstrable *match* (True)
+                # confirms delivery; a mismatch (False) or no record (None)
+                # must NOT be trusted on its own — err toward delivery, not
+                # suppression (#78100 ghost-reply fix: matcher()=None was
+                # silently suppressing final answers that were never shown
+                # to the user).  Payload-less multi-message split delivery
+                # (#78541) is covered by the final_content_delivered fallback
+                # below, so legitimate splits still suppress.
                 matcher = getattr(consumer, "delivered_final_matches", None)
                 if callable(matcher):
                     try:
-                        if matcher(final_text) is False:
+                        _match_result = matcher(final_text)
+                        if _match_result is True:
+                            return True
+                        if _match_result is False:
                             return False
+                        # None: no record / multi-message split — fall through
+                        # to check final_content_delivered as fallback.
                     except Exception:
                         pass
-                return True
+                # Fallback: if the consumer recorded that final content was
+                # actually delivered (not just that finalize ran), trust that.
+                final_content_delivered = getattr(
+                    consumer, "final_content_delivered", False
+                )
+                if final_content_delivered:
+                    return True
+                # No positive proof of delivery — do NOT suppress the send.
+                return False
             if previewed:
                 has_delivered_text = getattr(consumer, "has_delivered_text", None)
                 if callable(has_delivered_text):

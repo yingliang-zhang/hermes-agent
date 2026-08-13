@@ -7121,6 +7121,14 @@ def run_conversation(
                 # commentary only after the canonical SessionDB append above.
                 if not duplicate_previous_interim:
                     agent._emit_interim_assistant_message(assistant_msg)
+                    # Local patch: if the assistant message had no text content
+                    # but does have tool calls, emit a synthetic status line so
+                    # the user can see what's happening during silent tool chains.
+                    _asst_content = assistant_msg.get("content")
+                    if not _asst_content or (
+                        isinstance(_asst_content, str) and not _asst_content.strip()
+                    ):
+                        agent._emit_tool_call_status(assistant_msg)
 
                 # Close any open streaming display (response box, reasoning
                 # box) before tool execution begins.  Intermediate turns may
@@ -7893,7 +7901,7 @@ def run_conversation(
                     from hermes_cli.lifecycle import has_hook
                     from hermes_cli.plugins import get_pre_verify_continue_message
 
-                    if _edited and has_hook("pre_verify") and _attempt < max_verify_nudges():
+                    if has_hook("pre_verify") and _attempt < max_verify_nudges():
                         # Posture is fixed for the session — resolve once + cache.
                         coding = getattr(agent, "_resolved_is_coding", None)
                         if coding is None:

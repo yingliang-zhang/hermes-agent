@@ -987,6 +987,33 @@ class AIAgent:
             except Exception:
                 logger.debug("status_callback error in _emit_status", exc_info=True)
 
+    def _emit_tool_call_status(self, assistant_msg: Dict[str, Any]) -> None:
+        """Emit a synthetic status line for empty-content tool-call messages.
+
+        When the model issues tool calls without any accompanying narration
+        text, the user sees raw tool output with no explanation of what the
+        agent is doing.  This synthesizes a short status line from the tool
+        call metadata (names only — arguments may contain secrets) and routes
+        it through ``_emit_status`` (the status channel), NOT
+        ``interim_assistant_callback`` (the commentary channel), to keep
+        dedup records clean and avoid polluting the permanent message stream.
+
+        Local patch — not submitted upstream.
+        """
+        tool_calls = assistant_msg.get("tool_calls") or []
+        if not tool_calls:
+            return
+        names: List[str] = []
+        for tc in tool_calls:
+            if isinstance(tc, dict):
+                fn = tc.get("function", {})
+                names.append(fn.get("name", "unknown"))
+            elif hasattr(tc, "function"):
+                fn = tc.function
+                names.append(getattr(fn, "name", "unknown"))
+        if names:
+            self._emit_status(f"→ {', '.join(names)}")
+
     def _emit_warning(self, message: str) -> None:
         """Emit a user-visible warning through the same status plumbing.
 
@@ -4048,6 +4075,54 @@ class AIAgent:
         except Exception:
             # Never let durable cleanup I/O break turn teardown.
             pass
+
+    def _finalize_activity_after_turn(self) -> None:
+        """Terminal activity stamp — called from the turn ``finally`` block.
+
+        Ensures ``last_activity_at`` is durably persisted even when all
+        intermediate heartbeats were rate-limited or dropped under lock
+        contention. This fixes the "stuck timestamp" bug where the Desktop
+        UI stops refreshing messages because ``last_activity_at`` never
+        advances past the last successful heartbeat.
+
+        Key design decisions (tri-model review 3/3 convergence):
+
+        1. **Does NOT call ``_touch_activity``** — that method runs the
+           kanban bridge (``inject_new_comments_from_env``) which can
+           trigger a spurious continuation turn on a finished turn.
+        2. **Does NOT bump in-memory ``_last_activity_ts``** — the gateway
+           stall-watchdog relies on this value being preserved across
+           interrupt-recursive turns (#15654). Bumping it at every nested
+           finally would reset the accumulated-idle clock.
+        3. **Uses elevated write patience** (``_ACTIVITY_FINALIZE_PATIENCE_S``
+           = 2.0s) — the turn is already over, so there is no
+           response-critical path to protect. The 0.5s mid-turn budget
+           does not apply here.
+        4. **Atomic UPDATE** — stamps ts AND clears labels in one write,
+           avoiding a transient "turn completed" label flash and halving
+           teardown writes vs. touch-then-clear.
+        """
+        session_id = getattr(self, "session_id", None)
+        session_db = getattr(self, "_session_db", None)
+        ts = getattr(self, "_last_activity_ts", None)
+        if not session_id or session_db is None:
+            return
+        finalize = getattr(session_db, "finalize_session_activity", None)
+        if not callable(finalize):
+            return
+        try:
+            finalize(session_id, ts)
+        except Exception:
+            logger.debug(
+                "turn-end activity finalize write failed (ignored)",
+                exc_info=True,
+            )
+        # Clear in-memory labels (mirrors _reset_activity_labels_after_turn).
+        # The DB write already clears them atomically; this ensures the
+        # in-memory snapshot is consistent for any reader that checks
+        # get_activity_summary() before the next _touch_activity.
+        self._last_activity_desc = ""
+        self._last_activity_provenance = ActivityProvenance.UNKNOWN
 
     def _capture_rate_limits(self, http_response: Any) -> None:
         """Parse x-ratelimit-* headers from an HTTP response and cache the state.
@@ -8840,10 +8915,16 @@ class AIAgent:
                         ):
                             self._active_session_turn_lease_holder = None
                             self._active_session_turn_lease_ttl_seconds = None
-                    # Always clear mid-turn labels when the turn exits — including
-                    # interrupted early returns that skip finalize_turn. Keep ts.
+                    # Terminal activity stamp: persist ``last_activity_at``
+                    # and clear mid-turn labels in one atomic write. This
+                    # ensures the timestamp is durably stamped even when all
+                    # intermediate heartbeats were throttled or dropped.
+                    # ``_finalize_activity_after_turn`` does NOT call
+                    # ``_touch_activity`` (avoids kanban bridge side-effect)
+                    # and does NOT bump in-memory ``_last_activity_ts``
+                    # (preserves #15654 watchdog continuity).
                     try:
-                        self._reset_activity_labels_after_turn()
+                        self._finalize_activity_after_turn()
                     except Exception:
                         pass
                     if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:

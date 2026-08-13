@@ -209,6 +209,7 @@ class ShellHookSpec:
     matcher: Optional[str] = None
     timeout: int = DEFAULT_TIMEOUT_SECONDS
     fail_closed: bool = False
+    fail_context: Optional[str] = None
     compiled_matcher: Optional[re.Pattern] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -514,12 +515,21 @@ def _parse_single_entry(
         )
         fail_closed = False
 
+    fail_context = raw.get("fail_context")
+    if fail_context is not None and not isinstance(fail_context, str):
+        logger.warning(
+            "hooks.%s[%d].fail_context must be a string; ignoring",
+            event, index,
+        )
+        fail_context = None
+
     return ShellHookSpec(
         event=event,
         command=command.strip(),
         matcher=matcher,
         timeout=timeout,
         fail_closed=fail_closed,
+        fail_context=fail_context,
     )
 
 
@@ -677,6 +687,8 @@ def _evaluate_result(
         )
         if fail_closed:
             return _fail_closed_block(spec, r["error"])
+        if spec.event == "pre_llm_call" and spec.fail_context:
+            return {"context": spec.fail_context}
         return None
     if r["timed_out"]:
         logger.warning(
