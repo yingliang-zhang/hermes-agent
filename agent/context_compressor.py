@@ -5657,7 +5657,9 @@ This compaction should PRIORITISE preserving all information related to the focu
     @property
     def _effective_max_tail_message_floor(self) -> int:
         """Resolved tail-floor cap: config override or module default."""
-        if self.max_tail_message_floor > 0:
+        # getattr guards partially-initialised instances (tests constructing
+        # via __new__ set only the attributes under test).
+        if getattr(self, "max_tail_message_floor", 0) > 0:
             return self.max_tail_message_floor
         return _DEFAULT_MAX_TAIL_MESSAGE_FLOOR
 

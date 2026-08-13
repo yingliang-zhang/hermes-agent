@@ -2910,6 +2910,54 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             config_context_length=_effective_context_length,
             custom_providers=_sm_custom_providers,
         )
+        # Resolve the NEW route's threshold default before updating the
+        # compressor: Codex-autoraise routes (gpt-5.4/5.5/5.6 on the
+        # codex_responses wire, gpt-5.3-codex-spark) raise the configured
+        # baseline; switching back restores the preserved config value. The
+        # resolver is raise-only for autoraises and never lowers a higher
+        # user-configured threshold. Same math as agent_init's startup path,
+        # with the compressor's immutable config baseline standing in when the
+        # agent wasn't constructed through __init__.
+        _route_default_pct = None
+        try:
+            from agent.agent_init import _resolve_compression_threshold
+            from agent.auxiliary_client import (
+                _compression_threshold_for_model as _cthresh_fn,
+                _is_codex_gpt54_or_gpt55 as _is_codex_gpt54_or_gpt55_fn,
+                _is_codex_spark as _is_codex_spark_fn,
+            )
+            _global_pct = getattr(agent, "_compression_global_threshold", None)
+            if _global_pct is None:
+                _global_pct = getattr(
+                    agent.context_compressor,
+                    "_config_threshold_percent",
+                    agent.context_compressor.threshold_percent,
+                )
+            _model_cthresh = _cthresh_fn(
+                agent.model,
+                agent.provider,
+                allow_codex_gpt55_autoraise=getattr(
+                    agent, "_codex_gpt55_autoraise", True,
+                ),
+                api_mode=agent.api_mode,
+            )
+            _route_default_pct, agent._compression_threshold_autoraised = (
+                _resolve_compression_threshold(
+                    _global_pct,
+                    _model_cthresh,
+                    model=agent.model,
+                    is_codex_autoraise=(
+                        _is_codex_gpt54_or_gpt55_fn(
+                            agent.model,
+                            agent.provider,
+                            api_mode=agent.api_mode,
+                        )
+                        or _is_codex_spark_fn(agent.model, agent.provider)
+                    ),
+                )
+            )
+        except Exception:
+            _route_default_pct = None
         agent.context_compressor.update_model(
             model=agent.model,
             context_length=new_context_length,
@@ -2917,6 +2965,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             api_key=agent.api_key,  # context_compressor forwards to call_llm; callable preserved
             provider=agent.provider,
             api_mode=agent.api_mode,
+            default_threshold_percent=_route_default_pct,
         )
 
     # ── Re-resolve reasoning_config from per-model override ──
