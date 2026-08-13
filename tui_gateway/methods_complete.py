@@ -6,7 +6,7 @@ are rebound onto server.py's globals at install time — see method_ctx.py.
 
 from .method_ctx import HandlerRegistry
 
-_MODEL_OPTIONS_RUNTIME_SNAPSHOT = "_runtime_snapshot"
+_MODEL_OPTIONS_RUNTIME_SNAPSHOT = "_model_runtime_snapshot"
 
 _registry = HandlerRegistry()
 method = _registry.method
