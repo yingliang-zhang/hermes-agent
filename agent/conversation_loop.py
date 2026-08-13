@@ -49,7 +49,6 @@ from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
-    mark_interrupted_tool_tail,
     _repair_tool_call_arguments,
     _sanitize_messages_non_ascii,
     _sanitize_messages_surrogates,
@@ -784,12 +783,6 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
         agent._cached_system_prompt = stored_prompt
-        # Prompt-section callbacks are new-session-only. Recover their frozen
-        # bytes from the persisted full prompt so a later compression rebuild
-        # keeps them without evaluating plugin state in this resumed process.
-        from agent.system_prompt import restore_plugin_prompt_sections
-
-        restore_plugin_prompt_sections(agent, stored_prompt)
         # Reconstruct the cross-session-stable prefix for the early cache
         # breakpoint. The static prefix is not persisted (only the full
         # prompt is), so gateway surfaces that build a fresh AIAgent per
@@ -3265,7 +3258,7 @@ def run_conversation(
                                 break
                             agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                             _interrupt_text = f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries})."
-                            mark_interrupted_tool_tail(messages)
+                            close_interrupted_tool_sequence(messages, _interrupt_text)
                             agent._persist_session(messages, conversation_history)
                             agent.clear_interrupt()
                             return {
@@ -4990,7 +4983,7 @@ def run_conversation(
                         break
                     agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during error handling, aborting retries.", force=True)
                     _interrupt_text = f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))})."
-                    mark_interrupted_tool_tail(messages)
+                    close_interrupted_tool_sequence(messages, _interrupt_text)
                     agent._persist_session(messages, conversation_history)
                     agent.clear_interrupt()
                     return {
@@ -6331,7 +6324,7 @@ def run_conversation(
                             break
                         agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                         _interrupt_text = f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries})."
-                        mark_interrupted_tool_tail(messages)
+                        close_interrupted_tool_sequence(messages, _interrupt_text)
                         agent._persist_session(messages, conversation_history)
                         agent.clear_interrupt()
                         return {
@@ -7356,7 +7349,6 @@ def run_conversation(
                 # timeout (HERMES_AGENT_TIMEOUT, default 1800s) and the
                 # gateway kills the session before the next activity
                 # touch fires (#69559, #69131).
-                agent._false_stop_nudges = 0  # successful tool round — reset false-stop budget
                 agent._touch_activity(f"tool results posted, continuing iteration #{api_call_count}")
                 # Continue loop for next response
                 continue
@@ -7571,7 +7563,7 @@ def run_conversation(
                                     f"Operation interrupted: retrying empty response from model "
                                     f"(retry {agent._empty_content_retries}/3)."
                                 )
-                                mark_interrupted_tool_tail(messages)
+                                close_interrupted_tool_sequence(messages, _interrupt_text)
                                 agent._persist_session(messages, conversation_history)
                                 agent.clear_interrupt()
                                 return {
@@ -7825,7 +7817,6 @@ def run_conversation(
                         or messages[-1].get("_empty_recovery_synthetic")
                         or messages[-1].get("_empty_terminal_sentinel")
                         or messages[-1].get("_dropped_toolcall_nudge")
-                        or messages[-1].get("_false_stop_synthetic")
                     )
                 ):
                     messages.pop()
@@ -7858,7 +7849,7 @@ def run_conversation(
                     # attempted final answer before the verification loop runs.
                     # Only the nudge is flagged synthetic so it gets stripped
                     # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg, force_display=True)
+                    agent._emit_interim_assistant_message(final_msg)
                     messages.append(final_msg)
                     try:
                         agent._flush_messages_to_session_db(messages, conversation_history)
@@ -7930,7 +7921,7 @@ def run_conversation(
                     # attempted final answer before the pre_verify loop runs.
                     # Only the nudge is flagged synthetic so it gets stripped
                     # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg, force_display=True)
+                    agent._emit_interim_assistant_message(final_msg)
                     messages.append(final_msg)
                     try:
                         agent._flush_messages_to_session_db(messages, conversation_history)

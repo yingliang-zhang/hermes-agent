@@ -35,12 +35,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from hermes_cli.timeouts import get_provider_request_timeout
 from agent.message_sanitization import _FULL_ARGS_LOG_BOUND
 from agent.prompt_builder import format_steer_marker
-from agent.message_sanitization import INTERRUPTED_TOOL_TAIL_KEY
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED, credential_pool_matches_provider
 from agent.error_classifier import FailoverReason
-from run_agent import _is_ephemeral_scaffolding
 from agent.turn_context import drop_stale_api_content
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
@@ -101,7 +99,7 @@ def _ra():
 
 
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
-    {"todo", "session_search", "memory", "clarify", "read_terminal", "read_preview", "read_window_below", "setup_mcp", "delegate_task"}
+    {"todo", "session_search", "memory", "clarify", "read_terminal", "read_preview", "read_window_below", "delegate_task"}
 )
 
 
@@ -166,13 +164,7 @@ def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_que
     
     while i < len(messages):
         msg = messages[i]
-
-        # Skip ephemeral scaffolding (synthetic nudges, prefill sentinels, etc.)
-        # so they don't leak into saved trajectories as training data.
-        if _is_ephemeral_scaffolding(msg):
-            i += 1
-            continue
-
+        
         if msg["role"] == "assistant":
             # Check if this message has tool calls
             if "tool_calls" in msg and msg["tool_calls"]:
@@ -1321,7 +1313,6 @@ def try_recover_primary_transport(
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
-        agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
 
         if agent.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client
@@ -1563,7 +1554,6 @@ def restore_primary_runtime(agent) -> bool:
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
-        agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
         agent._client_kwargs = dict(rt["client_kwargs"])
         agent._use_prompt_caching = rt["use_prompt_caching"]
         # Default to native layout when the restored snapshot predates the
@@ -2407,11 +2397,16 @@ def anthropic_prompt_cache_policy(
     # explicitly via provider id or host match so users on
     # provider=minimax / minimax-cn (or custom endpoints pointing at
     # api.minimax.io/anthropic / api.minimaxi.com/anthropic) get the
-    # same cost reduction as Claude traffic.  MiniMax-M3 never reaches
-    # here — it is excluded before the native-Anthropic return above.
+    # same cost reduction as Claude traffic.
     # Docs: https://platform.minimax.io/docs/api-reference/anthropic-api-compatible-cache
-    if is_anthropic_wire and is_minimax_route:
-        return True, True
+    if is_anthropic_wire:
+        is_minimax_provider = provider_lower in {"minimax", "minimax-cn"}
+        is_minimax_host = (
+            base_url_host_matches(eff_base_url, "api.minimax.io")
+            or base_url_host_matches(eff_base_url, "api.minimaxi.com")
+        )
+        if is_minimax_provider or is_minimax_host:
+            return True, True
 
     # Qwen/Alibaba on OpenCode (Zen/Go) and native DashScope: OpenAI-wire
     # transport that accepts Anthropic-style cache_control markers and
@@ -2637,7 +2632,6 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             "_anthropic_base_url",
             "_is_anthropic_oauth",
             "_config_context_length",
-            "_reasoning_echo_flag",
         )
     }
     # _client_kwargs is a dict — snapshot a shallow copy so mutating the
@@ -2671,15 +2665,6 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         agent.model = new_model
         agent.provider = new_provider
         agent.requested_provider = new_provider
-        # Re-read reasoning_echo from config so the flag reflects the new
-        # primary model's setting (see _reasoning_echo_opt_in).
-        try:
-            from hermes_cli.config import load_config_readonly
-            agent._reasoning_echo_flag = bool(
-                (load_config_readonly().get("model") or {}).get("reasoning_echo")
-            )
-        except Exception:
-            agent._reasoning_echo_flag = False
         # Use the new base_url when provided. When it's empty AND the
         # provider is actually changing, do NOT fall back to the current
         # (old provider's) URL — that silently pairs the new provider label
@@ -2914,48 +2899,6 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             config_context_length=_effective_context_length,
             custom_providers=_sm_custom_providers,
         )
-        _sm_update_kwargs = {}
-        try:
-            from agent.agent_init import _resolve_compression_threshold
-            from agent.auxiliary_client import (
-                _compression_threshold_for_model,
-                _is_codex_gpt54_or_gpt55,
-                _is_codex_spark,
-            )
-            from agent.context_compressor import ContextCompressor
-
-            if isinstance(agent.context_compressor, ContextCompressor):
-                _sm_model_threshold = _compression_threshold_for_model(
-                    agent.model,
-                    provider=agent.provider,
-                    allow_codex_gpt55_autoraise=getattr(
-                        agent, "_codex_gpt55_autoraise", True,
-                    ),
-                    api_mode=agent.api_mode,
-                )
-                _sm_default_threshold, _ = _resolve_compression_threshold(
-                    agent.context_compressor._config_threshold_percent,
-                    _sm_model_threshold,
-                    model=agent.model,
-                    is_codex_autoraise=(
-                        _is_codex_gpt54_or_gpt55(
-                            agent.model,
-                            agent.provider,
-                            api_mode=agent.api_mode,
-
-                        )
-                        or _is_codex_spark(agent.model, agent.provider)
-                    ),
-                )
-                _sm_update_kwargs["default_threshold_percent"] = (
-                    _sm_default_threshold
-                )
-        except Exception:
-            logger.debug(
-                "compression threshold resolution skipped on switch_model",
-                exc_info=True,
-            )
-
         agent.context_compressor.update_model(
             model=agent.model,
             context_length=new_context_length,
@@ -2963,7 +2906,6 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             api_key=agent.api_key,  # context_compressor forwards to call_llm; callable preserved
             provider=agent.provider,
             api_mode=agent.api_mode,
-            **_sm_update_kwargs,
         )
 
     # ── Re-resolve reasoning_config from per-model override ──
@@ -3008,7 +2950,6 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_config": dict(agent.reasoning_config) if getattr(agent, "reasoning_config", None) else None,
-        "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
         "compressor_model": getattr(_cc, "model", agent.model) if _cc else agent.model,
         "compressor_base_url": getattr(_cc, "base_url", agent.base_url) if _cc else agent.base_url,
         "compressor_api_key": getattr(_cc, "api_key", "") if _cc else "",
@@ -3271,18 +3212,6 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             return _finish_agent_tool(
                 _read_window_below_tool(
                     callback=getattr(agent, "read_window_below_callback", None),
-                ),
-                next_args,
-            )
-    elif function_name == "setup_mcp":
-        def _execute(next_args: dict) -> Any:
-            from tools.setup_mcp_tool import setup_mcp_tool as _setup_mcp_tool
-            return _finish_agent_tool(
-                _setup_mcp_tool(
-                    server=next_args.get("server", ""),
-                    action=next_args.get("action", "install"),
-                    reason=next_args.get("reason", ""),
-                    callback=getattr(agent, "setup_mcp_callback", None),
                 ),
                 next_args,
             )
@@ -3769,43 +3698,6 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
         _ra().logger.debug(
             "Pre-call sanitizer: removed %d duplicate tool_call_id reference(s)",
             removed_dupes,
-        )
-    # 4. A user redirect after an explicitly interrupted tool-result tail needs
-    # an API-only assistant closure. The same role shape is also a valid normal
-    # redirect, so interruption provenance is mandatory; role adjacency alone
-    # must never synthesize cancellation context (#48879, #63292).
-    closed_tool_tails: List[Dict[str, Any]] = []
-    inserted_closures = 0
-    stripped_markers = 0
-    previous_was_interrupted_tool = False
-    for msg in messages:
-        if msg.get("role") == "user" and previous_was_interrupted_tool:
-            closed_tool_tails.append({
-                "role": "assistant",
-                "content": "Operation interrupted.",
-            })
-            inserted_closures += 1
-
-        api_msg = msg
-        if INTERRUPTED_TOOL_TAIL_KEY in msg:
-            api_msg = {
-                key: value
-                for key, value in msg.items()
-                if key != INTERRUPTED_TOOL_TAIL_KEY
-            }
-            stripped_markers += 1
-        closed_tool_tails.append(api_msg)
-        previous_was_interrupted_tool = (
-            msg.get("role") == "tool"
-            and msg.get(INTERRUPTED_TOOL_TAIL_KEY) is True
-        )
-
-    if inserted_closures or stripped_markers:
-        messages = closed_tool_tails
-    if inserted_closures:
-        _ra().logger.debug(
-            "Pre-call sanitizer: closed %d interrupted tool-result tail(s)",
-            inserted_closures,
         )
     return messages
 

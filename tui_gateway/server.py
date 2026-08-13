@@ -461,14 +461,8 @@ class _SlashWorker:
             creationflags=windows_hide_flags(),
             start_new_session=True,
         )
-        self._drain_thread_stdout = threading.Thread(
-            target=self._drain_stdout, daemon=True, name="slash-drain-stdout"
-        )
-        self._drain_thread_stderr = threading.Thread(
-            target=self._drain_stderr, daemon=True, name="slash-drain-stderr"
-        )
-        self._drain_thread_stdout.start()
-        self._drain_thread_stderr.start()
+        threading.Thread(target=self._drain_stdout, daemon=True).start()
+        threading.Thread(target=self._drain_stderr, daemon=True).start()
 
     def _drain_stdout(self):
         for line in self.proc.stdout or []:
@@ -538,18 +532,6 @@ class _SlashWorker:
                     stream.close()
                 except Exception:
                     pass
-            # Join drain threads so they don't outlive the worker. After
-            # proc.terminate() and stream.close(), the readline() in
-            # _drain_stdout/_drain_stderr hits EOF and the threads exit
-            # promptly. The timeout is a safety net for edge cases where
-            # the subprocess is mid-write (#53303).
-            for t in (getattr(self, '_drain_thread_stdout', None),
-                      getattr(self, '_drain_thread_stderr', None)):
-                if t is not None:
-                    try:
-                        t.join(timeout=2)
-                    except Exception:
-                        pass
 
 
 def _load_busy_input_mode() -> str:
@@ -1002,9 +984,6 @@ def _teardown_popped_session(
     """Finish a close after the caller has atomically detached the session."""
     if session is None:
         return False
-    logger.info(
-        "session closed sid=%s end_reason=%s", session.get("_sid", ""), end_reason
-    )
     run_thread = session.get("_run_thread")
     if (
         end_reason != "tui_shutdown"
@@ -1215,25 +1194,7 @@ def _close_sessions_for_transport(
             with session["history_lock"]:
                 if session.get("transport") is not transport:
                     continue
-                # Point detached sessions at the drop sentinel (NOT real stdio) so
-                # _ws_session_is_orphaned recognizes them and the grace-reap can
-                # actually fire; a standalone `hermes --tui` keeps real _stdio.
                 session["transport"] = _detached_ws_transport
-                # Close the slash_worker immediately on detach — it's ~13 MB per
-                # process and the Desktop app uses one WS for all sessions, so
-                # switching sessions leaves the old workers alive until the 6 h TTL
-                # reaper or the 20 s orphan reaper fires (which may not fire at all
-                # if the session is flagged running by a background curator review).
-                # The worker is recreated lazily on the next slash command: the
-                # slash.exec handler and _restart_slash_worker both handle
-                # worker=None.
-                worker = session.get("slash_worker")
-                if worker:
-                    try:
-                        worker.close()
-                    except Exception:
-                        pass
-                    session["slash_worker"] = None
                 detached += 1
             try:
                 _schedule_ws_orphan_reap(sid)
@@ -2144,29 +2105,6 @@ def _current_session_steer_authority(
         return transport, session
 
 
-_MODEL_OPTIONS_RUNTIME_SNAPSHOT = "_model_runtime_snapshot"
-
-
-def _freeze_model_options_request(req: dict, params: dict) -> dict:
-    """Copy a model.options request with its coherent request-time runtime."""
-    with _sessions_lock:
-        session = _sessions.get(params.get("session_id", ""))
-        agent = session.get("agent") if session else None
-        if agent is None:
-            runtime_snapshot = None
-        else:
-            runtime_snapshot = {
-                key: getattr(agent, key, "") or ""
-                for key in ("model", "provider", "base_url")
-            }
-
-    worker_params = dict(params)
-    worker_params[_MODEL_OPTIONS_RUNTIME_SNAPSHOT] = runtime_snapshot
-    worker_request = dict(req)
-    worker_request["params"] = worker_params
-    return worker_request
-
-
 def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
     """Route inbound RPCs — long handlers to the pool, everything else inline.
 
@@ -2186,22 +2124,16 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
         if isinstance(normalized, dict):
             return normalized
 
-        _rid, method, params = normalized
+        _rid, method, _params = normalized
         if method not in _LONG_HANDLERS:
             return handle_request(req)
-
-        worker_request = (
-            _freeze_model_options_request(req, params)
-            if method == "model.options"
-            else req
-        )
 
         # Snapshot the context so the pool worker sees the bound transport.
         ctx = contextvars.copy_context()
 
         def run():
             try:
-                resp = handle_request(worker_request)
+                resp = handle_request(req)
             except Exception as exc:
                 resp = _err(req.get("id"), -32000, f"handler error: {exc}")
             if resp is not None:
@@ -3575,7 +3507,6 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300) -> 
         "terminal.read.request",
         "preview.read.request",
         "window.read.request",
-        "mcp.setup.request",
     }:
         _emit(
             f"{event.removesuffix('.request')}.expire",
@@ -4721,8 +4652,7 @@ def _tool_lifecycle_required_for_ui(name: str) -> bool:
     # Desktop renders the clarify choices/question from the tool-call part, then
     # wires request_id from clarify.request. If tool progress is off, suppressing
     # clarify's lifecycle events leaves only the sidebar attention dot visible.
-    # setup_mcp is the same shape: its consent card mounts on the tool part.
-    return name in ("clarify", "setup_mcp")
+    return name == "clarify"
 
 
 def _restart_slash_worker(sid: str, session: dict):
@@ -5567,16 +5497,6 @@ def _session_info(agent, session: dict | None = None) -> dict:
     pending_switch = (session or {}).get("pending_model_switch") or {}
     pending_model = str(pending_switch.get("display_model") or "").strip()
     pending_provider = str(pending_switch.get("display_provider") or "").strip()
-    # Epoch seconds the current turn started, or None when idle. Lets the
-    # desktop preserve the turn-elapsed timer across session switches (cold
-    # resume path) instead of resetting it to 0:00.
-    inflight = (session or {}).get("inflight_turn")
-    turn_started_at = (
-        float(inflight["started_at"])
-        if isinstance(inflight, dict) and inflight.get("started_at")
-        else None
-    )
-
     info: dict = {
         "model": pending_model or mirror.get("model", getattr(agent, "model", "")),
         "provider": pending_provider
@@ -5594,7 +5514,6 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "terminal_backend": _effective_terminal_backend(),
         "personality": str(personality or ""),
         "running": bool((session or {}).get("running")),
-        "turn_started_at": turn_started_at,
         "title": _session_live_title(session or {}, session_key) if session_key else "",
         "stored_session_id": session_key or "",
         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
@@ -6225,18 +6144,6 @@ def _agent_cbs(sid: str) -> dict:
             sid,
             {},
             timeout=30,
-        ),
-        # setup_mcp tool (desktop GUI): the renderer shows an inline consent
-        # card and walks the user through install/enable/OAuth via the REST
-        # endpoints, then answers mcp.setup.respond with the JSON outcome.
-        # Long timeout on purpose — the flow can include typing an API key or
-        # a browser OAuth round-trip. Same lifecycle as clarify: on timeout
-        # the tool returns "unanswered" and a late answer is tolerated.
-        "setup_mcp_callback": lambda server, action, reason: _block(
-            "mcp.setup.request",
-            sid,
-            {"server": server, "action": action, "reason": reason},
-            timeout=600,
         ),
     }
 
@@ -8898,12 +8805,6 @@ def _live_session_payload(
         inflight = _inflight_snapshot(session)
         queued = _queued_prompt_snapshot(session)
         running = bool(session.get("running"))
-        inflight_turn = session.get("inflight_turn")
-        turn_started_at = (
-            float(inflight_turn["started_at"])
-            if isinstance(inflight_turn, dict) and inflight_turn.get("started_at")
-            else None
-        )
     # Prefer the persisted display lineage (candidate-inclusive) so this payload
     # matches the eager session.resume + REST transcript. Use the session's
     # profile-aware DB (not launch ``_get_db()``): app-global remote profile
@@ -8923,7 +8824,6 @@ def _live_session_payload(
         "messages": [] if omit_messages else _history_to_messages(history),
         "messages_omitted": omit_messages,
         "running": running,
-        "turn_started_at": turn_started_at,
         "session_id": sid,
         "session_key": _session_lookup_key(session, fallback=sid),
         "started_at": float(session.get("created_at") or time.time()),
@@ -14406,19 +14306,13 @@ def _details_completions(text: str) -> list[dict] | None:
     return []
 
 
-def _model_picker_context(agent, *, runtime_snapshot: dict | None = None):
-    """Layer live or request-time state onto config without losing identity."""
+def _model_picker_context(agent):
+    """Layer live session state onto config without losing custom identity."""
     from hermes_cli.inventory import load_picker_context
 
     ctx = load_picker_context()
-    if isinstance(runtime_snapshot, dict):
-        provider = runtime_snapshot.get("provider", "")
-        model = runtime_snapshot.get("model", "")
-        base_url = runtime_snapshot.get("base_url", "")
-    else:
-        provider = getattr(agent, "provider", "") if agent else ""
-        model = getattr(agent, "model", "") if agent else ""
-        base_url = getattr(agent, "base_url", "") if agent else ""
+    provider = getattr(agent, "provider", "") if agent else ""
+    base_url = getattr(agent, "base_url", "") if agent else ""
     if str(provider or "").strip().lower() == "custom":
         try:
             from hermes_cli.runtime_provider import canonical_custom_identity
@@ -14427,7 +14321,8 @@ def _model_picker_context(agent, *, runtime_snapshot: dict | None = None):
                 canonical_custom_identity(
                     base_url=base_url or None,
                     config_provider=ctx.current_provider,
-                    model=model or None,
+                    model=(getattr(agent, "model", "") if agent else "")
+                    or None,
                 )
                 or provider
             )
@@ -14439,10 +14334,10 @@ def _model_picker_context(agent, *, runtime_snapshot: dict | None = None):
 
     return ctx.with_overrides(
         current_provider=provider,
-        current_model=model or _resolve_model(),
+        current_model=(getattr(agent, "model", "") if agent else "")
+        or _resolve_model(),
         current_base_url=base_url,
     )
-
 
 
 # ── Methods: slash.exec ──────────────────────────────────────────────
