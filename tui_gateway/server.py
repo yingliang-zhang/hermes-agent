@@ -5497,6 +5497,16 @@ def _session_info(agent, session: dict | None = None) -> dict:
     pending_switch = (session or {}).get("pending_model_switch") or {}
     pending_model = str(pending_switch.get("display_model") or "").strip()
     pending_provider = str(pending_switch.get("display_provider") or "").strip()
+    # Epoch seconds the current turn started, or None when idle. Lets the
+    # desktop preserve the turn-elapsed timer across session switches (cold
+    # resume path) instead of resetting it to 0:00.
+    inflight = (session or {}).get("inflight_turn")
+    turn_started_at = (
+        float(inflight["started_at"])
+        if isinstance(inflight, dict) and inflight.get("started_at")
+        else None
+    )
+
     info: dict = {
         "model": pending_model or mirror.get("model", getattr(agent, "model", "")),
         "provider": pending_provider
@@ -5509,6 +5519,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "tools": dict(mirror.get("tools") or {}) if isinstance(mirror.get("tools"), dict) else {},
         "skills": dict(mirror.get("skills") or {}) if isinstance(mirror.get("skills"), dict) else {},
         "cwd": cwd,
+        "turn_started_at": turn_started_at,
         "branch": _git_branch_for_cwd(cwd),
         "project": _project_info_for_cwd(cwd),
         "terminal_backend": _effective_terminal_backend(),
@@ -6402,16 +6413,6 @@ def _agent_fallback_model(agent):
 def _background_agent_kwargs(agent, task_id: str) -> dict:
     cfg = _load_cfg()
 
-    # Epoch seconds the current turn started, or None when idle. Lets the
-    # desktop preserve the turn-elapsed timer across session switches (cold
-    # resume path) instead of resetting it to 0:00.
-    inflight = (session or {}).get("inflight_turn")
-    turn_started_at = (
-        float(inflight["started_at"])
-        if isinstance(inflight, dict) and inflight.get("started_at")
-        else None
-    )
-
     return {
         "base_url": getattr(agent, "base_url", None) or None,
         "api_key": getattr(agent, "api_key", None) or None,
@@ -6441,7 +6442,6 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "provider_data_collection": getattr(agent, "provider_data_collection", None),
         "openrouter_min_coding_score": getattr(agent, "openrouter_min_coding_score", None),
         "session_id": task_id,
-        "turn_started_at": turn_started_at,
         "reasoning_config": getattr(agent, "reasoning_config", None)
         or _load_reasoning_config(str(getattr(agent, "model", "") or "")),
         "service_tier": getattr(agent, "service_tier", None) or _load_service_tier(),
