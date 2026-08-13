@@ -2666,6 +2666,7 @@ def init_agent(
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
             min_tail_user_messages=compression_min_tail_users,
             tail_mode=compression_tail_mode,
+            protect_delivered_count=compression_protect_delivered,
             hygiene_hard_message_limit=compression_hard_msg_limit,
             max_tail_message_floor=compression_max_tail_message_floor,
         )
