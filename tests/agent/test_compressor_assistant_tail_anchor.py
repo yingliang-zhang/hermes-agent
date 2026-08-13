@@ -492,7 +492,7 @@ class TestSourceGuardrail:
         """The two anchors must run in sequence; reversing or skipping
         one drops the corresponding side of the guarantee."""
         user_call = "self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)"
-        asst_call = "self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end)"
+        asst_call = "self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end"
         user_idx = source.find(user_call)
         asst_idx = source.find(asst_call)
         assert user_idx >= 0 and asst_idx >= 0

@@ -1980,6 +1980,10 @@ def init_agent(
     # 2.5%/10K-25K tail with recovery-pointer machinery (#87326). Unknown
     # values fall back to legacy inside the compressor.
     compression_tail_mode = str(_compression_cfg.get("tail_mode", "legacy")).strip().lower()
+    # Number of recent delivered (finish_reason=stop) assistant replies to
+    # protect from compaction (#78100 protect-delivered fix). Default 3
+    # preserves up to 3 recent answers; set to 1 for old behavior.
+    compression_protect_delivered = int(_compression_cfg.get("protect_delivered_count", 3))
     # Minimum REAL (actionable) user messages guaranteed to survive in the
     # uncompressed tail (compression.min_tail_user_messages).  Default 1
     # preserves current behavior exactly — the existing single-user tail

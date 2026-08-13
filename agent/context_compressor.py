@@ -2601,6 +2601,7 @@ class ContextCompressor(ContextEngine):
         api_mode: str = "",
         max_tokens: int | None = None,
         default_threshold_percent: float | None = None,
+        protect_delivered_count: int = 1,
     ) -> None:
         """Update model info after a model switch or fallback activation."""
         runtime_changed = any((
@@ -2883,6 +2884,7 @@ class ContextCompressor(ContextEngine):
         )
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
+        self.protect_delivered_count = protect_delivered_count
         # Proactive tool-result pruning (cost-oriented; runs INDEPENDENTLY of the
         # full-compression trigger, via prune_tool_results_only()). 0 = disabled.
         self.proactive_prune_tokens = int(proactive_prune_tokens or 0)
@@ -5785,8 +5787,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         messages: List[Dict[str, Any]],
         cut_idx: int,
         head_end: int,
+        protect_delivered_count: int = 1,
     ) -> int:
-        """Guarantee the most recent assistant message is in the protected tail.
+        """Guarantee the most recent delivered assistant replies are in the protected tail.
 
         WebUI / TUI / SessionsPage bug (#29824). Without this anchor,
         ``_find_tail_cut_by_tokens`` can leave the user's most recent
@@ -5812,28 +5815,58 @@ This compaction should PRIORITISE preserving all information related to the focu
         tool messages would otherwise be removed by
         ``_sanitize_tool_pairs`` and trigger the same data-loss symptom
         we're trying to prevent.
+
+        Extended (#78100 ghost-reply / protect-delivered fix): protect
+        up to *protect_delivered_count* recent content-bearing assistant
+        replies, not just the single most recent one. This prevents
+        earlier delivered answers — which the user may not have read yet
+        — from being archived into the compaction summary. The default of
+        3 is conservative: assistant replies are typically small compared
+        to tool outputs, so the impact on compression ratio is minimal.
         """
-        last_asst_idx = self._find_last_assistant_message_idx(messages, head_end)
-        if last_asst_idx < 0:
-            # No assistant message in the compressible region — nothing
-            # to anchor (single-turn pre-reply state, etc.).
+        # Find up to N delivered assistant messages (content-bearing,
+        # non-summary) in the compressible region.
+        delivered_indices: List[int] = []
+        for i in range(len(messages) - 1, head_end - 1, -1):
+            if len(delivered_indices) >= protect_delivered_count:
+                break
+            msg = messages[i]
+            if msg.get("role") != "assistant":
+                continue
+            if self._is_context_summary_content(msg.get("content")):
+                continue
+            if self._is_context_summary_message(msg):
+                continue
+            content = msg.get("content")
+            if isinstance(content, str) and content.strip():
+                delivered_indices.append(i)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict):
+                        text = part.get("text") or part.get("content")
+                        if isinstance(text, str) and text.strip():
+                            delivered_indices.append(i)
+                            break
+
+        if not delivered_indices:
             return cut_idx
-        if last_asst_idx >= cut_idx:
-            # Already in the tail — the token-budget walk did the right
-            # thing on its own.
+
+        # The earliest of the delivered answers is the one most at risk
+        # of being in the compressed region. Anchor cut_idx to it.
+        earliest_delivered = min(delivered_indices)
+        if earliest_delivered >= cut_idx:
+            # All delivered answers already in the tail.
             return cut_idx
-        # Pull cut_idx back to the assistant message, then re-align so
-        # we don't split a tool group that immediately precedes it
-        # (e.g. an ``assistant(tool_calls)`` → ``tool(result)`` →
-        # ``assistant(final reply)`` sequence would otherwise leave the
-        # ``tool`` orphan when cut lands at the final reply).
-        new_cut = self._align_boundary_backward(messages, last_asst_idx)
+
+        # Pull cut_idx back to the earliest delivered answer, then
+        # re-align so we don't split a tool group that immediately
+        # precedes it.
+        new_cut = self._align_boundary_backward(messages, earliest_delivered)
         if not self.quiet_mode:
             logger.debug(
-                "Anchoring tail cut to last assistant message at index %d "
-                "(was %d, aligned to %d) to keep the previously-visible "
-                "reply out of the compaction summary (#29824)",
-                last_asst_idx, cut_idx, new_cut,
+                "Anchoring tail cut to protect %d delivered assistant messages "
+                "(earliest at index %d, was %d, aligned to %d) (#29824, #78100)",
+                len(delivered_indices), earliest_delivered, cut_idx, new_cut,
             )
         # Safety: never go back into the head region.
         return max(new_cut, head_end + 1)
@@ -6112,7 +6145,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # ``[CONTEXT COMPACTION — REFERENCE ONLY]`` block (fixes #29824).
         # Each anchor only walks ``cut_idx`` backward, so chaining them is
         # monotonic — the tail can only grow, never shrink.
-        cut_idx = self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end)
+        cut_idx = self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end, protect_delivered_count=getattr(self, "protect_delivered_count", 3))
 
         # Extend to the last N actionable user messages when configured
         # (compression.min_tail_user_messages > 1).  This prevents the
