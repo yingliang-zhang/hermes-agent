@@ -215,4 +215,3 @@ def test_run_job_releases_cwd_lock_when_body_raises(tmp_path):
     t.start()
     assert acquired.wait(timeout=5), "writer lock was leaked by run_job on exception"
     t.join(timeout=5)
-
