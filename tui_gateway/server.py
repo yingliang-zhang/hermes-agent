@@ -462,8 +462,16 @@ class _SlashWorker:
             creationflags=windows_hide_flags(),
             start_new_session=True,
         )
-        threading.Thread(target=self._drain_stdout, daemon=True).start()
-        threading.Thread(target=self._drain_stderr, daemon=True).start()
+        # Keep references so close() can join them (#53303); name them so
+        # leaked-thread dumps (py-spy) attribute the source.
+        self._drain_thread_stdout = threading.Thread(
+            target=self._drain_stdout, daemon=True, name="slash-drain-stdout"
+        )
+        self._drain_thread_stderr = threading.Thread(
+            target=self._drain_stderr, daemon=True, name="slash-drain-stderr"
+        )
+        self._drain_thread_stdout.start()
+        self._drain_thread_stderr.start()
 
     def _drain_stdout(self):
         for line in self.proc.stdout or []:
@@ -533,6 +541,20 @@ class _SlashWorker:
                     stream.close()
                 except Exception:
                     pass
+        # Join the drain threads (#53303): without this each closed session
+        # leaks two daemon threads holding references to this worker and its
+        # buffers. Bounded so a wedged reader can't hang gateway shutdown.
+        for thread in (
+            getattr(self, "_drain_thread_stdout", None),
+            getattr(self, "_drain_thread_stderr", None),
+        ):
+            if thread is None:
+                continue
+            try:
+                thread.join(timeout=2)
+            except RuntimeError:
+                # Thread was never started (partially-initialised worker).
+                pass
 
 
 def _load_busy_input_mode() -> str:
@@ -1031,7 +1053,12 @@ def _close_session_by_id(
             if current is None or not predicate(current):
                 return False
             session = _pop_session_by_id(sid)
-    return _teardown_popped_session(session, end_reason=end_reason)
+    closed = _teardown_popped_session(session, end_reason=end_reason)
+    if closed:
+        # Observability: previously the teardown path was completely silent,
+        # making it impossible to diagnose why sessions were or weren't reaped.
+        logger.info("session closed: %s (end_reason=%s)", sid, end_reason)
+    return closed
 
 
 def _ws_session_is_orphaned(session: dict | None) -> bool:
@@ -1191,12 +1218,31 @@ def _close_sessions_for_transport(
         else:
             # The owner snapshot can race a resume/retry. Serialize the final
             # detach with transport rebinding and only replace the transport
-            # this disconnect still owns.
-            with session["history_lock"]:
+            # this disconnect still owns. Sessions always carry a
+            # ``history_lock``; tolerate its absence so partial session dicts
+            # (tests, legacy fixtures) don't KeyError.
+            lock = session.get("history_lock")
+            with (lock if lock is not None else contextlib.nullcontext()):
                 if session.get("transport") is not transport:
                     continue
                 session["transport"] = _detached_ws_transport
                 detached += 1
+                # Close the slash worker immediately instead of letting it
+                # linger until the orphan grace/TTL reap: an idle worker is
+                # ~13 MB plus drain threads per session, and the Desktop app
+                # detaches on every session switch. Recreated lazily on next
+                # use.
+                worker = session.get("slash_worker")
+                session["slash_worker"] = None
+            if worker is not None:
+                try:
+                    worker.close()
+                except Exception:
+                    logger.warning(
+                        "slash worker close failed for detaching session %s",
+                        sid,
+                        exc_info=True,
+                    )
             try:
                 _schedule_ws_orphan_reap(sid)
             except Exception:
