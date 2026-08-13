@@ -2189,6 +2189,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
       'prompt.submit',
       {
         message_id: 'queued-1700000000000-source',
+        queued: true,
         session_id: RUNTIME_SESSION_ID,
         submitted_at: 1_700_000_000,
         text: 'queued message'
@@ -2444,12 +2445,14 @@ describe('useComposerQueue source-session retention', () => {
     expect(promptCalls).toEqual([
       {
         message_id: entry.id,
-        session_id: 'rt-a-stale',
+        queued: true,
+        session_id: 'rt-a-recovered',
         submitted_at: entry.queuedAt / 1000,
         text: entry.text
       },
       {
         message_id: entry.id,
+        queued: true,
         session_id: 'rt-a-recovered',
         submitted_at: entry.queuedAt / 1000,
         text: entry.text
@@ -2459,7 +2462,12 @@ describe('useComposerQueue source-session retention', () => {
     expect(ownedSourceIds).toEqual(new Set([entry.id]))
     expect(getQueuedPrompts(STORED_SESSION_A)).toEqual([])
     expect(getQueuedPrompts(STORED_SESSION_B)).toEqual([])
-    expect(calls.filter(call => call.method === 'session.resume')).toHaveLength(2)
+    // Three resumes, in order: the first drain's abandoned one (drifted away
+    // mid-resume), the retry's pre-submit rebind of the queue entry to the
+    // recovered runtime (submit's fromQueue check drops the stale queued id,
+    // then session.resume before any prompt.submit), and the bounded recovery
+    // resume after the scripted prompt.submit timeout.
+    expect(calls.filter(call => call.method === 'session.resume')).toHaveLength(3)
   })
 })
 
