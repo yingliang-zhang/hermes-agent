@@ -459,6 +459,17 @@ CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_system_prompt_hash
     ON sessions(system_prompt_hash);
+-- Byte-identical ACTIVE duplicate guard (#53461): two live rows may never
+-- share (session_id, role, content, timestamp). Partial so the intentional
+-- in-place-compaction pair — the same content+timestamp kept once as the
+-- soft-archived original (active=0, compacted=1) and once as the fresh
+-- active row — stays legal; the constraint bites only within the ACTIVE
+-- class, where a duplicate can only be a residual double-write. The
+-- columns here are exactly the conflict target of the ON CONFLICT clause
+-- on the messages INSERTs in hermes_state.py.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_active_dedupe
+    ON messages(session_id, role, content, timestamp)
+    WHERE active = 1;
 """
 
 

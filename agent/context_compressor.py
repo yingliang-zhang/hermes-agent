@@ -2846,6 +2846,7 @@ class ContextCompressor(ContextEngine):
         hygiene_hard_message_limit: int = 0,
         max_tail_message_floor: int = 0,
         default_threshold_percent: float | None = None,
+        protect_delivered_count: int = 1,
     ) -> None:
         self.model = model
         self.base_url = base_url
