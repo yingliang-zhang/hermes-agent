@@ -509,6 +509,19 @@ class TestSessionLifecycle:
     def test_first_accounted_fallback_replaces_requested_primary_route(self, db):
         """First successful fallback usage must persist one coherent route pair."""
         db.create_session(session_id="s1", source="cli", model="gpt-5.6-sol")
+        db._conn.execute(
+            "CREATE TABLE session_end_audit (reason TEXT NOT NULL)"
+        )
+        db._conn.execute(
+            """
+            CREATE TRIGGER audit_session_end
+            AFTER UPDATE OF ended_at ON sessions
+            WHEN OLD.ended_at IS NULL AND NEW.ended_at IS NOT NULL
+            BEGIN
+                INSERT INTO session_end_audit(reason) VALUES (NEW.end_reason);
+            END
+            """
+        )
 
         db.update_token_counts(
             "s1",
@@ -519,6 +532,8 @@ class TestSessionLifecycle:
             billing_base_url="https://api.z.ai/api/coding/paas/v4/",
             api_call_count=1,
         )
+
+        import threading
 
         peer = SessionDB(db_path=db.db_path)
         barrier = threading.Barrier(2)
