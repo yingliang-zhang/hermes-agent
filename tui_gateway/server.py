@@ -14318,7 +14318,7 @@ def _details_completions(text: str) -> list[dict] | None:
     return []
 
 
-def _model_picker_context(agent):
+def _model_picker_context(agent, runtime_snapshot=None):
     """Layer live session state onto config without losing custom identity."""
     from hermes_cli.inventory import load_picker_context
 
