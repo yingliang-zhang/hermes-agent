@@ -3585,6 +3585,31 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
         filtered.append(msg)
     messages = filtered
 
+    # --- Close interrupted tool tails on the API copy (#48879/#63292) ---
+    # ``mark_interrupted_tool_tail`` keeps the durable transcript at the real
+    # tool row and stamps provenance instead of persisting a synthetic
+    # assistant closure. Strict providers (Gemini, Claude) reject — or
+    # hallucinate continuations for — a direct tool → user alternation, so
+    # this per-call copy closes the sequence with an interim assistant
+    # marker when the next wire message isn't already an assistant. The
+    # provenance key is internal; strip it from the copy either way.
+    from agent.message_sanitization import INTERRUPTED_TOOL_TAIL_KEY
+
+    closed_tail: List[Dict[str, Any]] = []
+    for i, msg in enumerate(messages):
+        if isinstance(msg, dict) and INTERRUPTED_TOOL_TAIL_KEY in msg:
+            closed_tail.append(
+                {k: v for k, v in msg.items() if k != INTERRUPTED_TOOL_TAIL_KEY}
+            )
+            nxt = messages[i + 1] if i + 1 < len(messages) else None
+            if not (isinstance(nxt, dict) and nxt.get("role") == "assistant"):
+                closed_tail.append(
+                    {"role": "assistant", "content": "Operation interrupted."}
+                )
+        else:
+            closed_tail.append(msg)
+    messages = closed_tail
+
     # --- Heal empty-content non-final messages (self-recovery) ---
     # A dead stream can leave an empty assistant stub (or an empty user turn)
     # mid-transcript; the provider then 400s EVERY subsequent request until it

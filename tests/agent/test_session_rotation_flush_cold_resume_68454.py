@@ -51,7 +51,16 @@ def _contents(rows):
 
 
 def test_rotation_flush_without_history_boundary_duplicates(tmp_path: Path) -> None:
-    """Control: bare flush of unstamped cold-resume rows double-writes (#68454)."""
+    """Control: bare flush of unstamped cold-resume rows cannot double-write.
+
+    On older builds (and on stock upstream, which lacks the partial UNIQUE
+    index ``idx_messages_active_dedupe(session_id, role, content, timestamp)
+    WHERE active=1``) this bare flush — no ``conversation_history=`` boundary —
+    double-wrote the cold-resumed rows (#68454). The current schema makes the
+    duplicate ``INSERT`` a DB-level no-op even without the boundary, so the
+    assertion below intentionally diverges from the upstream copy of this
+    test: duplicates are forbidden, independently of the boundary.
+    """
     db = SessionDB(db_path=tmp_path / "state.db")
     sid = "COLD_ROTATE_DUP"
     db.create_session(sid, source="cli")
@@ -63,7 +72,7 @@ def test_rotation_flush_without_history_boundary_duplicates(tmp_path: Path) -> N
     agent._flush_messages_to_session_db(loaded)  # missing conversation_history=
 
     rows = db.get_messages_as_conversation(sid, include_inactive=True)
-    assert _contents(rows).count("persisted question") == 2
+    assert _contents(rows).count("persisted question") == 1
 
 
 def test_rotation_flush_with_history_boundary_is_noop(tmp_path: Path) -> None:
