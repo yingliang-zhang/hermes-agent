@@ -8830,6 +8830,12 @@ def _live_session_payload(
     else:
         with _session_db(session) as db:
             history = _live_visible_history(session, db, in_memory_history)
+    inflight_turn = session.get("inflight_turn")
+    turn_started_at = (
+        float(inflight_turn["started_at"])
+        if isinstance(inflight_turn, dict) and inflight_turn.get("started_at")
+        else None
+    )
     payload = {
         "info": _fallback_session_info(session),
         "message_count": len(history),
@@ -8840,6 +8846,7 @@ def _live_session_payload(
         "session_key": _session_lookup_key(session, fallback=sid),
         "started_at": float(session.get("created_at") or time.time()),
         "status": _session_live_status(sid, session),
+        "turn_started_at": turn_started_at,
     }
     if inflight:
         payload["inflight"] = inflight
