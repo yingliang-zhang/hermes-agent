@@ -282,6 +282,7 @@ function QueueHarness({
     refreshSessions: async () => undefined,
     requestGateway,
     resumeStoredSession: () => undefined,
+    runtimeIdByStoredSessionIdRef: { current: new Map() },
     selectedStoredSessionIdRef,
     startFreshSessionDraft: () => undefined,
     sttEnabled: false,
