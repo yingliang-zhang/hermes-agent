@@ -4152,8 +4152,15 @@ def _open_cron_session_db(log_context: str):
         if timeout <= 0:
             return SessionDB()
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(SessionDB)
+        # If SessionDB() later completes inside the abandoned worker, the
+        # future's result — an open SessionDB holding .db / WAL / SHM file
+        # handles — would be orphaned and never closed, leaking descriptors
+        # until EMFILE (#72782).  Register the done-callback BEFORE calling
+        # .result() so it fires even when the timeout raises.
+        future.add_done_callback(_close_late_session_db_result)
         try:
-            return pool.submit(SessionDB).result(timeout=timeout)
+            return future.result(timeout=timeout)
         finally:
             # A wedged constructor must not hold up the tick or job monitor.
             pool.shutdown(wait=False)

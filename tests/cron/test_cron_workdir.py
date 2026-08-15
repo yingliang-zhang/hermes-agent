@@ -172,6 +172,14 @@ class TestTickWorkdirPartition:
         monkeypatch.setattr(
             sched, "_deliver_result", lambda *_a, **_kw: None
         )
+        # Upstream tick() now claims jobs and creates execution records before
+        # dispatching to run_one_job. Mock the claim/execution/release cycle
+        # so the parallel pool path is exercised without a real cron DB.
+        monkeypatch.setattr(sched, "claim_job_for_fire", lambda jid, return_job=False: {"id": jid})
+        monkeypatch.setattr(sched, "finish_execution", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "create_execution", lambda job_id, source="builtin": {"id": "exec-1"})
+        monkeypatch.setattr(sched, "release_running_job", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "sweep_stale_inflight", lambda *_a, **_kw: None)
 
         n = sched.tick(verbose=False)
         assert n == 3

@@ -622,7 +622,7 @@ def test_run_job_no_agent_success_records_run_session(hermes_env):
     real_run_job_script = scheduler._run_job_script
     real_session_db = hermes_state.SessionDB
 
-    def tracked_script(path, workdir=None):
+    def tracked_script(path, workdir=None, cancel_event=None):
         events.append("script")
         return real_run_job_script(path, workdir=workdir)
 
