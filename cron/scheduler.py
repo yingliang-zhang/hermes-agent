@@ -4156,11 +4156,14 @@ def _open_cron_session_db(log_context: str):
         # If SessionDB() later completes inside the abandoned worker, the
         # future's result — an open SessionDB holding .db / WAL / SHM file
         # handles — would be orphaned and never closed, leaking descriptors
-        # until EMFILE (#72782).  Register the done-callback BEFORE calling
-        # .result() so it fires even when the timeout raises.
-        future.add_done_callback(_close_late_session_db_result)
+        # until EMFILE (#72782).  Register the done-callback ONLY on the
+        # timeout path so it fires for a late result; adding it before
+        # .result() would immediately close a db that completed on time.
         try:
             return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.add_done_callback(_close_late_session_db_result)
+            raise
         finally:
             # A wedged constructor must not hold up the tick or job monitor.
             pool.shutdown(wait=False)
