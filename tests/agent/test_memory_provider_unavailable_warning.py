@@ -40,7 +40,7 @@ def test_provider_reason_is_appended(caplog):
     # #7718) reaches the user through this warning — the only path that runs
     # when the provider is unavailable and thus never initialized.
     agent_init._warned_unavailable_providers.clear()
-    hint = "Install the embedded runtime with: uv pip install hindsight-all."
+    hint = "Run 'hermes memory setup' to install the lightweight embedded runtime, or verify HINDSIGHT_EMBED_API_EXECUTABLE."
     with caplog.at_level(logging.WARNING, logger="run_agent"):
         agent_init._warn_memory_provider_unavailable("hindsight", hint)
 

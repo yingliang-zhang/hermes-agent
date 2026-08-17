@@ -343,15 +343,22 @@ class TestConfig:
         assert env["HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT"] == "0"
 
 
-    def test_get_client_passes_idle_timeout_to_hindsight_embedded(self, monkeypatch):
+    def test_get_client_passes_settings_to_dedicated_embedded_adapter(self, monkeypatch):
+        from plugins.memory.hindsight import embedded_runtime
+
         captured = {}
 
-        class FakeHindsightEmbedded:
+        class FakeDedicatedEmbeddedClient:
             def __init__(self, **kwargs):
                 captured.update(kwargs)
 
-        monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded))
+        monkeypatch.setattr(
+            embedded_runtime,
+            "DedicatedEmbeddedClient",
+            FakeDedicatedEmbeddedClient,
+        )
         monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
+        monkeypatch.setattr("tools.lazy_deps.ensure", lambda *args, **kwargs: None)
 
         p = HindsightMemoryProvider()
         p._mode = "local_embedded"
@@ -361,6 +368,7 @@ class TestConfig:
             "llm_api_key": "test-key",
             "llm_model": "test-model",
             "idle_timeout": 0,
+            "server_executable": "/managed/current/bin/hindsight-api",
         }
         p._llm_base_url = "http://localhost:8060/v1"
 
@@ -368,6 +376,7 @@ class TestConfig:
 
         assert captured["idle_timeout"] == 0
         assert captured["llm_provider"] == "openai"
+        assert captured["server_executable"] == "/managed/current/bin/hindsight-api"
 
 
 class TestPostSetup:
@@ -1669,13 +1678,13 @@ class TestClientAutoUpgradeRoutesThroughLazyDeps:
         return calls
 
     def test_upgrade_uses_install_specs_not_subprocess(self, tmp_path, monkeypatch):
-        from plugins.memory.hindsight import _MIN_CLIENT_VERSION
+        from plugins.memory.hindsight import _CLIENT_REQUIREMENT
         from tools.lazy_deps import InstallSpecsResult
 
         calls = self._init_with_outdated_client(
             tmp_path, monkeypatch, InstallSpecsResult(ok=True)
         )
-        assert calls == [(f"hindsight-client>={_MIN_CLIENT_VERSION}",)]
+        assert calls == [(_CLIENT_REQUIREMENT,)]
 
     def test_blocked_upgrade_is_nonfatal_and_surfaces_reason(
         self, tmp_path, monkeypatch, caplog

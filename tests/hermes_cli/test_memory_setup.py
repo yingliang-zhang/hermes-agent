@@ -63,7 +63,7 @@ def test_write_env_vars_strips_line_separators_and_nul(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# _provider_pip_dependencies — mode-aware dep expansion (#70636)
+# _provider_pip_dependencies — declared baseline deps only (#70636)
 # ---------------------------------------------------------------------------
 
 

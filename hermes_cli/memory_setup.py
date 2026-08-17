@@ -22,27 +22,13 @@ _CANCELLED = -1
 def _provider_pip_dependencies(provider_name: str, declared: list) -> list:
     """Return the pip deps a provider actually needs on THIS install.
 
-    ``plugin.yaml`` declares the provider's baseline bridge packages, but
-    some providers install mode-dependent extras at setup time that the
-    manifest can't express. Hindsight's ``local_embedded`` mode installs
-    ``hindsight-all`` (daemon + embedder + client) during
-    ``hermes memory setup`` — if the update-time refresh only reinstalled
-    the declared ``hindsight-client``, the embedded daemon would stay
-    broken after a venv rebuild stripped ``hindsight-embed`` (#70636).
+    ``plugin.yaml`` declares the provider's baseline bridge packages — for
+    Hindsight that is now ``hindsight-client`` plus ``hindsight-embed``
+    (the lightweight embedded runtime; the ML stack lives in the dedicated
+    server venv), so the update-time refresh reinstalling the declared deps
+    covers the embedded daemon too (#70636).
     """
-    deps = list(declared or [])
-    if provider_name == "hindsight":
-        try:
-            import json
-            cfg_path = get_hermes_home() / "hindsight" / "config.json"
-            cfg = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
-            mode = cfg.get("mode", "")
-            # "local" is a legacy alias for "local_embedded"
-            if mode in {"local", "local_embedded"}:
-                deps.append("hindsight-all")
-        except Exception:
-            pass
-    return deps
+    return list(declared or [])
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +126,6 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
         "honcho-ai": "honcho",
         "mem0ai": "mem0",
         "hindsight-client": "hindsight_client",
-        "hindsight-all": "hindsight",
     }
 
     # Check which packages need installation.

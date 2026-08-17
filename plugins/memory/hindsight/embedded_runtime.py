@@ -35,6 +35,14 @@ _MARKER_FIELDS = frozenset({
 _FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
 _HASH_CHUNK_SIZE = 1024 * 1024
 
+# resolve_server_executable() runs a full fail-closed seal (19.8s cold / 11.8s
+# warm) on every client (re)construction. Cache the sealed result keyed by the
+# cheap (candidate, fingerprint-from-symlink) pair: an updater promotion flips
+# the ``current`` symlink target, which changes the fingerprint, which forces
+# a cache miss and a full re-seal — fail-closed is preserved.
+_RESOLVE_CACHE: dict[tuple[str, str], Path] = {}
+_RESOLVE_CACHE_LOCK = threading.Lock()
+
 
 def _runtime_repo() -> Path:
     return Path(__file__).resolve().parents[3]
@@ -317,6 +325,21 @@ def resolve_server_executable(
         )
 
     fingerprint = target.parts[1]
+
+    cache_key = (str(candidate), fingerprint)
+    with _RESOLVE_CACHE_LOCK:
+        cached = _RESOLVE_CACHE.get(cache_key)
+    if cached is not None:
+        # This exact (candidate, environment) pair passed the full seal earlier
+        # in this process; only repeat the cheap executability probe. A
+        # mid-process updater promotion flips the ``current`` target read
+        # above, changing the fingerprint and forcing the full seal again.
+        if not os.access(cached, os.X_OK):
+            raise RuntimeError(
+                f"Hindsight server executable is not executable: {cached}"
+            )
+        return candidate
+
     environment = envs / fingerprint
     if environment.is_symlink() or not environment.is_dir():
         raise RuntimeError(
@@ -395,6 +418,8 @@ def resolve_server_executable(
         ) from exc
     if final_target_text != target_text:
         raise RuntimeError("Hindsight server current pointer changed during validation")
+    with _RESOLVE_CACHE_LOCK:
+        _RESOLVE_CACHE[cache_key] = candidate
     return candidate
 
 
@@ -420,13 +445,19 @@ class DedicatedEmbeddedClient:
         stable_executable = resolve_server_executable(server_executable)
         self.profile = profile
         self.config = {
-            "HINDSIGHT_API_LLM_PROVIDER": llm_provider,
-            "HINDSIGHT_API_LLM_API_KEY": llm_api_key,
-            "HINDSIGHT_API_LLM_MODEL": llm_model,
             "HINDSIGHT_API_LOG_LEVEL": log_level,
             "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT": str(idle_timeout),
             _API_EXECUTABLE_ENV: str(stable_executable),
         }
+        # Only override profile-env LLM settings when explicitly provided: the
+        # daemon manager merges this config over ~/.hindsight/profiles/<profile>.env,
+        # so an empty string here would shadow the real key from the env file.
+        if llm_provider:
+            self.config["HINDSIGHT_API_LLM_PROVIDER"] = llm_provider
+        if llm_api_key:
+            self.config["HINDSIGHT_API_LLM_API_KEY"] = llm_api_key
+        if llm_model:
+            self.config["HINDSIGHT_API_LLM_MODEL"] = llm_model
         if llm_base_url:
             self.config["HINDSIGHT_API_LLM_BASE_URL"] = llm_base_url
         if database_url:

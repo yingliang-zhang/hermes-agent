@@ -2087,8 +2087,9 @@ def _refresh_active_memory_provider_dependencies() -> None:
     """Refresh pip dependencies for the configured external memory provider.
 
     Memory-provider bridge packages are declared in each provider's
-    ``plugin.yaml`` (plus mode-dependent extras like Hindsight's
-    ``hindsight-all``), NOT in Hermes' editable-install extras or
+    ``plugin.yaml`` (for Hindsight: ``hindsight-client`` plus the lightweight
+    ``hindsight-embed`` runtime — the ML stack lives in the dedicated server
+    venv), NOT in Hermes' editable-install extras or
     ``LAZY_DEPS`` alone — so the core dependency reinstall above can strip
     or downgrade them (#53272 mem0ai, #70636 hindsight-embed). Re-run the
     provider's declared install for the ACTIVE provider only, after the
