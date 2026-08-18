@@ -272,6 +272,10 @@ def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
+    # Off-screen sends (widget intents): type the persisted user row so no
+    # client renders it as a bubble. Whitelisted to "hidden" — display_kind
+    # is a DB-only sidecar and this RPC must not mint arbitrary kinds.
+    display_kind = "hidden" if params.get("display_kind") == "hidden" else None
     # Typed bare stop phrase while backend voice mode is active ends the
     # voice chat instead of sending "stop" to the agent — the typed twin of
     # the spoken stop phrase (PR #73106), applied at the ONE server-side
@@ -745,7 +749,9 @@ def _(rid, params: dict) -> dict:
         _start_inflight_turn(session, text)
 
     if turn_isolation:
-        isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
+        isolated_response = _submit_prompt_to_compute_host(
+            rid, sid, session, text, display_kind=display_kind
+        )
         if not isolated_response.get("error"):
             if survivor_user_row_ids is not None:
                 # The truncation already happened inline above (memory + DB),
@@ -838,6 +844,7 @@ def _(rid, params: dict) -> dict:
                 for key, value in (
                     ("submitted_at", explicit_submitted_at),
                     ("message_id", message_id),
+                    ("display_kind", display_kind),
                 )
                 if value is not None
             },

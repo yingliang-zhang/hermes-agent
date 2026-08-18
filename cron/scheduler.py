@@ -499,6 +499,7 @@ from cron.jobs import (
     claim_dispatch,
     claim_job_for_fire,
     fire_claim_fence,
+    clear_run_claim,
     get_due_jobs,
     heartbeat_fire_claim,
     heartbeat_run_claim,
@@ -2348,18 +2349,40 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
-) -> None:
+) -> list:
     """Send extracted MEDIA files as native platform attachments via a live adapter.
 
     Routes each file to the appropriate adapter method (send_voice, send_image_file,
     send_video, send_document) based on file extension — mirroring the routing logic
     in ``BasePlatformAdapter._process_message_background``.
+
+    Returns a list of per-file error strings (empty when every attachment
+    delivered). Callers surface these into the job's delivery errors so a
+    dropped attachment is visible in ``last_error``/run status instead of
+    only in the gateway log (the silent-drop half of the manual-run
+    attachment bug: text delivered, file vanished, job marked ok).
     """
     from pathlib import Path
 
     from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
 
+    errors: list = []
+    requested = [(str(p), v) for p, v in (media_files or [])]
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    # Report paths the safety filter dropped: the model referenced them in
+    # MEDIA: tags but they will never be sent (missing file, denied prefix,
+    # or strict-mode policy miss).
+    kept = {p for p, _ in media_files}
+    for raw_path, _v in requested:
+        try:
+            from gateway.platforms.base import validate_media_delivery_path
+
+            if validate_media_delivery_path(raw_path) not in kept:
+                errors.append(
+                    f"attachment dropped by media path policy: {raw_path}"
+                )
+        except Exception:
+            errors.append(f"attachment dropped by media path policy: {raw_path}")
 
     for media_path, _is_voice in media_files:
         try:
@@ -2377,23 +2400,37 @@ def _send_media_via_adapter(
             from agent.async_utils import safe_schedule_threadsafe
             future = safe_schedule_threadsafe(coro, loop)
             if future is None:
-                logger.warning(
-                    "Job '%s': cannot send media %s, gateway loop unavailable",
-                    job.get("id", "?"), media_path,
-                )
-                return
+                msg = f"cannot send media {media_path}: gateway loop unavailable"
+                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                errors.append(msg)
+                return errors
             try:
-                result = future.result(timeout=30)
+                # Large attachments (long TTS audio, concatenated recordings,
+                # big exports) can legitimately exceed a fixed 30s upload
+                # window. Configurable, matching the other cron timeouts
+                # (cron.media_send_timeout_seconds in config.yaml, or the
+                # HERMES_CRON_MEDIA_SEND_TIMEOUT env override).
+                result = future.result(timeout=_get_media_send_timeout())
             except TimeoutError:
                 future.cancel()
                 raise
             if result and not getattr(result, "success", True):
-                logger.warning(
-                    "Job '%s': media send failed for %s: %s",
-                    job.get("id", "?"), media_path, getattr(result, "error", "unknown"),
+                msg = (
+                    f"media send failed for {media_path}: "
+                    f"{getattr(result, 'error', 'unknown')}"
                 )
+                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                errors.append(msg)
         except Exception as e:
-            logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
+            # Argument-less exceptions (notably TimeoutError, the most likely
+            # failure on this path) have an empty str(), which would render
+            # the reason as nothing at all. Fall back to the class name.
+            msg = (
+                f"failed to send media {media_path}: {str(e) or type(e).__name__}"
+            )
+            logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+            errors.append(msg)
+    return errors
 
 
 def _confirm_adapter_delivery(send_result) -> bool:
@@ -2535,8 +2572,34 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
+
+    # Bridge gateway media-policy config (strict / allow_dirs / trust_recent)
+    # into the env vars the path validator reads. Gateway startup does this
+    # at boot; a standalone process (manual `hermes cron run` from the CLI,
+    # a cron tick without the gateway) historically did NOT — so manual runs
+    # filtered attachment paths under a DIFFERENT policy than scheduled runs
+    # and silently dropped files the gateway would deliver. Idempotent,
+    # env-wins, never raises.
+    from gateway.media_policy import apply_media_policy_env
+
+    apply_media_policy_env(user_cfg)
+
     media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+    requested_media = [(str(p), v) for p, v in media_files]
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    # Attachments the policy filter dropped will never be sent on ANY lane —
+    # record them up front so the run status says so (previously one
+    # stderr WARNING was the only trace: text delivered, file vanished).
+    _policy_dropped = len(requested_media) - len(media_files)
+    policy_drop_errors = (
+        [
+            f"{_policy_dropped} media attachment(s) dropped by media path "
+            "policy (missing file, denied prefix, or strict-mode miss); "
+            "see gateway.strict / media_delivery_allow_dirs in config.yaml"
+        ]
+        if _policy_dropped > 0
+        else []
+    )
 
     # Resolve the delivery-mirror gate ONCE (default off). When on, each
     # successful delivery is also appended to the target chat's gateway session
@@ -2976,7 +3039,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 routed_media_metadata["user_id"] = logical_home.user_id
                             if logical_home.scope_id:
                                 routed_media_metadata["scope_id"] = logical_home.scope_id
-                    _send_media_via_adapter(
+                    _media_errors = _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
                         media_files,
@@ -2985,6 +3048,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         job,
                         platform=platform,
                     )
+                    # Surface per-file failures into the run status (parity
+                    # with the standalone lane): text delivered but an
+                    # attachment didn't is a visible partial failure, not ok.
+                    for _me in _media_errors:
+                        _msg = f"{_me} (target {platform_name}:{chat_id})"
+                        delivery_errors.append(_msg)
                 elif timed_out and media_files:
                     msg = (
                         f"{len(media_files)} media attachment(s) not delivered to "
@@ -3122,6 +3191,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
 
+            # Standalone senders report per-file attachment failures in
+            # ``warnings`` while still returning success (the text leg
+            # delivered). Surface them: a cron whose PDF/image silently
+            # vanished used to mark the run ok with no trace — the exact
+            # "manual run delivers text but no attachment" field report.
+            _sender_warnings = (
+                result.get("warnings") if isinstance(result, dict) else None
+            ) or []
+            for _w in _sender_warnings:
+                msg = f"delivery warning: {_w} (target {platform_name}:{chat_id})"
+                logger.error("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
             _maybe_mirror_cron_delivery(
                 job, platform_name, chat_id, mirror_text,
@@ -3129,6 +3211,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 enabled=mirror_this_target and not thread_seeded,
             )
 
+    if policy_drop_errors:
+        # Filter-time drops apply to every target; report them once.
+        delivery_errors.extend(policy_drop_errors)
     if delivery_errors:
         return "; ".join(delivery_errors)
     return None
@@ -3172,6 +3257,44 @@ def _get_script_timeout() -> int:
         logger.debug("Failed to load cron script timeout from config: %s", exc)
 
     return _DEFAULT_SCRIPT_TIMEOUT
+
+
+_DEFAULT_MEDIA_SEND_TIMEOUT = 300
+
+
+def _get_media_send_timeout() -> int:
+    """Resolve the per-attachment media-send timeout from env/config.
+
+    Mirrors the ``script_timeout_seconds`` resolution pattern: the
+    HERMES_CRON_MEDIA_SEND_TIMEOUT env var wins, then
+    ``cron.media_send_timeout_seconds`` in config.yaml, then the default
+    (300s — large attachments like long TTS audio can legitimately exceed
+    the old fixed 30s upload window).
+    """
+    env_value = os.getenv("HERMES_CRON_MEDIA_SEND_TIMEOUT", "").strip()
+    if env_value:
+        try:
+            timeout = int(float(env_value))
+            if timeout > 0:
+                return timeout
+        except Exception:
+            logger.warning(
+                "Invalid HERMES_CRON_MEDIA_SEND_TIMEOUT=%r; using config/default",
+                env_value,
+            )
+
+    try:
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        configured = cron_cfg.get("media_send_timeout_seconds")
+        if configured is not None:
+            timeout = int(float(configured))
+            if timeout > 0:
+                return timeout
+    except Exception as exc:
+        logger.debug("Failed to load cron media-send timeout from config: %s", exc)
+
+    return _DEFAULT_MEDIA_SEND_TIMEOUT
 
 
 def _read_windows_pyvenv_cfg(venv_dir: Path) -> dict[str, str]:
@@ -7234,6 +7357,35 @@ def tick(
             membership is released in the worker's finally block.
             """
             job_id = job["id"]
+
+            def _clear_run_claim_best_effort() -> None:
+                """Best-effort claim cleanup on the dispatch-failure paths.
+
+                Only one-shot jobs carry a ``run_claim`` (stamped by
+                get_due_jobs, #59229), so recurring jobs skip the call
+                entirely — clear_run_claim acquires _jobs_lock (blocking
+                cross-process flock) and does a full load_jobs read, and the
+                dispatch-failure paths fire exactly when the process can
+                least afford N pointless lock/read round-trips (interpreter
+                shutdown, EMFILE).  clear_run_claim itself does
+                load_jobs/save_jobs file I/O; on those degraded paths it can
+                raise, and these early-exits exist precisely to skip cleanly
+                — a stale claim expiring at the TTL is a better outcome than
+                crashing the tick (#86522).
+                """
+                _schedule = job.get("schedule")
+                if not (isinstance(_schedule, dict) and _schedule.get("kind") == "once"):
+                    return
+                try:
+                    clear_run_claim(job_id)
+                except Exception as claim_err:
+                    logger.warning(
+                        "Could not clear run_claim for job '%s' after dispatch "
+                        "failure: %s (claim will expire at TTL)",
+                        job.get("name", job_id),
+                        claim_err,
+                    )
+
             # A tick can race gateway teardown: once the interpreter is
             # finalizing, ``pool.submit`` raises "cannot schedule new futures
             # after interpreter shutdown" and crashes the tick. Skip cleanly —
@@ -7244,6 +7396,7 @@ def tick(
                     "Job '%s' not dispatched — interpreter is shutting down",
                     job.get("name", job_id),
                 )
+                _clear_run_claim_best_effort()
                 return None
             if not try_register_running_job(job_id):
                 logger.info("Job '%s' already running — skipping", job.get("name", job_id))
@@ -7261,6 +7414,7 @@ def tick(
                 # audit requirement: every add is paired with guaranteed
                 # cleanup).
                 release_running_job(job_id)
+                _clear_run_claim_best_effort()
                 logger.exception(
                     "Job '%s' not dispatched: execution creation failed: %s",
                     job.get("name", job_id),
@@ -7278,6 +7432,7 @@ def tick(
                 fut = pool.submit(_run_and_release)
             except Exception as submit_err:
                 release_running_job(job_id)
+                _clear_run_claim_best_effort()
                 finish_execution(
                     execution["id"],
                     success=False,

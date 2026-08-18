@@ -344,7 +344,6 @@ export const zh: Translations = {
       providerApiKeys: 'API 密钥',
       providerCustomEndpoints: '自定义端点',
       gateway: '网关',
-      connections: '连接',
       apiKeys: '工具与密钥',
       keybinds: '键盘快捷键',
       keysTools: '工具',
@@ -372,7 +371,8 @@ export const zh: Translations = {
       agent: {
         title: '智能体插件',
         blurb:
-          '运行在 Hermes 后端——工具、技能、MCP 服务器、钩子和斜杠命令。「便携」插件是 Agent Plugins 标准包（技能 + MCP 组合，也可在其他智能体中使用）。开关在新会话中生效。',
+          '你安装到 Hermes 后端的插件——工具、技能、MCP 服务器、钩子和斜杠命令。「便携」插件是 Agent Plugins 标准包（技能 + MCP 组合，也可在其他智能体中使用）。开关在新会话中生效。',
+        appliesTo: '应用于：',
         empty: '尚未安装智能体插件。',
         loadFailed: '无法加载智能体插件',
         portable: '便携',
@@ -771,6 +771,10 @@ export const zh: Translations = {
       heading: 'Hermes Desktop',
       version: value => `版本 ${value}`,
       versionUnavailable: '版本不可用',
+      bundleOutOfSync: '应用构建版本过旧',
+      bundleOutOfSyncDesc:
+        'Hermes 运行时已更新,但桌面应用本身仍是旧构建——在应用更新之前,新的界面功能(如 Bot Mode)不会显示。请运行下方的更新以重新构建应用。如果此警告仍未消除,请从最新的桌面安装程序重新安装。',
+      bundleOutOfSyncAction: '获取安装程序',
       updates: '更新',
       checkNow: '立即检查',
       checking: '检查中…',
@@ -896,6 +900,11 @@ export const zh: Translations = {
       headerValueSaved: '已保存——留空以保留',
       headerAdd: '添加请求头',
       headerRemove: '移除',
+      duplicateLocal: '本应用已管理一个本地连接——只能有一个。',
+      duplicateUrl: (label: string) => `已存在指向此网关 URL 的连接（“${label}”）。`,
+      duplicateSsh: (label: string) => `已存在指向此 SSH 主机的连接（“${label}”）。`,
+      localAddHint: '“本地”不可用：应用管理的本地连接已存在（永远只有一个）。',
+      cloudAddHint: '提示：在上方登录 Hermes Cloud 可自动发现你的智能体——此表单仅用于手动注册已知的实例 URL。',
       save: '保存连接',
       saving: '保存中…',
       cancel: '取消',
@@ -909,10 +918,14 @@ export const zh: Translations = {
       envOverride: '环境变量覆盖',
       intro:
         'Hermes Desktop 默认会启动自己的本地网关。当你希望此应用控制另一台机器上或可信代理后的现有 Hermes 后端时，可以使用远程网关。下面可按 profile 指定各自的远程主机。',
-      appliesTo: '应用于',
       allProfiles: '所有 profile',
       defaultConnection: '默认连接会用于所有没有自定义覆盖的 profile。',
       profileConnection: profile => `仅当“${profile}”是当前 profile 时使用此连接。选择“使用默认网关”可移除其覆盖。`,
+      profileOverridesTitle: '按 profile 覆盖',
+      profileOverridesDesc: '每个 profile 都可以指向自己的网关。下面的连接控件编辑所选目标；此页其余设置为全应用范围。',
+      overrideEdit: '编辑',
+      overrideEditing: '正在编辑',
+      overrideSelectHint: '选择以查看或更改此 profile 使用的网关。',
       envOverrideTitle: '环境变量正在控制此桌面会话。',
       envOverrideDesc: '取消设置 HERMES_DESKTOP_REMOTE_URL 和 HERMES_DESKTOP_REMOTE_TOKEN 后才会使用下面保存的设置。',
       modeTitle: '连接模式',
@@ -1047,6 +1060,10 @@ export const zh: Translations = {
       loading: '正在加载 API 密钥和凭据...',
       failedLoad: 'API 密钥加载失败',
       empty: '此类别暂时没有配置项。'
+    },
+    profileScope: {
+      appliesTo: '应用于',
+      editsProfile: profile => `此页面的更改将应用于“${profile}”配置文件。`
     },
     mcp: {
       loading: '正在加载 MCP 服务器...',

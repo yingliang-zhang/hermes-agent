@@ -1813,6 +1813,7 @@ def _compute_host_turn_frame(
     *,
     submitted_at: float | None = None,
     message_id: str | None = None,
+    display_kind: str | None = None,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -1828,6 +1829,7 @@ def _compute_host_turn_frame(
         "request_id": rid,
         "session_key": session.get("session_key") or sid,
         "text": text,
+        **({"display_kind": display_kind} if display_kind else {}),
         "history": history,
         "history_version": history_version,
         "cols": int(session.get("cols", 80) or 80),
@@ -1921,6 +1923,7 @@ def _submit_prompt_to_compute_host(
     *,
     submitted_at: float | None = None,
     message_id: str | None = None,
+    display_kind: str | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -1932,6 +1935,7 @@ def _submit_prompt_to_compute_host(
         queued_prompt_generation=queued_prompt_generation,
         submitted_at=submitted_at,
         message_id=message_id,
+        display_kind=display_kind,
     )
 
     def _complete(done: dict) -> None:

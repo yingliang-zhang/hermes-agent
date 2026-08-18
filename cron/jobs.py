@@ -2363,6 +2363,38 @@ def clear_drift_alerted(job_id: str) -> None:
     _set_alert_flag(job_id, "drift_alerted", False)
 
 
+def note_fire_forward_failure(job_id: str, detail: str) -> bool:
+    """Durably record that a scheduled fire could not be handed to the runner.
+
+    Written by the dashboard fire webhook when the loopback forward to the
+    gateway api_server fails (gateway unreachable / listener not bound) —
+    the shape behind "job runs manually but never auto-fires". Without this
+    stamp the miss is invisible outside gui.log: no execution row is created
+    (the claim never happens) and ``last_status``/``last_error`` only cover
+    runs that actually started.
+
+    Stored as ``last_fire_error`` (``{"at": iso, "detail": str}``) on the job
+    record so `cronjob list`, the CLI, and the dashboard all surface it.
+    Cleared by the next successful run (``mark_job_run``). Repeated failures
+    overwrite in place — latest miss wins; per-fire history lives in the
+    scheduler's own logs.
+
+    Returns True when a job record was found and stamped.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job["id"] == job_id:
+                job["last_fire_error"] = {
+                    "at": _hermes_now().isoformat(),
+                    "detail": str(detail or "")[:500],
+                }
+                jobs[i] = job
+                save_jobs(jobs)
+                return True
+    return False
+
+
 def _mark_job_run_locked(
     job_id: str,
     success: bool,
@@ -2412,6 +2444,10 @@ def _mark_job_run_locked(
                 if success:
                     job.pop("preflight_alerted", None)
                     job.pop("drift_alerted", None)
+                    # The fire hand-off demonstrably works again — clear the
+                    # forward-failure stamp so it only ever describes the
+                    # CURRENT auto-fire health, not a healed past incident.
+                    job.pop("last_fire_error", None)
                 # Consecutive agent-failure streak. Any successful run resets
                 # it; delivery failures alone do NOT count (the agent did its
                 # job). Read by the scheduler's failure-delivery path to nudge
@@ -2664,6 +2700,34 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
             claim["at"] = _hermes_now().isoformat()
             save_jobs(jobs)
             return True
+    return False
+
+
+def clear_run_claim(job_id: str) -> bool:
+    """Clear a one-shot job's ``run_claim`` when its dispatch fails.
+
+    ``get_due_jobs`` stamps a ``run_claim`` before returning a one-shot as
+    due (#59229).  ``mark_job_run`` clears it on *successful* completion.
+    When dispatch itself fails (interpreter shutdown, executor submit error,
+    execution-creation error) the job never reaches ``mark_job_run`` and the
+    stale claim blocks re-dispatch until the TTL expires (default 30 min).
+
+    Calling this on every early-exit path restores the "the job stays due
+    and will fire on the next healthy tick" invariant that the scheduler
+    comment promises (#86522).
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            if job.get("schedule", {}).get("kind") != "once":
+                return False
+            if job.get("run_claim") is not None:
+                job["run_claim"] = None
+                save_jobs(jobs)
+                return True
+            return False  # already cleared
     return False
 
 

@@ -495,6 +495,7 @@ class ComputeHost:
                 text,
                 submitted_at=frame.get("submitted_at"),
                 message_id=frame.get("message_id"),
+                display_kind=frame.get("display_kind") or None,
             )
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):

@@ -383,6 +383,7 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
         *,
         submitted_at=None,
         message_id=None,
+        display_kind=None,
     ):
         inline_calls.append((rid, sid, text, submitted_at, message_id))
 
