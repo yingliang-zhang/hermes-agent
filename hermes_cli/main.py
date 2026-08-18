@@ -2890,8 +2890,8 @@ def _migrate_profile_config(profile) -> None:
     Called from ``cmd_update`` to catch up named profiles whose config.yaml
     is still at an older version after the active profile was migrated.
     Only version-bump-only migrations are applied silently; if new required
-    settings are needed, the user is told to run ``hermes config migrate``
-    with that profile active.
+    settings are needed, a warning is printed telling the user to run
+    ``hermes config migrate`` with that profile active.
     """
     from hermes_constants import (
         reset_hermes_home_override,
@@ -2911,6 +2911,12 @@ def _migrate_profile_config(profile) -> None:
             missing_config = get_missing_config_fields()
             if not (missing_env or missing_config):
                 migrate_config(interactive=False, quiet=True)
+            else:
+                print(
+                    f"⚠️  Profile '{profile.name}' config v{current_ver} is "
+                    f"outdated (current: v{latest_ver}). Run "
+                    f"`hermes --profile {profile.name} config migrate` to update."
+                )
     finally:
         reset_hermes_home_override(token)
 

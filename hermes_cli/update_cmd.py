@@ -5625,9 +5625,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 try:
                     _migrate_profile_config(p)
                 except Exception as pe:
-                    logger.debug(
-                        "Config migration for profile %s failed: %s",
-                        p.name, pe,
+                    print(
+                        f"  ⚠️  Config migration for profile '{p.name}' "
+                        f"failed: {pe}. Run `hermes --profile {p.name} "
+                        f"config migrate` manually."
                     )
         except Exception:
             pass  # profiles module not available or no profiles
