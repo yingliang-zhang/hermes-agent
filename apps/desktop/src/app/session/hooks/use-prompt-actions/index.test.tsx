@@ -277,8 +277,10 @@ function QueueHarness({
     awaitingResponse: false,
     interrupted: false
   } as never)
+
   const draftRef = useRef('')
   const queueEditRef = useRef<QueueEditState | null>(null)
+
   const actions = usePromptActions({
     activeSessionId,
     activeSessionIdRef,
@@ -293,6 +295,7 @@ function QueueHarness({
     resumeStoredSession: async storedSessionId => {
       const routeToken = routeTokenRef.current
       const selectedStoredSessionId = selectedStoredSessionIdRef.current
+
       const resumed = await requestGateway<{ session_id: string }>('session.resume', {
         session_id: storedSessionId,
         source: 'desktop'
@@ -324,6 +327,7 @@ function QueueHarness({
       return next
     }
   })
+
   const queue = useComposerQueue({
     activeQueueSessionKey,
     attachments: [],
@@ -2449,13 +2453,16 @@ describe('useComposerQueue source-session retention', () => {
 
   it('keeps A queued across a pending switch and retries the same source on A recovery', async () => {
     vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000)
+
     const entry = enqueueQueuedPrompt(STORED_SESSION_A, {
       attachments: [],
       text: 'keep this in session A'
     })!
+
     const selectedStoredSessionIdRef: MutableRefObject<string | null> = {
       current: STORED_SESSION_A
     }
+
     const activeSessionIdRef: MutableRefObject<string | null> = { current: null }
     const routeTokenRef: MutableRefObject<string> = { current: 'route-a' }
     const calls: { method: string; params?: Record<string, unknown> }[] = []
@@ -2464,9 +2471,11 @@ describe('useComposerQueue source-session retention', () => {
     let canonicalRows = 0
     let releaseInitialResume: () => void = () => undefined
     let markInitialResumeStarted: () => void = () => undefined
+
     const initialResumeStarted = new Promise<void>(resolve => {
       markInitialResumeStarted = resolve
     })
+
     let firstResume = true
 
     const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
@@ -2491,6 +2500,13 @@ describe('useComposerQueue source-session retention', () => {
         const sourceId = String(payload.message_id)
         promptCalls.push(payload)
 
+        // The runtime minted by the abandoned mid-switch resume is dead on
+        // the backend: the retry recovers through the #91276 cache, probes
+        // it once, and falls through to a fresh resume on the 404.
+        if (payload.session_id === 'rt-a-abandoned') {
+          throw new Error('session not found')
+        }
+
         if (!ownedSourceIds.has(sourceId)) {
           ownedSourceIds.add(sourceId)
           canonicalRows += 1
@@ -2502,7 +2518,9 @@ describe('useComposerQueue source-session retention', () => {
 
       return {} as never
     })
+
     let handle: QueueHarnessHandle | null = null
+
     const view = render(
       <QueueHarness
         activeQueueSessionKey={STORED_SESSION_A}
@@ -2514,6 +2532,7 @@ describe('useComposerQueue source-session retention', () => {
         selectedStoredSessionIdRef={selectedStoredSessionIdRef}
       />
     )
+
     await waitFor(() => expect(handle).not.toBeNull())
 
     let firstAttempt!: Promise<boolean>
@@ -2574,6 +2593,13 @@ describe('useComposerQueue source-session retention', () => {
         message_id: entry.id,
         queued: true,
         session_id: 'rt-a-stale',
+        submitted_at: entry.queuedAt / 1000,
+        text: entry.text
+      },
+      {
+        message_id: entry.id,
+        queued: true,
+        session_id: 'rt-a-abandoned',
         submitted_at: entry.queuedAt / 1000,
         text: entry.text
       },
