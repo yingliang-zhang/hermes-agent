@@ -649,7 +649,14 @@ export interface SessionResumeResponse {
     user?: string
   }
   queued?: null | {
+    /** Backward-compatible head prompt for older Desktop clients. */
     user?: string
+    /** Complete accepted FIFO, oldest first. Transport handles are never exposed. */
+    items?: Array<{
+      message_id?: string
+      submitted_at?: number
+      user?: string
+    }>
   }
   // The oldest gateway approval still waiting for a response. This is returned
   // on resume so a reconnect can restore a prompt whose original event was
