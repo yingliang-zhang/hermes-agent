@@ -1424,6 +1424,92 @@ describe('appendLiveSessionProjection', () => {
     expect(restored[3]).toMatchObject({ id: 'assistant-stream-runtime-1', pending: true })
   })
 
+  it('restores every accepted queued prompt in FIFO order after a renderer restart', () => {
+    const restored = appendLiveSessionProjection([], {
+      session_id: 'runtime-1',
+      inflight: {
+        user: 'current prompt',
+        assistant: 'partial answer',
+        streaming: true
+      },
+      queued: {
+        user: 'first queued prompt',
+        items: [
+          { user: 'first queued prompt', submitted_at: 101.25, message_id: 'desktop-1' },
+          { user: 'second queued prompt', submitted_at: 102.5, message_id: 'desktop-2' }
+        ]
+      }
+    })
+
+    expect(restored.map(message => message.role)).toEqual(['user', 'assistant', 'user', 'user'])
+    expect(restored.map(message => message.parts.map(part => ('text' in part ? part.text : '')).join(''))).toEqual([
+      'current prompt',
+      'partial answer',
+      'first queued prompt',
+      'second queued prompt'
+    ])
+    expect(restored.slice(-2)).toMatchObject([
+      { id: 'user-queued-id-desktop-1-runtime-1', timestamp: 101.25 },
+      { id: 'user-queued-id-desktop-2-runtime-1', timestamp: 102.5 }
+    ])
+  })
+
+  it('falls back to the legacy queued head when a newer items payload is unusable', () => {
+    const malformedQueued = {
+      user: 'legacy queued prompt',
+      items: [null, { user: 123, message_id: 456 }, { user: '   ' }]
+    } as unknown as SessionResumeResponse['queued']
+
+    const restored = appendLiveSessionProjection([], {
+      session_id: 'runtime-1',
+      queued: malformedQueued
+    })
+
+    expect(restored).toMatchObject([
+      { id: 'user-queued-runtime-1', role: 'user', parts: [{ type: 'text', text: 'legacy queued prompt' }] }
+    ])
+  })
+
+  it('keeps metadata-backed and ordinal fallback queue ids disjoint', () => {
+    const restored = appendLiveSessionProjection([], {
+      session_id: 'runtime-1',
+      queued: {
+        user: 'metadata-backed prompt',
+        items: [
+          { user: 'metadata-backed prompt', message_id: '1' },
+          { user: 'id-less prompt' }
+        ]
+      }
+    })
+
+    const ids = restored.map(message => message.id)
+
+    expect(ids).toEqual(['user-queued-id-1-runtime-1', 'user-queued-index-1-runtime-1'])
+    expect(new Set(ids).size).toBe(2)
+  })
+
+  it('encodes lone-surrogate queued message ids without throwing or collisions', () => {
+    const restored = appendLiveSessionProjection([], {
+      session_id: 'runtime-1',
+      queued: {
+        user: 'first malformed id',
+        items: [
+          { user: 'first malformed id', message_id: '\ud800' },
+          { user: 'second malformed id', message_id: '\ud801' },
+          { user: 'literal marker', message_id: '%uD800' },
+          { user: 'valid surrogate pair', message_id: '\ud83d\ude00' }
+        ]
+      }
+    })
+
+    expect(restored.map(message => message.id)).toEqual([
+      'user-queued-id-%uD800-runtime-1',
+      'user-queued-id-%uD801-runtime-1',
+      'user-queued-id-%25uD800-runtime-1',
+      'user-queued-id-%F0%9F%98%80-runtime-1'
+    ])
+  })
+
   it('does not duplicate a persisted inflight user after consecutive canceled user turns', () => {
     const stored = [
       msg('stored-user-1', 'user', 'canceled prompt one'),
@@ -1646,6 +1732,32 @@ describe('removeRepresentedLocalLiveProjection', () => {
     const remaining = removeRepresentedLocalLiveProjection(previous, projection)
 
     expect(remaining.map(message => message.id)).toEqual(['user-old-optimistic', 'assistant-complete', 'user-racing'])
+  })
+
+  it('removes every represented queued FIFO row and preserves a later local race', () => {
+    const previous = [
+      msg('assistant-complete', 'assistant', 'finished answer'),
+      msg('user-current', 'user', 'current prompt'),
+      msg('assistant-stream-current', 'assistant', 'partial answer', { pending: true }),
+      msg('user-queued-id-desktop-1-runtime-1', 'user', 'first queued prompt'),
+      msg('user-queued-id-desktop-2-runtime-1', 'user', 'second queued prompt'),
+      msg('user-racing', 'user', 'new racing prompt')
+    ]
+
+    const projection = {
+      ...runningProjection('current prompt'),
+      queued: {
+        user: 'first queued prompt',
+        items: [
+          { user: 'first queued prompt', message_id: 'desktop-1', submitted_at: 101.25 },
+          { user: 'second queued prompt', message_id: 'desktop-2', submitted_at: 102.5 }
+        ]
+      }
+    }
+
+    const remaining = removeRepresentedLocalLiveProjection(previous, projection)
+
+    expect(remaining.map(message => message.id)).toEqual(['assistant-complete', 'user-racing'])
   })
 
   it('preserves an ambiguous text-identical local race prompt without a matching stream boundary', () => {

@@ -88,6 +88,21 @@ def test_enqueue_preserves_distinct_messages_and_submission_metadata():
             "message_id": "desktop-2",
         }
     ]
+    assert server._queued_prompt_snapshot(session) == {
+        "user": "first",
+        "items": [
+            {
+                "user": "first",
+                "submitted_at": 101.25,
+                "message_id": "desktop-1",
+            },
+            {
+                "user": "second",
+                "submitted_at": 102.5,
+                "message_id": "desktop-2",
+            },
+        ],
+    }
 
 
 def test_enqueue_keeps_one_multi_paragraph_prompt_as_one_message():

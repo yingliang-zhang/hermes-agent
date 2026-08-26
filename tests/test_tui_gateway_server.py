@@ -15633,11 +15633,11 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
 
 
 def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
-    """A full client restart must recover an accepted next-turn prompt.
+    """A full client restart must recover every accepted next-turn prompt.
 
     Busy prompts are intentionally not durable until they drain. Their only
-    authoritative copy is ``queued_prompt``, so the live projection must expose
-    that copy without leaking the transport object.
+    authoritative copies are the in-memory FIFO, so the live projection must
+    expose every item in order without leaking per-client transports.
     """
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
     monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
@@ -15653,10 +15653,26 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
     )
     server._sessions["sid-live"] = session
     try:
-        queued = server._handle_busy_submit(
-            "submit", "sid-live", session, "newest prompt", object()
+        first_queued = server._handle_busy_submit(
+            "submit-1",
+            "sid-live",
+            session,
+            "first queued prompt",
+            object(),
+            submitted_at=101.25,
+            message_id="desktop-1",
         )
-        assert queued["result"]["status"] == "queued"
+        second_queued = server._handle_busy_submit(
+            "submit-2",
+            "sid-live",
+            session,
+            "second queued prompt",
+            object(),
+            submitted_at=102.5,
+            message_id="desktop-2",
+        )
+        assert first_queued["result"]["status"] == "queued"
+        assert second_queued["result"]["status"] == "queued"
 
         activated = server.handle_request(
             {
@@ -15666,8 +15682,25 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
             }
         )
 
-        assert activated["result"]["queued"] == {"user": "newest prompt"}
+        assert activated["result"]["queued"] == {
+            "user": "first queued prompt",
+            "items": [
+                {
+                    "user": "first queued prompt",
+                    "submitted_at": 101.25,
+                    "message_id": "desktop-1",
+                },
+                {
+                    "user": "second queued prompt",
+                    "submitted_at": 102.5,
+                    "message_id": "desktop-2",
+                },
+            ],
+        }
         assert "transport" not in activated["result"]["queued"]
+        assert all(
+            "transport" not in item for item in activated["result"]["queued"]["items"]
+        )
     finally:
         server._sessions.pop("sid-live", None)
 
@@ -20686,10 +20719,10 @@ def test_prompt_submit_consecutive_rewinds_with_returned_survivor_row_ids(
         server._sessions.pop(sid, None)
 
 
-def test_prompt_submit_rebind_map_clears_active_row_hidden_by_sequence_repair(
+def test_prompt_submit_rebind_map_preserves_active_rows_across_sequence_repair(
     monkeypatch, tmp_path
 ):
-    """The bounded map classifies physical active IDs before user;user repair."""
+    """The bounded map retains each canonical user row across provider repair."""
     from hermes_state import SessionDB
 
     db = SessionDB(db_path=tmp_path / "rowid-repaired-wedge.db")
@@ -20709,9 +20742,9 @@ def test_prompt_submit_rebind_map_clears_active_row_hidden_by_sequence_repair(
     repaired = db.get_messages_as_conversation(
         session_key, repair_alternation=True, include_row_ids=True
     )
-    # Provider repair merges the wedge and necessarily drops the second
-    # physical user's row identity from the replay view.
-    assert physical_ids[1] not in {
+    # Provider-only repair no longer mutates canonical history, so every
+    # physical user's durable row identity remains available to replay/rewind.
+    assert physical_ids[1] in {
         server._message_row_id(message) for message in repaired
     }
 
@@ -20740,7 +20773,14 @@ def test_prompt_submit_rebind_map_clears_active_row_hidden_by_sequence_repair(
         )
         assert response.get("error") is None, response
         row_id_map = response["result"]["survivor_row_id_map"]
-        assert row_id_map[str(physical_ids[1])] is None
+        mapped_second = row_id_map[str(physical_ids[1])]
+        assert isinstance(mapped_second, int)
+        assert mapped_second in {
+            server._message_row_id(message)
+            for message in db.get_messages_as_conversation(
+                session_key, include_row_ids=True
+            )
+        }
         assert "999999" not in row_id_map
     finally:
         server._sessions.pop(sid, None)

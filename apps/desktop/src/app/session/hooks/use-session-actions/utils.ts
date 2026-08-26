@@ -729,6 +729,97 @@ type ReconciledSessionResumeResponse = SessionResumeResponse & {
   [safelyPersistedInflightUser]?: true
 }
 
+type QueuedProjectionItem = {
+  messageId?: string
+  submittedAt?: number
+  user: string
+}
+
+function queuedProjectionItems(queued: SessionResumeResponse['queued']): QueuedProjectionItem[] {
+  const items = queued?.items
+
+  if (Array.isArray(items) && items.length) {
+    const normalized: QueuedProjectionItem[] = []
+
+    for (const rawItem of items as unknown[]) {
+      if (!rawItem || typeof rawItem !== 'object') {
+        continue
+      }
+
+      const item = rawItem as Record<string, unknown>
+      const user = typeof item.user === 'string' ? item.user.trim() : ''
+
+      if (!user) {
+        continue
+      }
+
+      const messageId = typeof item.message_id === 'string' ? item.message_id.trim() : ''
+      const submittedAt = item.submitted_at
+
+      normalized.push({
+        user,
+        ...(messageId ? { messageId } : {}),
+        ...(typeof submittedAt === 'number' && Number.isFinite(submittedAt) ? { submittedAt } : {})
+      })
+    }
+
+    if (normalized.length) {
+      return normalized
+    }
+  }
+
+  const legacyUser =
+    queued && typeof queued === 'object' ? (queued as unknown as Record<string, unknown>).user : undefined
+
+  const legacyHead = typeof legacyUser === 'string' ? legacyUser.trim() : ''
+
+  return legacyHead ? [{ user: legacyHead }] : []
+}
+
+function encodeQueuedMessageIdComponent(messageId: string): string {
+  try {
+    // Keep the native encoding byte-for-byte for every well-formed string.
+    return encodeURIComponent(messageId)
+  } catch (error) {
+    if (!(error instanceof URIError)) {
+      throw error
+    }
+  }
+
+  let encoded = ''
+  let chunkStart = 0
+
+  for (let index = 0; index < messageId.length; index += 1) {
+    const codeUnit = messageId.charCodeAt(index)
+
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const nextCodeUnit = messageId.charCodeAt(index + 1)
+
+      if (nextCodeUnit >= 0xdc00 && nextCodeUnit <= 0xdfff) {
+        index += 1
+
+        continue
+      }
+    } else if (codeUnit < 0xdc00 || codeUnit > 0xdfff) {
+      continue
+    }
+
+    encoded += encodeURIComponent(messageId.slice(chunkStart, index))
+    encoded += `%u${codeUnit.toString(16).toUpperCase()}`
+    chunkStart = index + 1
+  }
+
+  return encoded + encodeURIComponent(messageId.slice(chunkStart))
+}
+
+function queuedProjectionId(item: QueuedProjectionItem, index: number, sessionId: string): string {
+  if (item.messageId) {
+    return `user-queued-id-${encodeQueuedMessageIdComponent(item.messageId)}-${sessionId}`
+  }
+
+  return index === 0 ? `user-queued-${sessionId}` : `user-queued-index-${index}-${sessionId}`
+}
+
 export function appendLiveSessionProjection(messages: ChatMessage[], projection: LiveSessionProjection): ChatMessage[] {
   const inflightUser = projection.inflight?.user?.trim() ?? ''
   const inflightAssistant = projection.inflight?.assistant ?? ''
@@ -757,14 +848,15 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
   // failure on the projected row instead of rendering the partial as healthy.
   const inflightError = projection.inflight?.error?.trim() ?? ''
   const inflightErrorSurface = parseErrorSurface(projection.inflight?.error_surface)
-  const queuedUser = projection.queued?.user?.trim() ?? ''
+  const queuedItems = queuedProjectionItems(projection.queued)
+  const queuedUser = queuedItems[0]?.user ?? ''
 
   if (
     !inflightUser &&
     !inflightAssistant &&
     !inflightStreaming &&
     !inflightError &&
-    !queuedUser &&
+    !queuedItems.length &&
     !inflightCorrections.length
   ) {
     return messages
@@ -929,11 +1021,12 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
     }
   }
 
-  if (queuedUser) {
+  for (const [index, queuedItem] of queuedItems.entries()) {
     projected.push({
-      id: `user-queued-${sessionId}`,
+      id: queuedProjectionId(queuedItem, index, sessionId),
       role: 'user',
-      parts: [textPart(queuedUser)]
+      parts: [textPart(queuedItem.user)],
+      ...(queuedItem.submittedAt !== undefined ? { timestamp: queuedItem.submittedAt } : {})
     })
   }
 
@@ -1028,14 +1121,14 @@ export function dedupeInflightUserAgainstTranscript(
  */
 export function removeRepresentedLocalLiveProjection(
   previousMessages: ChatMessage[],
-  projection: Pick<SessionResumeResponse, 'inflight' | 'queued'>
+  projection: Pick<SessionResumeResponse, 'inflight' | 'queued' | 'session_id'>
 ): ChatMessage[] {
   const inflightUser = projection.inflight?.user?.replace(/\s+/g, ' ').trim() ?? ''
   const inflightAssistant = projection.inflight?.assistant?.replace(/\s+/g, ' ').trim() ?? ''
-  const queuedUser = projection.queued?.user?.replace(/\s+/g, ' ').trim() ?? ''
+  const queuedItems = queuedProjectionItems(projection.queued)
 
   const hasAssistantProjection = Boolean(
-    projection.inflight?.assistant || projection.inflight?.streaming || (inflightUser && queuedUser)
+    projection.inflight?.assistant || projection.inflight?.streaming || (inflightUser && queuedItems.length)
   )
 
   if (!inflightUser || !hasAssistantProjection) {
@@ -1075,20 +1168,31 @@ export function removeRepresentedLocalLiveProjection(
     return previousMessages
   }
 
-  let queuedUserIndex = -1
+  const queuedUserIndices = new Set<number>()
+  let queuedSearchStart = assistantIndex
+  const sessionId = projection.session_id || 'session'
 
-  if (queuedUser) {
-    queuedUserIndex = previousMessages.findIndex(
+  for (const [queuedIndex, queuedItem] of queuedItems.entries()) {
+    const projectedId = queuedProjectionId(queuedItem, queuedIndex, sessionId)
+    const normalizedQueuedUser = queuedItem.user.replace(/\s+/g, ' ').trim()
+
+    const match = previousMessages.findIndex(
       (message, index) =>
-        index > assistantIndex &&
+        index > queuedSearchStart &&
         message.role === 'user' &&
-        message.id.startsWith('user-queued-') &&
-        normalizedMessageText(message) === queuedUser
+        (message.id === projectedId ||
+          (message.id.startsWith('user-queued-') && normalizedMessageText(message) === normalizedQueuedUser))
     )
+
+    if (match >= 0) {
+      queuedUserIndices.add(match)
+      queuedSearchStart = match
+    }
   }
 
   return previousMessages.filter(
-    (_message, index) => index !== inflightUserIndex && index !== assistantIndex && index !== queuedUserIndex
+    (_message, index) =>
+      index !== inflightUserIndex && index !== assistantIndex && !queuedUserIndices.has(index)
   )
 }
 

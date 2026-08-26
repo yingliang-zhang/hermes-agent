@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import queue
 import subprocess
@@ -9298,18 +9299,36 @@ def _restore_agent_history_after_turn_error(session: dict, agent) -> bool:
 
 
 def _queued_prompt_snapshot(session: dict) -> dict | None:
-    """Return the accepted next-turn prompt without its transport handle.
+    """Return every accepted next-turn prompt without transport handles.
 
-    A busy ``prompt.submit`` lives only in ``session["queued_prompt"]`` until
-    the current turn winds down. Desktop may reconnect or restart during that
-    window, so the live-session projection must carry the user-visible text;
-    otherwise the accepted prompt disappears until it finally drains.
+    ``queued.user`` remains the backward-compatible head field. ``queued.items``
+    carries the complete FIFO so a reconnect can restore every accepted user
+    bubble before any queued turn drains. Stable source metadata is safe to
+    expose; per-client transport handles and attachment paths are not.
     """
-    queued = session.get("queued_prompt")
-    if not isinstance(queued, dict):
+    head = session.get("queued_prompt")
+    raw_tail = session.get("queued_prompts")
+    tail = raw_tail if isinstance(raw_tail, list) else []
+    entries = ([head] if isinstance(head, dict) else []) + [
+        entry for entry in tail if isinstance(entry, dict)
+    ]
+    items: list[dict] = []
+
+    for entry in entries:
+        user = _inflight_text(entry.get("text"))
+        if not user:
+            continue
+        item = {"user": user}
+        submitted_at = entry.get("submitted_at")
+        if isinstance(submitted_at, (int, float)) and math.isfinite(float(submitted_at)):
+            item["submitted_at"] = submitted_at
+        if entry.get("message_id") is not None:
+            item["message_id"] = str(entry["message_id"])
+        items.append(item)
+
+    if not items:
         return None
-    user = _inflight_text(queued.get("text"))
-    return {"user": user} if user else None
+    return {"user": items[0]["user"], "items": items}
 
 
 # ── Methods: session ─────────────────────────────────────────────────
