@@ -44,6 +44,34 @@ class TestDetectToolFailureTerminal:
         assert _detect_tool_failure("terminal", result) == (False, "")
 
 
+    def test_nonzero_exit_with_output_is_not_a_failure(self):
+        """grep / diff / test-suites / pipefail pipelines exit non-zero by design while emitting
+        valid output. Classifying them as failures fed the same_tool_failure counter and could trip
+        same_tool_failure_halt — halting a turn in which every command actually succeeded."""
+        result = json.dumps({"output": "matched line\n", "exit_code": 1})
+        assert _detect_tool_failure("terminal", result) == (False, "")
+
+    def test_nonzero_exit_with_whitespace_only_output_is_a_failure(self):
+        result = json.dumps({"output": "   \n  ", "exit_code": 1})
+        is_failure, suffix = _detect_tool_failure("terminal", result)
+        assert is_failure is True
+        assert suffix == " [exit 1]"
+
+    def test_nonzero_exit_with_error_field_wins_over_output(self):
+        # An explicit error field is authoritative even when output is present.
+        result = json.dumps({
+            "output": "partial output\n",
+            "exit_code": 2,
+            "error": "command not found: foo",
+        })
+        is_failure, suffix = _detect_tool_failure("terminal", result)
+        assert is_failure is True
+        assert "command not found" in suffix
+
+    def test_nonzero_dict_result_with_output_is_not_a_failure(self):
+        """Dict form (plugin tool_execution middleware) classifies like its JSON form (#111815)."""
+        assert _detect_tool_failure("terminal", {"output": "ok", "exit_code": 1}) == (False, "")
+
     def test_nonzero_exit_with_error_shows_message(self):
         result = json.dumps({
             "output": "",

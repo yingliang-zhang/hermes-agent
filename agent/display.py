@@ -921,7 +921,10 @@ def _detect_tool_failure(tool_name: str, result: Any) -> tuple[bool, str]:
     if isinstance(data, dict) and data.get("user_summary"):
         return True, f" [{_tail_trunc(str(data['user_summary']), _DEGRADED_SUFFIX_MAX_LEN)}]"
 
-    # Terminal: non-zero exit code is the canonical failure signal.
+    # Terminal: a non-zero exit is only a failure when it produced nothing usable. grep/diff/
+    # test-suites and `set -o pipefail` pipelines exit non-zero by design while emitting valid
+    # output; treating those as failures fed the same_tool_failure counter and could trip
+    # same_tool_failure_halt mid-turn. An explicit ``error`` field stays authoritative.
     if tool_name == "terminal":
         exit_code = data.get("exit_code") if isinstance(data, dict) else None
         if exit_code is None or exit_code == 0:
@@ -929,7 +932,11 @@ def _detect_tool_failure(tool_name: str, result: Any) -> tuple[bool, str]:
         if data.get("status") == "degraded":
             return True, _degraded_suffix(data)
         err_msg = data.get("error")
-        return True, f" [{_trim_error(str(err_msg))}]" if err_msg else f" [exit {exit_code}]"
+        if err_msg:
+            return True, f" [{_trim_error(str(err_msg))}]"
+        if str(data.get("output") or "").strip():
+            return False, ""
+        return True, f" [exit {exit_code}]"
 
     if isinstance(data, dict):
         failed = data.get("success") is False
