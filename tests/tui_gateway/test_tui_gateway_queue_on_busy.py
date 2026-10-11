@@ -111,6 +111,80 @@ def test_enqueue_keeps_one_multi_paragraph_prompt_as_one_message():
     assert session.get("queued_prompts", []) == []
 
 
+# ── _queued_prompt_snapshot (live projection) ─────────────────────────────
+
+
+def test_queued_snapshot_exposes_the_whole_fifo_with_source_identity():
+    """A reconnect must be able to restore EVERY accepted prompt, not only the head."""
+    session = _session()
+    server._enqueue_prompt(session, "first", "ws-1", submitted_at=101.25, message_id="desktop-1")
+    server._enqueue_prompt(session, "second", "ws-2", submitted_at=102.5, message_id="desktop-2")
+    server._enqueue_prompt(session, "third", "ws-1", image_paths=["/private/attach/c.png"])
+
+    snapshot = server._queued_prompt_snapshot(session)
+
+    # ``user`` stays the head for clients that only know the single-slot shape.
+    assert snapshot["user"] == "first"
+    assert snapshot["items"] == [
+        {"user": "first", "submitted_at": 101.25, "message_id": "desktop-1"},
+        {"user": "second", "submitted_at": 102.5, "message_id": "desktop-2"},
+        {"user": "third"},
+    ]
+
+
+def test_queued_snapshot_never_serializes_transports_attachments_or_internal_rows():
+    session = _session()
+    server._enqueue_prompt(session, "first", object(), submitted_at=101.25, message_id="desktop-1")
+    server._enqueue_prompt(session, "second", object(), image_paths=["/private/attach/c.png"])
+    session["queued_prompts"][0]["_submit_user_row"] = {"_row_id": 7, "content": "staged copy"}
+
+    snapshot = server._queued_prompt_snapshot(session)
+
+    allowed = {"user", "submitted_at", "message_id", "row_id"}
+    assert all(set(item) <= allowed for item in snapshot["items"])
+    assert "/private/attach/c.png" not in repr(snapshot)
+    assert "staged copy" not in repr(snapshot)
+
+
+def test_queued_snapshot_names_the_durable_accept_row_of_each_queued_prompt():
+    """Accepted prompts are already persisted (the accept-time row sits BEFORE the running turn's
+    reply). The snapshot names that row so a client paints it once, after the live reply, instead
+    of showing the stored row in place AND the projected copy."""
+    session = _session()
+    server._enqueue_prompt(session, "first", "ws-1", submitted_at=101.25, message_id="desktop-1")
+    server._enqueue_prompt(session, "second", "ws-1")
+    server._enqueue_prompt(session, "third", "ws-1")
+    session["queued_prompt"]["_submit_user_row"] = {"_row_id": 41, "content": "first"}
+    session["queued_prompts"][0]["_submit_user_row"] = {"_row_id": 42, "content": "second"}
+    session["queued_prompts"][1]["_submit_user_row"] = {"_row_id": True, "content": "third"}
+
+    items = server._queued_prompt_snapshot(session)["items"]
+
+    assert [item.get("row_id") for item in items] == [41, 42, None]
+
+
+def test_queued_snapshot_omits_unusable_timestamps_and_blank_entries():
+    session = _session()
+    session["queued_prompt"] = {"text": "first", "transport": None, "submitted_at": float("nan")}
+    session["queued_prompts"] = [
+        {"text": "   ", "transport": None, "message_id": "blank"},
+        "not an envelope",
+        {"text": "second", "transport": None, "submitted_at": float("inf"), "message_id": 42},
+    ]
+
+    snapshot = server._queued_prompt_snapshot(session)
+
+    assert snapshot == {
+        "user": "first",
+        "items": [{"user": "first"}, {"user": "second", "message_id": "42"}],
+    }
+
+
+def test_queued_snapshot_is_absent_for_an_empty_queue():
+    assert server._queued_prompt_snapshot(_session()) is None
+    assert server._queued_prompt_snapshot(_session(queued_prompt=None, queued_prompts=[])) is None
+
+
 # ── _handle_busy_submit (policy) ───────────────────────────────────────────
 
 def test_busy_interrupt_mode_redirects_active_turn(monkeypatch):

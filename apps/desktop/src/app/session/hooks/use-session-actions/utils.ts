@@ -74,6 +74,7 @@ import {
   persistedTurnsEquivalent,
   transcriptRowIds
 } from './pending-turn-identity'
+import { queuedProjectionItems, queuedProjectionRowId, withoutQueuedAcceptRows } from './queued-projection'
 
 function withAppendedText(message: ChatMessage, suffix: string): ChatMessage {
   let appended = false
@@ -1173,7 +1174,12 @@ type ReconciledSessionResumeResult = SessionResumeResult & {
   [safelyPersistedInflightUser]?: true
 }
 
-export function appendLiveSessionProjection(messages: ChatMessage[], projection: LiveSessionProjection): ChatMessage[] {
+export function appendLiveSessionProjection(
+  storedMessages: ChatMessage[],
+  projection: LiveSessionProjection
+): ChatMessage[] {
+  // Still-queued prompts are painted by this projection, after the live turn.
+  const messages = withoutQueuedAcceptRows(storedMessages, projection.queued, message => message.rowId)
   const inflightUser = projection.inflight?.user?.trim() ?? ''
   const inflightAssistant = projection.inflight?.assistant ?? ''
   const inflightStreaming = Boolean(projection.inflight?.streaming)
@@ -1201,14 +1207,14 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
   // failure on the projected row instead of rendering the partial as healthy.
   const inflightError = projection.inflight?.error?.trim() ?? ''
   const inflightErrorSurface = parseErrorSurface(projection.inflight?.error_surface)
-  const queuedUser = projection.queued?.user?.trim() ?? ''
+  const queuedItems = queuedProjectionItems(projection.queued)
 
   if (
     !inflightUser &&
     !inflightAssistant &&
     !inflightStreaming &&
     !inflightError &&
-    !queuedUser &&
+    !queuedItems.length &&
     !inflightCorrections.length
   ) {
     return messages
@@ -1331,7 +1337,7 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
   )
 
   const wantsAssistantRow = Boolean(
-    inflightAssistant || inflightStreaming || inflightError || (inflightUser && queuedUser)
+    inflightAssistant || inflightStreaming || inflightError || (inflightUser && queuedItems.length)
   )
 
   const projectAssistantDump = wantsAssistantRow && !turnAlreadyCommitted && !(turnAlreadyStructured && !inflightError)
@@ -1444,11 +1450,12 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
     }
   }
 
-  if (queuedUser) {
+  for (const [index, item] of queuedItems.entries()) {
     projected.push({
-      id: `user-queued-${sessionId}`,
+      id: queuedProjectionRowId(item, index, sessionId),
       role: 'user',
-      parts: [textPart(queuedUser)]
+      parts: [textPart(item.user)],
+      ...(item.submittedAt !== undefined ? { timestamp: item.submittedAt } : {})
     })
   }
 
@@ -1549,14 +1556,14 @@ export function dedupeInflightUserAgainstTranscript(
  */
 export function removeRepresentedLocalLiveProjection(
   previousMessages: ChatMessage[],
-  projection: Pick<SessionResumeResult, 'inflight' | 'queued'>
+  projection: Pick<SessionResumeResult, 'inflight' | 'queued'> & Partial<Pick<SessionResumeResult, 'session_id'>>
 ): ChatMessage[] {
   const inflightUser = projection.inflight?.user?.replace(/\s+/g, ' ').trim() ?? ''
   const inflightAssistant = projection.inflight?.assistant?.replace(/\s+/g, ' ').trim() ?? ''
-  const queuedUser = projection.queued?.user?.replace(/\s+/g, ' ').trim() ?? ''
+  const queuedItems = queuedProjectionItems(projection.queued)
 
   const hasAssistantProjection = Boolean(
-    projection.inflight?.assistant || projection.inflight?.streaming || (inflightUser && queuedUser)
+    projection.inflight?.assistant || projection.inflight?.streaming || (inflightUser && queuedItems.length)
   )
 
   if (!inflightUser || !hasAssistantProjection) {
@@ -1606,20 +1613,34 @@ export function removeRepresentedLocalLiveProjection(
     return previousMessages
   }
 
-  let queuedUserIndex = -1
+  // Every projected queued row a previous activation painted, matched in FIFO
+  // order after the live stream: by its stable projection id, or (for rows a
+  // renderer painted before it knew the id) by queued-row text. A racing local
+  // submit is never a `user-queued-` row, so it survives.
+  const sessionId = projection.session_id || 'session'
+  const queuedUserIndices = new Set<number>()
+  let searchFrom = assistantIndex + 1
 
-  if (queuedUser) {
-    queuedUserIndex = previousMessages.findIndex(
+  for (const [queuedIndex, item] of queuedItems.entries()) {
+    const projectedId = queuedProjectionRowId(item, queuedIndex, sessionId)
+    const text = item.user.replace(/\s+/g, ' ').trim()
+
+    const match = previousMessages.findIndex(
       (message, index) =>
-        index > assistantIndex &&
+        index >= searchFrom &&
         message.role === 'user' &&
         message.id.startsWith('user-queued-') &&
-        normalizedMessageText(message) === queuedUser
+        (message.id === projectedId || normalizedMessageText(message) === text)
     )
+
+    if (match >= 0) {
+      queuedUserIndices.add(match)
+      searchFrom = match + 1
+    }
   }
 
   return previousMessages.filter(
-    (_message, index) => index !== inflightUserIndex && index !== assistantIndex && index !== queuedUserIndex
+    (_message, index) => index !== inflightUserIndex && index !== assistantIndex && !queuedUserIndices.has(index)
   )
 }
 

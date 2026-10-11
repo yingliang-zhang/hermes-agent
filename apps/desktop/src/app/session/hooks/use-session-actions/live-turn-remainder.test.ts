@@ -5,6 +5,7 @@ import type { SessionMessage, SessionResumeResult } from '@/types/hermes'
 
 import { mergeLiveAssistantRun } from './live-turn-remainder'
 import { reconcilePersistedLiveTurn } from './persisted-live-turn'
+import { appendLiveSessionProjection, reconcileDurableHistory } from './utils'
 
 const assistant = (id: string, text: string, extra: Partial<ChatMessage> = {}): ChatMessage => ({
   id,
@@ -142,5 +143,78 @@ it('pairs only the queue projection, preserving equal corrections and different 
     expect(current).toContainEqual(oldQueue)
     expect(current).toContainEqual(response)
     expect(new Set(current.map(row => row.id)).size).toBe(current.length)
+  }
+})
+
+it('keeps every queued prompt of a multi-item FIFO across repeated reconciles of the anchored turn', () => {
+  const prompt = 'Inspect this file'
+  const rows: SessionMessage[] = [{ id: 1, role: 'user', content: prompt }]
+
+  const projection: Pick<SessionResumeResult, 'inflight' | 'queued' | 'session_id'> = {
+    session_id: 'runtime',
+    inflight: { user: prompt, assistant: 'Reading.', streaming: true },
+    queued: {
+      user: 'Then run the tests',
+      items: [
+        { user: 'Then run the tests', message_id: 'desktop-1', submitted_at: 101.25 },
+        { user: 'Then summarise', message_id: 'desktop-2', submitted_at: 102.5 }
+      ]
+    }
+  }
+
+  let current: ChatMessage[] = []
+
+  for (let resume = 0; resume < 3; resume++) {
+    current = reconcilePersistedLiveTurn(toChatMessages(rows), current, rows, projection)!
+    expect(current.filter(row => row.role === 'user').map(chatMessageText)).toEqual([
+      prompt,
+      'Then run the tests',
+      'Then summarise'
+    ])
+    expect(new Set(current.map(row => row.id)).size).toBe(current.length)
+  }
+})
+
+it('paints each persisted queued prompt once, after the live reply, not also at its stored accept position', () => {
+  // The gateway persists an accepted queued prompt BEFORE the running turn's
+  // reply exists, so the stored transcript is [prompt, queued 1, queued 2].
+  const prompt = 'Inspect this file'
+
+  const rows: SessionMessage[] = [
+    { id: 1, role: 'user', content: prompt },
+    { id: 2, role: 'user', content: 'Then run the tests' },
+    { id: 3, role: 'user', content: 'Then summarise' }
+  ]
+
+  const projection: Pick<SessionResumeResult, 'inflight' | 'queued' | 'session_id'> = {
+    session_id: 'runtime',
+    inflight: { user: prompt, assistant: 'Reading.', streaming: true },
+    queued: {
+      user: 'Then run the tests',
+      items: [
+        { user: 'Then run the tests', message_id: 'desktop-1', submitted_at: 101.25, row_id: 2 },
+        { user: 'Then summarise', message_id: 'desktop-2', submitted_at: 102.5, row_id: 3 }
+      ]
+    }
+  }
+
+  // A cold load first paints the stored transcript as-is.
+  let current: ChatMessage[] = toChatMessages(rows)
+  let fallback: ChatMessage[] = toChatMessages(rows)
+
+  for (let resume = 0; resume < 3; resume++) {
+    current = reconcilePersistedLiveTurn(toChatMessages(rows), current, rows, projection)!
+    // The unanchored path (no persisted live-turn provenance) must agree.
+    fallback = reconcileDurableHistory(appendLiveSessionProjection(toChatMessages(rows), projection), fallback)
+
+    for (const view of [current, fallback]) {
+      expect(view.map(row => [row.role, chatMessageText(row)])).toEqual([
+        ['user', prompt],
+        ['assistant', 'Reading.'],
+        ['user', 'Then run the tests'],
+        ['user', 'Then summarise']
+      ])
+      expect(new Set(view.map(row => row.id)).size).toBe(view.length)
+    }
   }
 })

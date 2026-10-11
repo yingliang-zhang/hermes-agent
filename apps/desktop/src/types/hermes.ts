@@ -1,4 +1,4 @@
-import type { ConnectionRequestPayload, FreeTierChallengePayload, ToolLabel } from '@hermes/shared'
+import type { ConnectionRequestPayload, FreeTierChallengePayload, QueuedPromptItem, ToolLabel } from '@hermes/shared'
 
 import type { ToolResultMetadata } from '@/lib/tool-result-metadata'
 
@@ -797,7 +797,12 @@ export interface SessionResumeResult {
     user?: string
   }
   queued?: null | {
+    /** Queue head: the single-slot shape older gateways send alone. */
     user?: string
+    /** The whole accepted next-turn FIFO, oldest first, with the source
+     *  identity each prompt was submitted with and its accept-time durable
+     *  row. Omitted by older gateways. */
+    items?: QueuedPromptItem[]
   }
   // The oldest gateway approval still waiting for a response. This is returned
   // on resume so a reconnect can restore a prompt whose original event was

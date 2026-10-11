@@ -5,6 +5,7 @@ import { parseErrorSurface } from '@/lib/error-surface'
 import type { SessionMessage, SessionResumeResult } from '@/types/hermes'
 
 import { mergeLiveAssistantRun } from './live-turn-remainder'
+import { queuedProjectionItems, queuedProjectionRowId, withoutQueuedAcceptRows } from './queued-projection'
 import { reconcileDurableHistory } from './utils'
 
 const rowId = (row: SessionMessage) => row.row_id ?? row.id
@@ -195,9 +196,9 @@ function snapshotIntervals(inflight: NonNullable<SessionResumeResult['inflight']
  * Missing provenance takes the legacy path without subtracting any snapshot text.
  */
 export function reconcilePersistedLiveTurn(
-  messages: ChatMessage[],
-  previous: ChatMessage[],
-  rows: SessionMessage[],
+  storedMessages: ChatMessage[],
+  cachedMessages: ChatMessage[],
+  storedRows: SessionMessage[],
   projection: Pick<SessionResumeResult, 'inflight' | 'queued' | 'session_id'>
 ): ChatMessage[] | null {
   const inflight = projection.inflight
@@ -206,6 +207,11 @@ export function reconcilePersistedLiveTurn(
     return null
   }
 
+  // Still-queued prompts are painted by the projection below, after the turn,
+  // so their stored accept rows leave both the transcript and the cached view.
+  const messages = withoutQueuedAcceptRows(storedMessages, projection.queued, message => message.rowId)
+  const previous = withoutQueuedAcceptRows(cachedMessages, projection.queued, message => message.rowId)
+  const rows = withoutQueuedAcceptRows(storedRows, projection.queued, rowId)
   const turn = locateTurn(rows, messages, inflight)
 
   if (!turn) {
@@ -308,21 +314,23 @@ export function reconcilePersistedLiveTurn(
 
   result.push(...unpairedLocal)
 
-  if (projection.queued?.user) {
-    const id = `user-queued-${projection.session_id}`
+  // The anchored turn's next-turn queue. Refresh each projected row in place by
+  // its stable id; equal correction/optimistic user text is a different
+  // occurrence and is left alone.
+  for (const [index, item] of queuedProjectionItems(projection.queued).entries()) {
+    const id = queuedProjectionRowId(item, index, projection.session_id)
 
     const queuedIndex = result.findIndex(
-      (message, index) => index >= turnStart && message.role === 'user' && message.id === id
+      (message, messageIndex) => messageIndex >= turnStart && message.role === 'user' && message.id === id
     )
 
-    const parts = [textPart(projection.queued.user)]
+    const parts = [textPart(item.user)]
+    const timestamp = item.submittedAt !== undefined ? { timestamp: item.submittedAt } : {}
 
-    // The anchored turn has one next-turn queue slot. Refresh its projection
-    // in place; equal correction/optimistic user text is a different occurrence.
     if (queuedIndex >= 0) {
-      result[queuedIndex] = { ...result[queuedIndex], parts }
+      result[queuedIndex] = { ...result[queuedIndex], parts, ...timestamp }
     } else {
-      result.push({ id, role: 'user', parts })
+      result.push({ id, role: 'user', parts, ...timestamp })
     }
   }
 

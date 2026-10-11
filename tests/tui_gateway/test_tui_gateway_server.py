@@ -17906,10 +17906,88 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
             }
         )
 
-        assert activated["result"]["queued"] == {"user": "newest prompt"}
+        assert activated["result"]["queued"]["user"] == "newest prompt"
         assert "transport" not in activated["result"]["queued"]
     finally:
         server._sessions.pop("sid-live", None)
+
+
+def test_session_activate_returns_every_prompt_queued_during_busy_turn(monkeypatch, tmp_path):
+    """Two source-identified prompts queued behind a running turn are separate
+    envelopes (``queued_prompt`` + ``queued_prompts``). A renderer restart while
+    the turn still runs must get BOTH back, in FIFO order, with their source
+    identity and the durable row each was persisted to at accept time, and the
+    result must still satisfy the session.activate contract."""
+    from hermes_state import SessionDB
+    from tui_gateway.contracts.registry import METHODS
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("session-key", source="desktop")
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    monkeypatch.setattr(server, "_session_info", lambda agent, *_: {"model": agent.model})
+    agent = types.SimpleNamespace(model="model-live")
+    session = _session(
+        agent=agent,
+        running=True,
+        inflight_turn={
+            "assistant": "partial answer",
+            "streaming": True,
+            "user": "current prompt",
+        },
+    )
+    server._sessions["sid-live"] = session
+    try:
+        for index, (text, at) in enumerate(
+            (("first queued prompt", 101.25), ("second queued prompt", 102.5)), start=1
+        ):
+            accepted = server._handle_busy_submit(
+                f"submit-{index}",
+                "sid-live",
+                session,
+                text,
+                object(),
+                submitted_at=at,
+                message_id=f"desktop-{index}",
+            )
+            assert accepted["result"]["status"] == "queued"
+
+        activated = server.handle_request(
+            {
+                "id": "activate",
+                "method": "session.activate",
+                "params": {"session_id": "sid-live"},
+            }
+        )
+
+        result = activated["result"]
+        stored = {
+            row["content"]: row["_row_id"]
+            for row in db.get_messages_as_conversation("session-key", include_row_ids=True)
+            if row.get("role") == "user"
+        }
+        assert set(stored) == {"first queued prompt", "second queued prompt"}
+        assert result["queued"] == {
+            "user": "first queued prompt",
+            "items": [
+                {
+                    "user": "first queued prompt",
+                    "submitted_at": 101.25,
+                    "message_id": "desktop-1",
+                    "row_id": stored["first queued prompt"],
+                },
+                {
+                    "user": "second queued prompt",
+                    "submitted_at": 102.5,
+                    "message_id": "desktop-2",
+                    "row_id": stored["second queued prompt"],
+                },
+            ],
+        }
+        METHODS["session.activate"].result.model_validate(result)
+    finally:
+        server._sessions.pop("sid-live", None)
+        db.close()
 
 
 def test_session_activate_switches_live_session_without_closing_siblings(monkeypatch):

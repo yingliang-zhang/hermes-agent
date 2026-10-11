@@ -3140,8 +3140,17 @@ export interface InflightTurn {
   recoverable?: boolean | null
   error_surface?: Record<string, unknown> | null
 }
+/** ``session_auto_continue._queued_prompt_snapshot``: the accepted next-turn queue. ``user`` is the head (the single-slot shape older clients read); ``items`` is the whole FIFO, oldest first. */
 export interface QueuedPrompt {
   user: string
+  items?: QueuedPromptItem[] | null
+}
+/** One accepted next-turn prompt: its text plus the stable source identity the client sent (``message_id``/``submitted_at``) and, once persisted, its accept-time durable ``row_id``; never its transport, attachments or other durable-row internals. */
+export interface QueuedPromptItem {
+  user: string
+  submitted_at?: number | null
+  message_id?: string | null
+  row_id?: number | null
 }
 /** One unanswered server→client request (``server_requests.Request.snapshot``); the reconnecting client re-delivers it to its request handlers. */
 export interface OpenRequestEntry {
