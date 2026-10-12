@@ -756,11 +756,39 @@ def _restore_agent_history_after_turn_error(session: dict, agent) -> bool:
 
 
 def _queued_prompt_snapshot(session: dict) -> dict | None:
-    """The accepted next-turn prompt without its transport handle, for the live-session projection (Desktop may
-    reconnect while it is still queued)."""
-    queued = session.get("queued_prompt")
-    user = _inflight_text(queued.get("text")) if isinstance(queued, dict) else ""
-    return {"user": user} if user else None
+    """The accepted next-turn queue without transport handles, for the live-session projection
+    (Desktop may reconnect or restart while prompts are still queued).
+
+    ``queued_prompt`` is the head and ``queued_prompts`` the later envelopes, so a snapshot of the
+    head alone made every later accepted prompt vanish until it drained. ``items`` carries the whole
+    FIFO, oldest first, with the source identity the client sent and the accept-time durable row id;
+    ``user`` stays the head for clients that only read the single-slot shape. Transports, attachments
+    and the staged row's content stay out."""
+    import math
+
+    head = session.get("queued_prompt")
+    tail = session.get("queued_prompts")
+    entries = [head, *(tail if isinstance(tail, list) else [])]
+    items: list[dict] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not (user := _inflight_text(entry.get("text"))):
+            continue
+        item: dict = {"user": user}
+        submitted_at = entry.get("submitted_at")
+        if (isinstance(submitted_at, (int, float)) and not isinstance(submitted_at, bool)
+                and math.isfinite(submitted_at)):
+            item["submitted_at"] = submitted_at
+        if entry.get("message_id") is not None:
+            item["message_id"] = str(entry["message_id"])
+        # The accept-time durable row (written before the ``queued`` ack, so it sits AHEAD of the
+        # running turn's reply in the stored transcript): naming it lets a client paint the prompt
+        # once, after the live reply, instead of the stored row in place plus a projected copy.
+        staged = entry.get("_submit_user_row")
+        row_id = staged.get("_row_id") if isinstance(staged, dict) else None
+        if isinstance(row_id, int) and not isinstance(row_id, bool) and row_id > 0:
+            item["row_id"] = row_id
+        items.append(item)
+    return {"user": items[0]["user"], "items": items} if items else None
 
 
 def register(server) -> None:

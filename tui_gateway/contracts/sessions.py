@@ -44,8 +44,23 @@ class InflightTurn(Result):
     error_surface: dict[str, JsonValue] | None = None
 
 
-class QueuedPrompt(Result):
+class QueuedPromptItem(Result):
+    """One accepted next-turn prompt: its text plus the stable source identity the client sent
+    (``message_id``/``submitted_at``) and, once persisted, its accept-time durable ``row_id``;
+    never its transport, attachments or other durable-row internals."""
+
     user: str
+    submitted_at: float | None = None
+    message_id: str | None = None
+    row_id: int | None = None
+
+
+class QueuedPrompt(Result):
+    """``session_auto_continue._queued_prompt_snapshot``: the accepted next-turn queue. ``user`` is the
+    head (the single-slot shape older clients read); ``items`` is the whole FIFO, oldest first."""
+
+    user: str
+    items: list[QueuedPromptItem] | None = None
 
 
 class TodoState(Result):

@@ -14,7 +14,7 @@ import { $messages, setActiveSessionId, setMessages } from '@/store/session'
 import { $sessionStates } from '@/store/session-states'
 
 import { usePromptActions } from '../use-prompt-actions'
-import { reconcileDurableHistory } from '../use-session-actions/utils'
+import { appendLiveSessionProjection, reconcileDurableHistory } from '../use-session-actions/utils'
 import { useSessionStateCache } from '../use-session-state-cache'
 
 import { useMessageStream } from './index'
@@ -177,6 +177,42 @@ it.each([true, false, undefined])(
 )
 
 const timeline = (messages: ChatMessage[]) => messages.map(message => [message.role, chatMessageText(message)])
+
+it('settles the live reply in place while several projected queued prompts wait behind it', async () => {
+  const h = mount()
+  await h.submit()
+  await h.send('message.start')
+  await h.send('message.delta', { text: ANSWER })
+  await flush()
+  const assistantId = h.state().streamId
+
+  // The rows a renderer restart restores for a two-item gateway FIFO.
+  const queuedRows = appendLiveSessionProjection([], {
+    session_id: SID,
+    queued: {
+      user: 'Next',
+      items: [
+        { user: 'Next', message_id: 'desktop-1', submitted_at: 101.25 },
+        { user: 'After that', message_id: 'desktop-2', submitted_at: 102.5 }
+      ]
+    }
+  })
+
+  expect(queuedRows.map(chatMessageText)).toEqual(['Next', 'After that'])
+  h.update(state => ({ ...state, messages: [...state.messages, ...queuedRows] }))
+
+  await h.send('message.complete', { text: ANSWER })
+
+  const settled = h.state().messages.find(message => message.id === assistantId)
+  expect(settled?.pending).toBe(false)
+  expect(timeline(h.state().messages)).toEqual([
+    ['user', 'Give the answer.'],
+    ['assistant', ANSWER],
+    ['user', 'Next'],
+    ['user', 'After that']
+  ])
+  h.dispose()
+})
 
 const flush = () =>
   act(async () => {

@@ -27113,16 +27113,83 @@
       },
       "QueuedPrompt": {
         "additionalProperties": false,
+        "description": "``session_auto_continue._queued_prompt_snapshot``: the accepted next-turn queue. ``user`` is the\nhead (the single-slot shape older clients read); ``items`` is the whole FIFO, oldest first.",
         "properties": {
           "user": {
             "title": "User",
             "type": "string"
+          },
+          "items": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/QueuedPromptItem"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Items"
           }
         },
         "required": [
           "user"
         ],
         "title": "QueuedPrompt",
+        "type": "object"
+      },
+      "QueuedPromptItem": {
+        "additionalProperties": false,
+        "description": "One accepted next-turn prompt: its text plus the stable source identity the client sent\n(``message_id``/``submitted_at``) and, once persisted, its accept-time durable ``row_id``;\nnever its transport, attachments or other durable-row internals.",
+        "properties": {
+          "user": {
+            "title": "User",
+            "type": "string"
+          },
+          "submitted_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Submitted At"
+          },
+          "message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Message Id"
+          },
+          "row_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Row Id"
+          }
+        },
+        "required": [
+          "user"
+        ],
+        "title": "QueuedPromptItem",
         "type": "object"
       },
       "ReactionAuthor": {

@@ -38,6 +38,7 @@ import { $todosBySession, setSessionTodos } from '@/store/todos'
 import { broadcastTranscriptChanged } from '@/store/transcript-sync'
 
 import type { ClientSessionState } from '../../../types'
+import { isQueuedProjectionRow } from '../use-session-actions/queued-projection'
 
 import {
   collapseDuplicateFinalAfterToolInterim,
@@ -868,7 +869,7 @@ export function useMessageStream({
         const hasCurrentResponse = Boolean(streamId || state.sawAssistantPayload || interimBoundaryPending)
 
         const lastUserIndex = prev.findLastIndex(
-          message => message.role === 'user' && !(hasCurrentResponse && message.id === `user-queued-${sessionId}`)
+          message => message.role === 'user' && !(hasCurrentResponse && isQueuedProjectionRow(message.id, sessionId))
         )
 
         const streamIndex = streamId
